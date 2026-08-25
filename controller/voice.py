@@ -749,6 +749,22 @@ class VoiceClient:
         except pymumble.errors.UnknownChannelError:
             return None
 
+    def _channel_name(self, channel_id):
+        """返回服务器当前给这个频道号的名称，拿不到时返回 None。
+
+        Murmur 会回收 temporary channel 的数字 ID。只看 ``channel_id`` 会把
+        一个已经被复用的旧号误认成目标频道，尤其是在判断自己是否已经入频率
+        频道时。这里故意直接查当前频道表，不使用本地的频率映射缓存。
+        """
+        try:
+            channel = self.mumble.channels[channel_id]
+            if isinstance(channel, dict):
+                return channel.get("name")
+            return channel["name"]
+        except (KeyError, TypeError, AttributeError, IndexError,
+                pymumble.errors.UnknownChannelError):
+            return None
+
     def _create_channel(self, name):
         """在根下建一个临时频道，**不要阻塞**。
 
@@ -830,8 +846,17 @@ class VoiceClient:
         if previous is not None and previous != channel_id:
             # 同一个频率换了新号：反查表里的旧号要拆掉，否则收到的音频会被
             # 认成另一个频率
-            self._channel_to_khz.pop(previous, None)
+            if self._channel_to_khz.get(previous) == khz:
+                self._channel_to_khz.pop(previous, None)
             log.info("channel %s changed id: %s -> %s", name, previous, channel_id)
+        previous_khz = self._channel_to_khz.get(channel_id)
+        if previous_khz is not None and previous_khz != khz:
+            # 频道号被 Murmur 回收后分配给了另一个频率；旧频率的映射也必须
+            # 拆掉，否则两个频率会同时指向同一个活频道。
+            if self._channel_ids.get(previous_khz) == channel_id:
+                self._channel_ids.pop(previous_khz, None)
+            log.warning("channel id %s was reused: %s -> %s",
+                        channel_id, radiostack.channel_name(previous_khz), name)
         log.debug("frequency %s maps to channel %s (id %s)",
                   radiostack.format_frequency(khz), name, channel_id)
         self._channel_ids[khz] = channel_id
@@ -843,7 +868,8 @@ class VoiceClient:
         stale = self._channel_ids.pop(khz, None)
         if stale is None:
             return
-        self._channel_to_khz.pop(stale, None)
+        if self._channel_to_khz.get(stale) == khz:
+            self._channel_to_khz.pop(stale, None)
         self._listening.discard(stale)
         log.info("channel %s is gone (a temporary channel dies as soon as it "
                  "empties), discarding the stale id %s", name, stale)
@@ -956,7 +982,8 @@ class VoiceClient:
         重解析一次的代价是一次本地字典查找加一次建频道；不重试的代价是这一轮
         彻底没进去，要等下一次栈变化才有机会——而那可能是几分钟以后。
         """
-        if self._join(channel_id):
+        name = radiostack.channel_name(khz)
+        if self._join(channel_id, expected_name=name):
             return True
 
         again = self._resolve_channel(khz)
@@ -964,12 +991,19 @@ class VoiceClient:
             return False
         log.info("channel for %s came back as id %s, joining again",
                  radiostack.format_frequency(khz), again)
-        return self._join(again)
+        return self._join(again, expected_name=name)
 
-    def _join(self, channel_id):
+    def _join(self, channel_id, expected_name=None):
         try:
-            if self.mumble.users.myself.get("channel_id") == channel_id:
+            if (self.mumble.users.myself.get("channel_id") == channel_id
+                    and (expected_name is None
+                         or self._channel_name(channel_id) == expected_name)):
                 return True
+            if (expected_name is not None
+                    and self.mumble.users.myself.get("channel_id") == channel_id):
+                log.warning("channel id %s is not %s; forcing a re-resolve",
+                            channel_id, expected_name)
+                return False
             # move_in() 也走 execute_command(blocking=True)，和建频道一样会
             # 无限期卡住，同样自己发命令
             self.mumble.execute_command(
@@ -977,7 +1011,7 @@ class VoiceClient:
                 blocking=False)
             # 命令是异步的，确认真的进去了再往下走——主频道没进去的话，服务端
             # 不支持频道监听时管制员一个频率都听不到
-            if not self._wait_until_in(channel_id):
+            if not self._wait_until_in(channel_id, expected_name=expected_name):
                 log.warning("sent the request to join channel %s but it did not "
                             "take effect within %.0f s", channel_id,
                             CHANNEL_TIMEOUT)
@@ -987,16 +1021,20 @@ class VoiceClient:
             log.warning(f"joining the channel failed: {e}")
             return False
 
-    def _wait_until_in(self, channel_id):
+    def _wait_until_in(self, channel_id, expected_name=None):
         """等服务器确认我们真的进了这个频道。"""
         deadline = time.time() + CHANNEL_TIMEOUT
         while time.time() < deadline and self.running:
             myself = self.mumble.users.myself
-            if myself is not None and myself.get("channel_id") == channel_id:
+            if (myself is not None and myself.get("channel_id") == channel_id
+                    and (expected_name is None
+                         or self._channel_name(channel_id) == expected_name)):
                 return True
             time.sleep(0.1)
         myself = self.mumble.users.myself
-        return myself is not None and myself.get("channel_id") == channel_id
+        return (myself is not None and myself.get("channel_id") == channel_id
+                and (expected_name is None
+                     or self._channel_name(channel_id) == expected_name))
 
     def _set_listening(self, channel_ids):
         """频道监听。pymumble 没封装，直接发 UserState。"""

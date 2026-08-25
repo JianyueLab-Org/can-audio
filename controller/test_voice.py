@@ -242,6 +242,13 @@ class FakeChannels:
                 return self.server.by_name[name]
         raise pymumble.errors.UnknownChannelError(name)
 
+    def __getitem__(self, channel_id):
+        with self.server.lock:
+            for channel in self.server.by_name.values():
+                if channel["channel_id"] == channel_id:
+                    return channel
+        raise KeyError(channel_id)
+
     def new_channel(self, parent_id, name, temporary=False):
         self.server.hang("channels.new_channel")
 
@@ -456,6 +463,42 @@ class ChannelSwitchTest(unittest.TestCase):
         result, _ = self.call(lambda: self.client._join(7))
         self.assertTrue(result)
         self.assertEqual(self.server.commands, [])
+
+    def test_join_does_not_trust_a_reused_id_with_the_wrong_name(self):
+        """同一个数字 ID 被复用时，不能把错误频道当成已入频率频道。"""
+        self.server.by_name["FREQ_121700"] = {
+            "channel_id": 7,
+            "name": "FREQ_121700",
+            "parent": 0,
+            "temporary": True,
+        }
+        self.server.my_channel = 7
+        result, _ = self.call(
+            lambda: self.client._join(7, expected_name="FREQ_118000"))
+        self.assertFalse(result)
+        self.assertEqual(self.server.commands, [],
+                         "应先按频道名称重新解析，而不是重复移动到错误频道")
+
+    def test_join_frequency_reresolves_after_id_reuse(self):
+        """频道号撞车时，按频率名称重新解析并进入正确频道。"""
+        self.server.by_name["FREQ_121700"] = {
+            "channel_id": 7,
+            "name": "FREQ_121700",
+            "parent": 0,
+            "temporary": True,
+        }
+        self.server.my_channel = 7
+
+        result, _ = self.call(
+            lambda: self.client._join_frequency(118000, 7),
+            budget=voice.CHANNEL_TIMEOUT * 4 + 3)
+
+        self.assertTrue(result)
+        self.assertEqual(self.server.by_name["FREQ_118000"]["name"],
+                         "FREQ_118000")
+        self.assertEqual(
+            self.server.my_channel,
+            self.server.by_name["FREQ_118000"]["channel_id"])
 
     # ---------- 整条同步链 ----------
     def test_sync_finishes_even_if_the_server_never_answers(self):
