@@ -149,6 +149,11 @@ TEXT = {
                              "en": "{sender} → {recipient}: {body}"},
     "msg.sent":             {"zh": "我 → {recipient}: {body}",
                              "en": "me → {recipient}: {body}"},
+    "msg.wallop_sent":      {"zh": "我 → 督导: {body}",
+                             "en": "me → supervisors: {body}"},
+    "msg.wallop_empty":     {"zh": ".wallop 后面要写内容，例如 .wallop 请求协助",
+                             "en": "Write something after .wallop, e.g. "
+                                   ".wallop request assistance"},
     "msg.observer_on":      {"zh": "观察员模式：只连语音，网络上不会出现这架飞机",
                              "en": "Observer mode: voice only, this aircraft is not on "
                                    "the network"},

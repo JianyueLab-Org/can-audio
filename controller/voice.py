@@ -806,7 +806,17 @@ class VoiceClient:
         return self._find_channel(name)
 
     def _resolve_channel(self, khz):
-        """拿到频率对应的频道 id，没有就建一个临时频道。
+        """拿到频率对应的频道 id，没有就建一个临时频道。解析不出来时返回 None。"""
+        channel_id, _ = self._resolve_channel_ex(khz)
+        return channel_id
+
+    def _resolve_channel_ex(self, khz):
+        """同 `_resolve_channel`，另外回报**这一次是不是新建过频道**。
+
+        `_join_frequency` 要靠这个信息决定重不重试。真 Murmur 分配的是**最小空闲
+        号**，一个刚被销毁的临时频道重建出来，几乎必然原样拿回同一个号——所以
+        "号变没变"根本区分不了"频道一直是原来那个"和"频道死了、又被我建了回来"。
+        返回 (channel_id | None, recreated)。
 
         **每次都拿服务器的频道表核对一遍，绝不能直接吃缓存。** 频率频道都是
         temporary 的，最后一个人离开服务器当场就把它销毁——管制员把主频率从 A
@@ -824,8 +834,10 @@ class VoiceClient:
         """
         name = radiostack.channel_name(khz)
         channel = self._find_channel(name)
+        recreated = False
 
         if channel is None:
+            recreated = True
             self._forget_channel(khz, name)
             try:
                 log.info("channel %s does not exist, creating a temporary one", name)
@@ -835,11 +847,11 @@ class VoiceClient:
                 channel = self._wait_for_channel(name)
             except Exception as e:
                 log.warning(f"could not create channel {name}: {e}")
-                return None
+                return None, recreated
         if channel is None:
             log.warning("channel %s did not appear within %.0f s of being "
                         "created, skipping this round", name, CHANNEL_TIMEOUT)
-            return None
+            return None, recreated
 
         channel_id = channel["channel_id"]
         previous = self._channel_ids.get(khz)
@@ -861,7 +873,7 @@ class VoiceClient:
                   radiostack.format_frequency(khz), name, channel_id)
         self._channel_ids[khz] = channel_id
         self._channel_to_khz[channel_id] = khz
-        return channel_id
+        return channel_id, recreated
 
     def _forget_channel(self, khz, name):
         """频道已经不在服务器上了，把它的号从两张表里拆掉。"""
@@ -936,21 +948,40 @@ class VoiceClient:
         rx_channels = {khz: resolved[khz] for khz in stack.rx_frequencies()
                        if khz in resolved}
 
-        # 主频率：真正进入的那个频道。服务端不支持监听时，至少这个频率能听到
-        primary = stack.selected_khz if stack.selected_khz in rx_channels else None
-        if primary is None and rx_channels:
-            primary = next(iter(rx_channels))
-        joined = (primary is not None
-                  and self._join_frequency(primary, rx_channels[primary]))
+        # 主频率：真正进入的那个频道。服务端不支持监听时，至少这个频率能听到。
+        #
+        # **进不去就换一个试。** 选中的那个频率完全可能是个谁也不在的频道——
+        # 临时频道一空就被销毁，于是每一轮刚建好就没了，MoveCmd 永远落空。这时
+        # 候把整个电台栈一起降级成"只监听"是最坏的结果：管制员**正在值守**的那
+        # 个频率也跟着发不出话，而界面上全是绿的。实测日志里就是这样——主频率
+        # 是手动加的 118.000（自始至终没有第二个人在），席位频率 118.350 于是
+        # 整晚只能收不能发。
+        #
+        # 只试两个：用户选中的，和数据源上正在值守的那个席位频率。用户的选择
+        # 仍然排第一，只有在它**进不去**的时候才轮到席位频率——而席位频率恰恰
+        # 是唯一一个"必须能发话"的。故意不把整张 RX 表都试一遍：每次失败要等满
+        # 一个 CHANNEL_TIMEOUT，而这段等待是在 _sync_lock 里面的。
+        candidates = []
+        for khz in (stack.selected_khz, stack.locked_khz):
+            if khz in rx_channels and khz not in candidates:
+                candidates.append(khz)
+        if not candidates and rx_channels:
+            candidates.append(next(iter(rx_channels)))
 
-        # 其余频率用频道监听
-        wanted = {cid for khz, cid in rx_channels.items() if khz != primary}
-        if primary is not None and not joined:
-            # 主频道没进去（临时频道死了、服务器没回话……）：至少把它挂上
-            # 监听，别让管制员**唯一在用的那个频率**成了唯一听不到的
-            wanted.add(rx_channels[primary])
-            log.warning("could not join the primary channel, falling back to a "
-                        "channel listener so RX still works")
+        joined_khz = None
+        for khz in candidates:
+            if self._join_frequency(khz, rx_channels[khz]):
+                joined_khz = khz
+                break
+            log.warning("could not join the primary channel %s",
+                        radiostack.format_frequency(khz))
+
+        # 没进去的频率一律挂频道监听——**试过没进去的那些也算在内**，别让管制员
+        # 唯一在用的那个频率成了唯一听不到的
+        wanted = {cid for khz, cid in rx_channels.items() if khz != joined_khz}
+        if joined_khz is None and rx_channels:
+            log.warning("could not join any primary channel, falling back to "
+                        "channel listeners so RX still works")
         self._set_listening(wanted)
 
         # 发话目标。重连后的那一轮必须强制重发：断线前启动的一轮 sync 可能
@@ -965,7 +996,7 @@ class VoiceClient:
         self._set_voice_target(self._tx_channels, force=force_target)
         self._program_cross_couple_targets()
         log.debug("syncing the radio stack: primary %s, RX %s, TX %s, XC %s",
-                  radiostack.format_frequency(primary) if primary else "none",
+                  radiostack.format_frequency(joined_khz) if joined_khz else "none",
                   [radiostack.format_frequency(k) for k in stack.rx_frequencies()],
                   [radiostack.format_frequency(k) for k in stack.tx_frequencies()],
                   [radiostack.format_frequency(k) for k in stack.xc_frequencies()])
@@ -981,16 +1012,28 @@ class VoiceClient:
 
         重解析一次的代价是一次本地字典查找加一次建频道；不重试的代价是这一轮
         彻底没进去，要等下一次栈变化才有机会——而那可能是几分钟以后。
+
+        **判据是"有没有重建过"，不是"号变没变"。** 原来这里写的是
+        `again == channel_id 就不重试`，理由是"什么都没变，别白等一个
+        CHANNEL_TIMEOUT"。但真 Murmur 分配的是**最小空闲号**：频道刚被销毁，它的
+        号立刻变成最小空闲号，重建出来几乎必然原样拿回**同一个号**。于是这条守卫
+        恰好在它唯一该生效的场景里把重试挡掉了——实测日志里 8 次进频道失败，
+        "joining again" 一次都没出现过。
         """
         name = radiostack.channel_name(khz)
         if self._join(channel_id, expected_name=name):
             return True
 
-        again = self._resolve_channel(khz)
-        if again is None or again == channel_id:
+        again, recreated = self._resolve_channel_ex(khz)
+        if again is None:
             return False
-        log.info("channel for %s came back as id %s, joining again",
-                 radiostack.format_frequency(khz), again)
+        if not recreated and again == channel_id:
+            # 频道自始至终好好地在那儿，号也没变：再发一次 MoveCmd 得不到不同的
+            # 结果，只会再等满一个 CHANNEL_TIMEOUT——而这段等待是在 _sync_lock
+            # 里面的，会把后面排队的 sync 一起拖住
+            return False
+        log.info("channel for %s resolved to id %s (recreated=%s), joining again",
+                 radiostack.format_frequency(khz), again, recreated)
         return self._join(again, expected_name=name)
 
     def _join(self, channel_id, expected_name=None):

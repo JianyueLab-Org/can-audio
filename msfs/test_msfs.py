@@ -771,6 +771,53 @@ class FlightPlanTest(unittest.TestCase):
         self.assertEqual(self.fsdpilot.CLIENT_NAME, "MSFS for CAN")
 
 
+class DotCommandTest(unittest.TestCase):
+    """`.wallop` 在客户端翻成发往 `*S` 的 #TM。
+
+    协议层这一份是从 xpc 复制来的，两边会各自漂移，所以这里直接测**本目录**
+    的那一份，而不是指望 test_xpc.py 替它把关——上面
+    `test_identifies_as_msfs_not_xplane` 记着的就是复制没跟上的那次。
+
+    缺陷本身是静默的：原来 `.wallop 求助` 会被当成普通正文，跟着收件人框
+    （空的时候是 COM1 频率）发到频率上，服务端的 handleWallop 一次都不会触
+    发，而界面照样回一行"已发送"。
+    """
+
+    def setUp(self):
+        import fsdpilot
+        self.fsdpilot = fsdpilot
+
+    def test_wallop_goes_to_the_supervisor_channel(self):
+        recipient, body = self.fsdpilot.parse_dot_command(".wallop 请求协助")
+        self.assertEqual(recipient, self.fsdpilot.WALLOP_RECIPIENT)
+        self.assertEqual(body, "请求协助")
+
+    def test_command_name_is_case_insensitive(self):
+        recipient, _ = self.fsdpilot.parse_dot_command(".WALLOP help")
+        self.assertEqual(recipient, self.fsdpilot.WALLOP_RECIPIENT)
+
+    def test_colons_in_the_body_survive(self):
+        # 分帧要洗的冒号归 sanitize 管，解析这一步不该先把正文切断。
+        _, body = self.fsdpilot.parse_dot_command(".wallop ETA 12:30")
+        self.assertEqual(body, "ETA 12:30")
+
+    def test_wallop_with_no_text_yields_an_empty_body(self):
+        recipient, body = self.fsdpilot.parse_dot_command(".wallop")
+        self.assertEqual(recipient, self.fsdpilot.WALLOP_RECIPIENT)
+        self.assertEqual(body, "")
+
+    def test_ordinary_message_is_untouched(self):
+        recipient, body = self.fsdpilot.parse_dot_command("request pushback")
+        self.assertIsNone(recipient)
+        self.assertEqual(body, "request pushback")
+
+    def test_unknown_dot_command_is_sent_as_text(self):
+        # 吞掉一条本该发出去的消息，比把一句奇怪的话发到频率上更糟。
+        recipient, body = self.fsdpilot.parse_dot_command(".wallpo 求助")
+        self.assertIsNone(recipient)
+        self.assertEqual(body, ".wallpo 求助")
+
+
 class InjectorTest(unittest.TestCase):
     """他机注入。真正跑要 SimConnect，这里只测不依赖模拟器的那部分。"""
 

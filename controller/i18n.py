@@ -195,9 +195,17 @@ TEXT = {
     "reject.ServerFull":      {"zh": "服务器已满", "en": "The server is full"},
     "reject.NoCertificate":   {"zh": "服务器要求证书",
                                "en": "The server requires a certificate"},
-    "reject.AuthenticatorFail": {"zh": "服务端认证器故障（服务器上的 login.py 可能没在运行）",
-                                 "en": "The server's authenticator failed (login.py may not "
-                                       "be running on the server)"},
+    # **这一条恰恰说明 login.py 在跑。** Murmur 只在 Ice 认证器返回 -3
+    # （AUTH_TEMPORARY_FAILURE）时报 AuthenticatorFail，而 server/login.py 只在
+    # 上游 /api/v1/public/auth 没响应时返回 -3。认证器要是真的没注册，Murmur 会
+    # 回落到它自己的账号库，拒绝理由是 WrongUserPW 而不是这个。原来这句写的是
+    # "login.py 可能没在运行"，把排查方向直接引到服务器进程上，而该看的是那个
+    # 接口——一次实测故障就是这么被找错方向的。
+    "reject.AuthenticatorFail": {"zh": "服务端暂时验不了账号（认证器的上游 "
+                                       "/api/v1/public/auth 没有响应）",
+                                 "en": "The server could not verify the account right now "
+                                       "(the authenticator's upstream "
+                                       "/api/v1/public/auth did not respond)"},
     "reject.WrongVersion":    {"zh": "客户端版本不被服务器接受",
                                "en": "The server does not accept this client version"},
     "reject.with_note":       {"zh": "{reason}（服务器附言：{note}）",

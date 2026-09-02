@@ -123,6 +123,46 @@ def sanitize(text):
     return (text or "").replace(":", " ").replace("\r", " ").replace("\n", " ").strip()
 
 
+# 督导频道。FSD 里 `*S` 是一个**收件人**而不是一条命令：客户端把 .wallop 翻成
+# 发往这个地址的普通 #TM，服务端 handleTextMessage 认出它再转给所有在线督导。
+# can-fsd 那条分支没有等级门槛（要求督导身份的是 `*` 全网广播那条），所以飞行
+# 员发得出去。
+WALLOP_RECIPIENT = "*S"
+
+# 认识的点命令。EuroScope 和 CRC 是在**客户端**把 `.wallop` 翻成正确的包的，
+# 这个客户端原来没有这一步：用户打的 `.wallop 求助` 被当成普通正文，跟着收件
+# 人框（空的时候是 COM1 频率）发到频率上去了。服务端的 handleWallop 一次都不
+# 会触发，督导收不到、Discord 中继也不会响，而界面还回一行"已发送"——所以它
+# 看起来是好的。
+DOT_COMMANDS = {".wallop": WALLOP_RECIPIENT}
+
+
+def parse_dot_command(text):
+    """把用户输入的一行翻成 `(收件人, 正文)`。
+
+    不是已知点命令就返回 `(None, 原文)`，由调用方按原来的规矩挑收件人。
+
+    **不认识的点命令原样发出去**，既不报错也不吞掉：猜不出用户是想打一条命令
+    还是真要发一句以点开头的话，而吞掉一条本该发出去的消息，比把一句奇怪的话
+    发到频率上更糟。
+
+    命令名不分大小写（`.WALLOP` 也认）；正文一个字都不动——大小写、标点和内部
+    空格都是用户写给督导的原话，转述时不该被改写。分帧要洗的冒号由 sanitize
+    在发包那一步负责，不在这里。
+    """
+    stripped = (text or "").strip()
+    if not stripped.startswith("."):
+        return None, stripped
+
+    # split(None, 1) 按任意空白切，所以 `.wallop\t求助` 也认得。
+    parts = stripped.split(None, 1)
+    recipient = DOT_COMMANDS.get(parts[0].lower())
+    if recipient is None:
+        return None, stripped
+
+    return recipient, (parts[1].strip() if len(parts) > 1 else "")
+
+
 class FSDPilot:
     """飞行员的 FSD 连接。
 

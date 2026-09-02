@@ -784,7 +784,16 @@ class XpcWindow(QMainWindow):
         if not (self.fsd and self.fsd.connected):
             self.add_message(t("msg.not_connected"), theme.MUTED_COLOR)
             return
-        recipient = self.recipient_input.text().strip().upper()
+
+        # 点命令自带收件人，压过收件人框：`.wallop` 就是发给督导的，收件人框里
+        # 写着什么都不该改变这一点。
+        command_recipient, body = fsdpilot.parse_dot_command(body)
+        if command_recipient and not body:
+            # 空的 `.wallop` 发出去也只是给督导一条空消息。
+            self.add_message(t("msg.wallop_empty"), theme.MUTED_COLOR)
+            return
+
+        recipient = command_recipient or self.recipient_input.text().strip().upper()
         if not recipient:
             com1 = (self.snapshot or {}).get("com1")
             if not com1:
@@ -793,8 +802,12 @@ class XpcWindow(QMainWindow):
             # 发到频率上：@ 后面是 5 位电台频率，去掉开头的 1 和小数点
             recipient = f"@{int(round(com1 * 1000)) % 100000:05d}"
         if self.fsd.send_text(recipient, body):
-            self.add_message(t("msg.sent", recipient=recipient, body=body),
-                             theme.IDLE_COLOR)
+            if command_recipient == fsdpilot.WALLOP_RECIPIENT:
+                # `我 → *S:` 谁也看不懂，而且服务端随后还会回一条确认。
+                self.add_message(t("msg.wallop_sent", body=body), theme.IDLE_COLOR)
+            else:
+                self.add_message(t("msg.sent", recipient=recipient, body=body),
+                                 theme.IDLE_COLOR)
             self.message_input.clear()
 
     def send_ident(self):

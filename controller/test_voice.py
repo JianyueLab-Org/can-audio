@@ -299,9 +299,12 @@ class FakeServer:
         # True = 进不存在的频道时什么都不做，和真服务器一样（既不报错也不照做）。
         # 默认关着，因为多数用例根本不建频道就直接 _join(7) 试进频道的语义。
         self.strict_moves = False
+        # 建好之后没人进去、一被 MoveCmd 指到就已经销毁了的频道名。模拟"这个
+        # 频率上自始至终只有自己一个人"：临时频道一空就死，于是每一轮都是刚
+        # 建好就没了，MoveCmd 永远落空。
+        self.reap_on_move = set()
         self.by_name = {}
         self.my_channel = my_channel
-        self.next_id = 1
         self.commands = []
         self.blocking_calls = []
         self.messages = []
@@ -327,18 +330,40 @@ class FakeServer:
         with self.lock:
             if "name" in params:                    # CreateChannel
                 self.by_name[params["name"]] = {
-                    "channel_id": self.next_id,
+                    "channel_id": self._free_id(),
                     "name": params["name"],
                     "parent": params["parent"],
                     "temporary": params["temporary"],
                 }
-                self.next_id += 1
             elif "session" in params:               # MoveCmd
                 target = params["channel_id"]
+                # 命令到达的这一刻频道才空掉被销毁——解析出号和 MoveCmd 被处理
+                # 之间的那个窗口，正是真服务器上出事的地方。
+                # 直接改 by_name：调用点已经持有 self.lock，走 remove_channel 会死锁。
+                for name in [n for n in self.reap_on_move
+                             if self.by_name.get(n, {}).get("channel_id") == target]:
+                    del self.by_name[name]
                 if self.strict_moves and target not in {
                         c["channel_id"] for c in self.by_name.values()}:
                     return                          # 频道没了，服务器直接无视
                 self.my_channel = target
+
+    def _free_id(self):
+        """最小空闲频道号——真 Murmur 就是这么分的。
+
+        原来是一个只增不减的计数器，频道销毁之后号不回收。差别不在"号好不好
+        看"：频率频道是 temporary 的，一空就被销毁、下一轮又被建回来，真服务器
+        **几乎必然把刚释放的那个号原样发回来**。计数器版本永远发新号，于是
+        `_join_frequency` 里"号变了才重试"的守卫在这里必被走到、在真服务器上
+        永远走不到——实测日志里 8 次进频道失败，重试一次都没发生过。
+
+        调用点已经持有 self.lock。
+        """
+        used = {c["channel_id"] for c in self.by_name.values()}
+        candidate = 1                       # 0 是根频道
+        while candidate in used:
+            candidate += 1
+        return candidate
 
     def remove_channel(self, name):
         """服务器销毁一个空掉的临时频道。
@@ -587,15 +612,19 @@ class TemporaryChannelRemovedTest(unittest.TestCase):
         return old
 
     def test_a_removed_channel_is_not_joined_by_its_old_id(self):
-        old = self.switch_away_and_let_the_old_channel_die()
+        self.switch_away_and_let_the_old_channel_die()
 
         self.stack.select(118000)
         self.sync_and_wait()
 
-        self.assertNotEqual(self.client._channel_ids[118000], old,
-                            "频道已经被销毁，旧号不能再用")
         rebuilt = self.server.by_name.get("FREQ_118000")
         self.assertIsNotNone(rebuilt, "频道没了就该重建，不是拿着旧号一直试")
+        # **这里不能断言"号变了"。** 真 Murmur 发的是最小空闲号，一个刚被销毁
+        # 的临时频道重建出来，多半原样拿回**同一个号**；旧的假服务器只增不减地
+        # 发号，才让"号变了"看着像个有效判据。要紧的是记下来的号指向**活着的那
+        # 个频道**，而不是缓存里那个死号——这才是原来那条断言想说的事。
+        self.assertEqual(self.client._channel_ids[118000], rebuilt["channel_id"],
+                         "记下来的号没有指向重建出来的那个频道")
         self.assertEqual(self.server.my_channel, rebuilt["channel_id"],
                          "人没有进到 118.000 里去——MoveCmd 指着一个不存在的频道，"
                          "服务器不报错也不照做，日志里只会刷「5 秒内没有生效」")
@@ -1042,6 +1071,64 @@ class ReconnectLimitTest(unittest.TestCase):
         states.clear()
         client._on_disconnected()
         self.assertEqual([s for s, _ in states], [])
+
+
+class PrimaryChannelFallbackTest(unittest.TestCase):
+    """选中的主频率进不去时，要退到正在值守的席位频率。
+
+    主频率完全可能是个谁也不在的频道（手动加进来的、或者对方已经下线）：临时
+    频道一空就被销毁，于是每一轮刚建好就没了，MoveCmd 永远落空。原来这时候整个
+    电台栈一起降级成"只监听"——管制员**正在值守**的那个频率也跟着发不出话，而
+    界面上全是绿的。实测日志里就是这样：主频率是手动加的 118.000，席位频率
+    118.350 整晚只能收不能发。
+    """
+
+    def setUp(self):
+        self._timeout = voice.CHANNEL_TIMEOUT
+        voice.CHANNEL_TIMEOUT = 0.3
+
+        self.client = VoiceClient("host", "1000", "pw")
+        self.server = FakeServer(latency=0.02)
+        self.server.strict_moves = True
+        self.server.reap_on_move.add("FREQ_118000")     # 118.000 上没有第二个人
+        self.client.mumble = self.server
+        self.client.connected = True
+        self.client.running = True
+
+        self.stack = radiostack.RadioStack()
+        for khz in (118000, 118350):
+            self.stack.add(khz)
+            radio = self.stack.get(khz)
+            radio.rx = True
+            radio.tx = True
+        self.stack.select(118000)          # 手动加的那个当上了主频率
+        self.stack.locked_khz = 118350     # 数据源上正在值守的是 118.350
+
+    def tearDown(self):
+        voice.CHANNEL_TIMEOUT = self._timeout
+
+    def sync_and_wait(self):
+        thread = threading.Thread(target=self.client.sync, args=(self.stack,),
+                                  daemon=True)
+        thread.start()
+        thread.join(voice.CHANNEL_TIMEOUT * 8 + 5)
+        self.assertFalse(thread.is_alive(), "sync 没有在预算内返回")
+
+    def test_the_staffed_frequency_is_joined_when_the_selected_one_cannot_be(self):
+        self.sync_and_wait()
+
+        staffed = self.server.by_name.get("FREQ_118350")
+        self.assertIsNotNone(staffed, "席位频率的频道都没建出来")
+        self.assertNotEqual(self.server.my_channel, 0, "人还留在根频道")
+        self.assertEqual(self.server.my_channel, staffed["channel_id"],
+                         "没有退到席位频率——管制员正在值守的频率发不出话")
+
+    def test_the_frequency_that_could_not_be_joined_still_gets_a_listener(self):
+        self.sync_and_wait()
+
+        self.assertTrue(self.client._listening, "进不去的那个频率连监听都没挂上")
+        self.assertNotIn(self.server.my_channel, self.client._listening,
+                         "已经进去的频道不该再挂一份监听")
 
 
 if __name__ == "__main__":
