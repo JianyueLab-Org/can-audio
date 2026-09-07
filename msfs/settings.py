@@ -1,7 +1,17 @@
 """配置，存成当前目录下的 msfs_settings.json。
 
-密码是明文存的——和这个仓库里其他几个客户端一样。这不是好做法，但网络的
-FSD 密码就是网站密码，改法要三个仓库一起动，先照旧。
+**密码默认不再落盘。** 这里的 password 不是"这个客户端的密码"，它就是成员的
+网站密码：can-api 的 `VerifyNetworkCredential` 对两个列都认，注册和改密写进去
+的是同一个秘密。所以这个文件泄露一次，泄露的是整个账号——网站、FSD、语音一起。
+
+而这个文件躺的地方偏偏最容易被端走：它写在**当前工作目录**，也就是用户双击
+exe 的地方。会被云同步的游戏目录、报障时打包发过来的那个 zip，都是常见的落点。
+
+所以 `remember_password` 默认 False，`save()` 只在它为 True 时写 password。
+老配置里已经有明文密码的，`load()` 会把它读进内存（这次运行照常能连，不会
+突然登不上），然后立刻把文件重写掉、并把 `password_migrated` 置上让界面说一
+声——形状照着下面 OLD_MUMBLE_HOSTS 那个迁移来：**认得出老样子，就地改掉，
+并且说出来**。
 """
 
 import json
@@ -31,6 +41,9 @@ OLD_FSD_HOSTS = {"fsd.airwaysn.org"}
 DEFAULTS = {
     "cid": "",
     "password": "",
+    # 把密码存进这个文件。**默认关**，理由见模块开头：这是成员的网站密码，
+    # 而这个文件写在双击 exe 的那个目录里。想省事的人自己勾。
+    "remember_password": False,
     "real_name": "",
     "callsign": "",
     "aircraft": "",
@@ -87,6 +100,9 @@ def _clamp_volume(value, default=100):
 class Settings:
     def __init__(self, path=SETTINGS_FILE):
         self.path = path
+        # 这一次启动是不是刚把老配置里的明文密码清掉了。不进 DEFAULTS，
+        # 所以不落盘——它描述的是本次启动，不是配置。界面拿它提示一次。
+        self.password_migrated = False
         for key, value in DEFAULTS.items():
             setattr(self, key, value)
         self.load()
@@ -130,10 +146,37 @@ class Settings:
                                      legacy_key=self.ptt_key,
                                      legacy_joystick=self.joystick_ptt)
         log.info("read the settings from %s", os.path.abspath(self.path))
+        self._migrate_stored_password(data)
+
+    def _migrate_stored_password(self, data):
+        """老版本存下来的明文密码：本次还能用，但从文件里清掉。
+
+        认得出"老样子"的判据是 `remember_password` 这个键**不存在**——那只
+        可能是加上这个开关之前的版本写的。用户自己关掉记住密码的文件里这个
+        键是有的（值为 False），不会被反复当成待迁移。
+
+        故意不做成"读到就删、下次自己重打"这么干脆：那等于悄悄把人锁在外面。
+        密码留在内存里，这一次连接照常；文件当场重写；`password_migrated` 让
+        界面说一句，用户可以当场再勾上"记住密码"。
+        """
+        if "remember_password" in data or not (self.password or "").strip():
+            return
+        self.remember_password = False
+        self.password_migrated = True
+        log.info("an older version had stored the network password in cleartext "
+                 "in %s; it is being removed from the file. This session still "
+                 "has it, and 'remember password' is off unless the user turns "
+                 "it back on.", os.path.abspath(self.path))
+        self.save()
 
     def save(self):
         data = {key: getattr(self, key, DEFAULTS[key]) for key in DEFAULTS}
         data["ptt_bindings"] = ptt.dump(self.ptt_bindings)
+        # 没勾"记住密码"就不写。写空串而不是把键删掉：老版本读到空串是"没存
+        # 过密码"，读不到这个键也一样，但留着键能让上面那个迁移判据只认
+        # remember_password，不至于把用户自己清空的密码又当成待迁移。
+        if not self.remember_password:
+            data["password"] = ""
         # ptt_key / joystick_ptt 不再写回去：留着就有两个说了算的地方，而且它们
         # 加起来也表达不了鼠标侧键这一种。
         data.pop("ptt_key", None)

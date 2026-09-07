@@ -255,6 +255,10 @@ Three things that derivation gets wrong if you rewrite it by hand:
 
 **Authentication.** There are no local accounts — the Mumble server delegates to the Can web API via the Ice authenticator in `server/login.py`, which also kicks a prior session when the same name reconnects.
 
+**`-2` (fallthrough) is not "let it through, something downstream will check" — it is the whole check, and returning it for an unknown name admits that name.** It means *"this user is not mine, use your own account database"*, and Murmur only refuses an unregistered guest when `serverpassword` is non-empty. This deployment has never set one: the `Dockerfile` rewrites only `ice=` and `logfile=`, and `start.sh` writes only `icesecretwrite`. Meanwhile `fix_acl.py` grants Enter/Speak/Whisper/Listen/MakeTempChannel to the **`all`** group by design — and in Mumble `all` *includes unauthenticated users* (the group that excludes them is `auth`). So `authenticate()` returning `-2` for every name `user_id_for()` could not parse meant **username `guest` plus any password reached every `FREQ_*` channel with full transmit and receive, without `verify()` ever being called.** The reason the fallthrough existed is real — `SuperUser` must be able to log in, or the server's own admin entry is locked out by this authenticator — but that needs one name, not the entire complement. `MURMUR_LOCAL_ACCOUNTS` is that list, matched **exactly**: case variants, padding and affixes are not `SuperUser`, and Mumble's `SuperUser` cannot be renamed, so there is no reason to loosen it. Everything else is `AUTH_FAILED`, and is refused without spending an upstream request. Pinned by `test_a_name_this_authenticator_does_not_own_is_refused` and `test_only_the_exact_superuser_name_falls_through`.
+
+`nameToId` still answers `-2` for a name it does not recognise, and that is correct — it is a lookup, not an admission decision, and `-2` there only means "I don't know this name".
+
 That kick needs **two** Ice objects registered, which is easy to get wrong: `userConnected`/`userDisconnected` belong to `ServerCallback`, not `ServerAuthenticator`, so `setAuthenticator()` alone leaves `online_users` permanently empty and nothing is ever kicked. `main()` registers a `ServerCallbackI` via `addCallback()` as well, and seeds `online_users` from `getUsers()` for anyone already connected. All Ice calls carry the `{"secret": …}` context — `kickUser` without it raises `InvalidSecretException`.
 
 **Mumble 1.5 renamed the Ice slice module** from `Murmur` to `MumbleServer`; the interfaces themselves are unchanged (signatures checked against `v1.5.735/src/murmur/MumbleServer.ice`). `login.py` imports `MumbleServer` and falls back to `Murmur`, so it runs on either. Regenerate the bindings on the host with `slice2py /usr/share/mumble-server/MumbleServer.ice` — the generated package is gitignored. On Debian 13 the config lives at `/etc/mumble/mumble-server.ini`. The Mumble host is `audio.ceruleanavi.net`, hardcoded in `client/radio.py`, `xplane_client/radio.py`, `controller/gui.py`, `atis/gui.py` and `server/ATIS/mumble.py`, and a *settable default* in `xpc/settings.py` and `msfs/settings.py`.
@@ -300,8 +304,9 @@ That kick needs **two** Ice objects registered, which is easy to get wrong: `use
 `Listen` is the one that bites hardest: **Mumble 1.4 added it, so a server upgraded from 1.2/1.3 keeps an old root ACL without it**. Frequency channels are temporary children of root and inherit its ACL, so granting once on root covers all of them:
 
 ```powershell
-python server\fix_acl.py            # 只看，不改
-python server\fix_acl.py --apply    # 真的写进去
+python server\fix_acl.py                  # 只看，不改
+python server\fix_acl.py --apply          # 授给 all（历史行为，默认）
+python server\fix_acl.py --group auth     # 预览迁移：授给 auth 并从 all 收回
 ```
 
 Run it on the Mumble host (Ice only listens on `127.0.0.1`). It prints the root ACL with every permission bit spelled out, reports which of `REQUIRED` are missing and what each one breaks, ORs them into the `all` group entry that applies to subchannels, and reads back to confirm rather than trusting that `setACL` didn't throw. Bit values come from mumble's `src/ACL.h`.
@@ -309,6 +314,8 @@ Run it on the Mumble host (Ice only listens on `127.0.0.1`). It prints the root 
 If the permissions are all present and radios are still silent, the cause is the `listenersperuser` / `listenersperchannel` caps in `mumble-server.ini` instead — the `PERMISSIONDENIED` callbacks in `controller/voice.py` and `atis/broadcast.py` distinguish those cases by denial type.
 
 `getACL` returns inherited ACLs too and those are read-only; the script filters them before `setACL`. Root has none, but don't rely on that if you adapt it for another channel.
+
+**Which group holds those bits is a security decision, and the default is the historical one.** Mumble's `all` group **includes unauthenticated users** — the group that excludes them is `auth`. Granting the voice permissions to `all` is only safe because `login.py` refuses every name it does not own (see `MURMUR_LOCAL_ACCOUNTS` above); it is one gate, not two. `--group auth` performs the migration, and it is genuinely two steps — grant to `auth` **and** strip the same bits from `all`, since leaving `all`'s copy in place achieves nothing. The script creates the `auth` entry if none exists and inserts it ahead of `all`, because Mumble evaluates ACLs in order and a later entry overrides an earlier one. Run the dry run on the host and read it before applying: the migration is correct only if every legitimate connection is authenticated, which for this repo means members (numeric CAN ID), ATIS bots (`{cid}_atis{freq6}`) and SuperUser — all of them are. Anything connecting as a guest would silently lose the ability to hear or speak. `test_fix_acl.py` covers the selection and construction logic; the Ice round trip is not testable off-host.
 
 **`sync()` is expensive, so a burst of stack changes must collapse — not queue.** This is the shape of a real 13-hour log (`can-controller.log`): 202 channel creations, 180 "the channel is gone", 40 move requests that never took effect, **93 of the creations in the same second as the previous one**, up to 34 in a single minute, and the server eventually answering `ChannelName` (duplicate) — while the controller sat in root all evening hearing nothing, with a green UI. Four things made that storm, all fixed and pinned by `SyncStormTest`:
 
@@ -536,3 +543,98 @@ The naming has caught up: the network is **Cerulean Aviation Network (formerly A
 
 - `xplane_client/API.md` — X-Plane UDP protocol notes (BECN discovery on `239.255.1.1:49707`, RREF requests, dataref precision) and a SimConnect-vs-X-Plane comparison table. Applies to `xpc/xplane.py` too, except that XPC subscribes rather than polls.
 - `client/API.md` — vendored upstream pymumble API reference, not project documentation.
+
+## Credentials, versions and the update check
+
+Four things that were each wrong in a way nothing reported, fixed together. They share a shape:
+the mechanism was present and the check inside it was not, so from the outside everything looked
+healthy.
+
+**The voice server's certificate is pinned by SHA-256 fingerprint.** `mumblecompat.py` used to
+build its TLS context with `check_hostname = False` and `verify_mode = CERT_NONE`, justified in the
+docstring by the fact that the official Mumble client authenticates a server *by fingerprint*
+rather than by CA chain — but no fingerprint check existed here, and pymumble does none either, so
+neither half of that argument held. The password on that socket is the member's **website**
+password (can-api's `VerifyNetworkCredential` accepts it against either column), so anyone able to
+sit in the middle got the whole account.
+
+The check has to go where it now is and nowhere else. pymumble 1.6.1 **wraps before it connects**
+(`mumble.py`'s `connect`): `ssl.wrap_socket(std_sock, …)` on an unconnected socket, then
+`control_socket.connect(...)` — which is where the handshake happens — and only *then* the
+`Version` and `Authenticate` messages. So `_PinnedSSLSocket` overrides the socket's `connect()`
+and verifies before returning, which is the one point after the handshake and before the
+credential. Wrapping `Mumble.connect` from outside is too late: the password has already gone.
+It is an `ssl.SSLSocket` subclass installed via `SSLContext.sslsocket_class`, not a proxy, because
+pymumble's main loop `select`s on it and `_RetryingSocket` wraps it again.
+
+`CertificatePinError` is **deliberately not an `OSError`**: pymumble's `connect()` catches
+`socket.error` around exactly that region, so an `OSError` would be swallowed into a plain
+"connection failed" and then retried three times by `BoundedReconnect` — a man in the middle
+retried three times is still a man in the middle, only now the log reads like a flaky network.
+
+Two operational facts follow, and the first one can strand every client at once:
+
+- **Murmur's certificate lives in `/var/lib/mumble-server`.** Lose that volume and the server
+  self-signs a new one, at which point every shipped client refuses to connect and there is no
+  remote fix. `PINNED_FINGERPRINTS` is a tuple so a rotation can ship **both** fingerprints, wait
+  for people to update, and only then drop the old one.
+- `CAN_MUMBLE_FINGERPRINTS` (comma or space separated, colons and case tolerated) replaces the
+  built-in list — the escape hatch for that rotation and for self-hosted servers. An **empty**
+  value means "not set", not "no pinning", or the variable would itself be a bypass switch.
+
+Only `audio.ceruleanavi.net` is enforced. `xpc`/`msfs` let a member set `mumble_host`, and pointing
+a client at a test server or an intranet mirror is deliberate — those get the fingerprint logged at
+INFO instead, so anyone who wants to pin their own server can read it off. The current pin was
+taken from the live server (`openssl s_client -connect audio.ceruleanavi.net:64738 </dev/null |
+openssl x509 -noout -fingerprint -sha256`); both A records serve the same certificate.
+
+**A packaged release reports the tag it was built from, and `DEV` no longer overrides that.**
+`version.py`'s `DEV = True` has been on `main` since 2026-08-07, and `release.yml` fires on every
+push to `main` without ever flipping it — there is no `sed` on `version.py` anywhere in the
+workflow. So `version()` returned `_bump_patch(release_version())` in shipped builds: the package
+tagged `v2.2.3` called itself `2.2.4 (Dev Build 1)`. That is not merely cosmetic. The update check
+compares numerically on both sides, so a user on v2.2.3 self-reporting `2.2.4` is told "you are
+current" when v2.2.4 actually ships — **every release permanently skips the one after it**, on all
+four clients, silently.
+
+The fix is to stop depending on anyone remembering to flip a constant. `freeze()` records whether
+`CAN_VERSION` was supplied (`RELEASE_KEY` in `buildinfo.json`), which is exactly what separates a
+CI build — whose number comes from counting tags and really will be published — from a hand-run
+`pyinstaller`. `is_dev()` reads that mark, and `version()`/`display()`/`full()` all go through it.
+`DEV` therefore governs only source runs and local packages, which genuinely are test builds.
+"Any `buildinfo.json` means release" would have been wrong: `freeze()` writes it into the component
+directory, so one local build would make every later source run claim to be a release.
+
+**`update.py` matches can-api's actual response, which it never did.** It tested a top-level
+`update_available` that can-api has never sent (the verdict is nested: `update.available`), so the
+check returned "no update" every single time, on all four clients, and looked exactly like there
+being no update. Behind that sat a second fault: the top-level `client` field is the package **name
+as a string**, while the per-build object with `version`/`size`/`download` lives under
+`clients[<name>]` — so fixing only the first line would have produced `AttributeError: 'str' object
+has no attribute 'get'` on a line outside the `try` (which covers only the `urlopen`), escaping
+into an unguarded worker thread where `update_found` simply never fires. The parse is now inside
+its own `try` for that reason. `xpc/test_xpc.py`'s `UpdateCheckTest` builds the real can-api
+payload; when this was written the old mocks reproduced can-web's long-dead shape, which is why
+every one of them passed against dead code.
+
+**The pilot clients no longer write the network password to disk by default.** `xpc`/`msfs`
+persisted `password` in cleartext next to the username, in a settings file written to the **current
+working directory** — an X-Plane or MSFS community folder, a synced game directory, a support
+bundle. `remember_password` now defaults off and `save()` writes the field only when it is on. A
+file from an older version is recognised by the *absence* of the `remember_password` key: the
+password is read into memory so the session in progress still connects, the file is rewritten
+immediately rather than at the next save, and `password_migrated` makes the client say so — the
+same shape as the `OLD_MUMBLE_HOSTS` rewrite. Dropping it without saying anything would look like
+the client losing the password; keeping it would leave the leak in place.
+
+**Still open: the pbh sign, and it is not safe to guess.** can-fsd's `normaliseSigned`
+(`internal/fsd/packet.go`) begins `v = -v`, so it decodes pitch and bank as the negation of what
+`xpc`/`msfs`'s `fsdpilot.py` encodes. `test_xpc.py`'s reference `unpack_pbh` — which
+`fsdpilot.py` names as the arbiter — is a transcription of that Go function that dropped the same
+line, so `PbhTest` round-trips can-audio against a copy of its own convention and passes while both
+halves may be wrong. Neither side's tests pin it: can-fsd's `TestPitchBankHeading` checks only the
+heading round-trip and that all three axes stay in range, and `docs/protocol.md` documents the bit
+layout without mentioning a sign. **Which side matches the external openfsd/EuroScope convention
+cannot be decided from this tree**, and changing the wrong one inverts aircraft attitude for
+everybody, so it has been left alone. Settle it against openfsd or a real EuroScope capture, not
+against either copy here.

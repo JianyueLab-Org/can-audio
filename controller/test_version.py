@@ -138,14 +138,21 @@ class DevBuildTest(unittest.TestCase):
     """
 
     def setUp(self):
+        import tempfile
         self._dev = version.DEV
         self._build = version.DEV_BUILD
         self._cache = version._cached_version
+        # 目录里可能真的躺着一个 buildinfo.json——在组件目录里手工跑过一次
+        # pyinstaller 就会留下一个，而且是 gitignore 的，别人的机器上看不见。
+        # 指到一个空目录，这一类就只测 DEV 常量那条路。
+        self._resource_dir = version._resource_dir
+        version._resource_dir = lambda: tempfile.mkdtemp()
 
     def tearDown(self):
         version.DEV = self._dev
         version.DEV_BUILD = self._build
         version._cached_version = self._cache
+        version._resource_dir = self._resource_dir
 
     def test_the_dev_flag_is_a_plain_bool(self):
         # 开发分支上 DEV 可以是 True（当前就是）；这里只钉住类型和 build 号
@@ -181,6 +188,143 @@ class DevBuildTest(unittest.TestCase):
         version._cached_version = "2.1.1"
         version.DEV = False
         self.assertEqual(version.display(), "2.1.1")
+
+
+class ReleaseBuildTest(unittest.TestCase):
+    """**CI 打的正式包报的必须是真的发出去的那个号，DEV 说什么都不算。**
+
+    这条是补一个真出过的事故。`DEV = True` 从 2026-08-07 起就在 main 上，
+    而 release.yml 每次推到 main 都打包发版，却从来没有一条 sed 去翻那个常量
+    （工作流里搜不到）。于是 v2.2.3 那个 tag 打出来的包把自己报成 2.2.4，
+    标题栏写 "2.2.4 (Dev Build 1)"。
+
+    显示难看是小事，查更新才是大事：服务端按数值比，装了 v2.2.3 的人自报
+    2.2.4，等 v2.2.4 真发出来时 CompareVersions("2.2.4","2.2.4") 不大于 0，
+    回的是"已经是最新"——**每个版本永久跳过它的下一个版本**，四个客户端一起，
+    而且安静得像本来就没有更新。
+
+    所以判断改成看 buildinfo.json 里 CI 写下的标记，不再靠人记得翻常量。
+    """
+
+    def setUp(self):
+        import tempfile
+        self._dev = version.DEV
+        self._build = version.DEV_BUILD
+        self._cache = version._cached_version
+        self._resource_dir = version._resource_dir
+        self._folder = tempfile.mkdtemp()
+        version._resource_dir = lambda: self._folder
+        version._cached_version = None
+
+    def tearDown(self):
+        version.DEV = self._dev
+        version.DEV_BUILD = self._build
+        version._cached_version = self._cache
+        version._resource_dir = self._resource_dir
+
+    def write(self, **fields):
+        import json
+        with open(os.path.join(self._folder, version.BUILDINFO_NAME), "w",
+                  encoding="utf-8") as f:
+            json.dump(fields, f)
+        version._cached_version = None
+
+    # ---------- 标记本身 ----------
+    def test_a_ci_package_is_not_a_dev_build_even_with_the_flag_on(self):
+        version.DEV = True
+        self.write(version="2.2.3", build="123.abcdef0",
+                   **{version.RELEASE_KEY: True})
+        self.assertTrue(version.is_release_build())
+        self.assertFalse(version.is_dev(),
+                         "DEV 常量不该管得着 CI 打的正式包")
+        self.assertEqual(version.version(), "2.2.3",
+                         "正式包报的必须是 tag 上那个号，不是它加一")
+        self.assertEqual(version.display(), "2.2.3")
+        self.assertNotIn("Dev Build", version.full())
+
+    def test_a_locally_built_package_is_still_a_dev_build(self):
+        """手工 `pyinstaller gui.spec` 打的包没有 CAN_VERSION，还是测试版。
+
+        它确实是——那个号没有 tag，谁也拿不到。也正因为这样，"有
+        buildinfo.json 就算正式包"这条规则是不行的：手工打包会把文件留在
+        源码目录里，之后从源码跑也会被当成正式包。
+        """
+        version.DEV = True
+        self.write(version="2.2.0", build="123.abcdef0",
+                   **{version.RELEASE_KEY: False})
+        self.assertFalse(version.is_release_build())
+        self.assertTrue(version.is_dev())
+        self.assertEqual(version.version(), "2.2.1")
+        self.assertIn("Dev Build", version.display())
+
+    def test_running_from_source_is_unaffected(self):
+        """没有 buildinfo.json（从源码跑）时 DEV 照旧说了算。"""
+        version.DEV = True
+        self.assertFalse(version.is_release_build())
+        self.assertTrue(version.is_dev())
+        version.DEV = False
+        self.assertFalse(version.is_dev())
+
+    def test_a_broken_buildinfo_is_not_a_release(self):
+        """读不出来就当没有，不能抛——起不来比版本号显示错严重得多。"""
+        with open(os.path.join(self._folder, version.BUILDINFO_NAME), "w",
+                  encoding="utf-8") as f:
+            f.write("{ 这不是 json")
+        version._cached_version = None
+        self.assertFalse(version.is_release_build())
+        self.assertIsInstance(version.version(), str)
+
+    # ---------- freeze() 写标记 ----------
+    def test_freeze_marks_a_ci_build(self):
+        import json
+        import tempfile
+        folder = tempfile.mkdtemp()
+        original = os.environ.get(version.VERSION_ENV)
+        os.environ[version.VERSION_ENV] = "2.2.3"
+        try:
+            version.freeze(folder, source_dir=repo_root())
+        finally:
+            if original is None:
+                os.environ.pop(version.VERSION_ENV, None)
+            else:
+                os.environ[version.VERSION_ENV] = original
+        with open(os.path.join(folder, version.BUILDINFO_NAME),
+                  encoding="utf-8") as f:
+            written = json.load(f)
+        self.assertEqual(written["version"], "2.2.3")
+        self.assertIs(written[version.RELEASE_KEY], True)
+
+    def test_freeze_without_the_env_var_does_not_mark_a_release(self):
+        import json
+        import tempfile
+        folder = tempfile.mkdtemp()
+        original = os.environ.pop(version.VERSION_ENV, None)
+        try:
+            version.freeze(folder, source_dir=repo_root())
+        finally:
+            if original is not None:
+                os.environ[version.VERSION_ENV] = original
+        with open(os.path.join(folder, version.BUILDINFO_NAME),
+                  encoding="utf-8") as f:
+            written = json.load(f)
+        self.assertEqual(written["version"], version.VERSION)
+        self.assertIs(written[version.RELEASE_KEY], False)
+
+    # ---------- 这才是真正会疼的那一条 ----------
+    def test_a_release_is_still_offered_the_next_release(self):
+        """v2.2.3 的包必须自报 2.2.3，否则永远收不到 v2.2.4。
+
+        用查更新那套真的比较函数走一遍，而不是只比字符串——两边同一套判据
+        才有意义。
+        """
+        import update
+        version.DEV = True
+        self.write(version="2.2.3", build="123.abcdef0",
+                   **{version.RELEASE_KEY: True})
+        reported = version.version()
+        self.assertTrue(
+            update.is_newer("2.2.4", reported),
+            f"这个包报 {reported}，服务端会判它已经是最新，v2.2.4 永远发不到它手上")
 
 
 class CopiesAgreeTest(unittest.TestCase):

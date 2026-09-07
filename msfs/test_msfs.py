@@ -1235,5 +1235,121 @@ class SharedCopyTest(unittest.TestCase):
                 f"{name} 和 xpc 的那份不一样了——改了一边就要把另一边同步过去")
 
 
+class StoredPasswordTest(unittest.TestCase):
+    """密码不再默认落盘。
+
+    这一格里的 password 不是"这个客户端的密码"——它就是成员的**网站密码**：
+    can-api 的 `VerifyNetworkCredential` 对两个列都认，注册和改密写进去的是
+    同一个秘密。所以配置文件泄露一次，泄露的是整个账号。
+
+    而它躺的地方偏偏最容易被端走：写在**当前工作目录**，也就是用户双击 exe
+    的地方——MSFS 的 Community 文件夹、会被云同步的游戏目录、报障时打包发过来的那个 zip。
+
+    迁移的形状照着 OLD_MUMBLE_HOSTS 那个来：认得出老样子，就地改掉，并且
+    说出来。这里最要紧的一条是**不能把人悄悄锁在外面**，所以老密码这一次
+    还在内存里，连接照常。
+    """
+
+    def setUp(self):
+        import settings as settings_module
+        self.module = settings_module
+        self.temp = tempfile.mkdtemp(prefix="msfs_settings_")
+        self.addCleanup(shutil.rmtree, self.temp, True)
+        self.path = os.path.join(self.temp, "msfs_settings.json")
+
+    def write(self, data):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    def read(self):
+        with open(self.path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    # ---------- 默认 ----------
+    def test_remembering_is_off_by_default(self):
+        self.assertIs(self.module.DEFAULTS["remember_password"], False,
+                      "默认存网站密码是不行的")
+
+    def test_a_password_is_not_written_unless_asked(self):
+        s = self.module.Settings(self.path)
+        s.cid = "1234"
+        s.password = "hunter2"
+        s.save()
+        self.assertEqual(self.read()["password"], "",
+                         "没勾记住密码，密码不该出现在文件里")
+        self.assertEqual(self.read()["cid"], "1234", "别的字段照旧存")
+
+    def test_ticking_the_box_stores_it(self):
+        """勾了就是勾了——这是用户自己的决定，不能替他做主。"""
+        s = self.module.Settings(self.path)
+        s.password = "hunter2"
+        s.remember_password = True
+        s.save()
+        self.assertEqual(self.read()["password"], "hunter2")
+        self.assertIs(self.read()["remember_password"], True)
+        again = self.module.Settings(self.path)
+        self.assertEqual(again.password, "hunter2")
+        self.assertIs(again.remember_password, True)
+        self.assertFalse(again.password_migrated, "这不是待迁移的老配置")
+
+    # ---------- 老配置 ----------
+    def test_an_old_file_still_connects_this_session(self):
+        """**不能悄悄把人锁在外面。**
+
+        老版本存下来的密码这一次还要能用：读进内存，连接照常。下次启动那一格
+        才是空的，而界面会说明原因（msg.password_dropped）。
+        """
+        self.write({"cid": "1234", "password": "hunter2"})
+        s = self.module.Settings(self.path)
+        self.assertEqual(s.password, "hunter2", "这一次运行还得连得上")
+        self.assertTrue(s.password_migrated, "界面要靠它提示一句")
+
+    def test_an_old_file_is_rewritten_at_once(self):
+        """当场重写，不等下一次 save()。
+
+        等的话，一个只是打开看看就关掉的用户，明文密码原封不动留在那儿。
+        """
+        self.write({"cid": "1234", "password": "hunter2"})
+        self.module.Settings(self.path)
+        self.assertEqual(self.read()["password"], "")
+        self.assertIs(self.read()["remember_password"], False)
+
+    def test_the_migration_only_happens_once(self):
+        self.write({"cid": "1234", "password": "hunter2"})
+        self.module.Settings(self.path)
+        second = self.module.Settings(self.path)
+        self.assertFalse(second.password_migrated,
+                         "已经迁过的文件不该再被当成老配置")
+        self.assertEqual(second.password, "")
+
+    def test_turning_it_back_off_clears_what_was_stored(self):
+        """取消勾选要真的把文件里那份删掉，不能只是不再更新它。"""
+        self.write({"cid": "1234", "password": "hunter2",
+                    "remember_password": True})
+        s = self.module.Settings(self.path)
+        self.assertEqual(s.password, "hunter2")
+        self.assertFalse(s.password_migrated)
+        s.remember_password = False
+        s.save()
+        self.assertEqual(self.read()["password"], "")
+
+    def test_an_empty_old_password_is_not_a_migration(self):
+        """没存过密码的老配置不该弹那句提示。"""
+        for value in ("", "   "):
+            self.write({"cid": "1234", "password": value})
+            s = self.module.Settings(self.path)
+            self.assertFalse(s.password_migrated)
+
+    def test_a_user_who_cleared_their_password_is_not_re_migrated(self):
+        """自己关掉记住密码之后，password 是空串但键是在的。
+
+        判据认的是 `remember_password` 这个键在不在，不是密码空不空——否则
+        每次启动都会重跑一遍迁移，提示也会每次都弹。
+        """
+        self.write({"cid": "1234", "password": "", "remember_password": False})
+        s = self.module.Settings(self.path)
+        self.assertFalse(s.password_migrated)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -302,35 +302,53 @@ class AuthenticateTest(UpstreamTestCase):
         self.authenticate("1000", "pw")
         self.assertEqual(self.kicked, [], "登录失败不该把在线的自己踢下去")
 
-    def test_a_non_numeric_name_falls_through_to_murmur(self):
-        """既不是纯数字也不是通播格式的名字要**放行**，不是拒绝。
-
-        -2（fallthrough）是 Murmur 约定的"交回内部账号库"：SuperUser 走的就是
-        这条路，回 -1 会把服务器自己的管理入口锁死。内部库不认识的名字最终
-        照样登不进来，所以放行不等于放水。也不该在放行前先去问上游——那是
-        白付一次 HTTP 往返。
-        """
-        fake = self.upstream(Response(200))
-        user_id, _, _ = self.authenticate("不是数字", "pw")
-        self.assertEqual(user_id, login_module.AUTH_FALLTHROUGH)
-        self.assertEqual(fake.calls, [], "非本认证器的名字不该拿去问 can-web")
-
     def test_superuser_can_still_log_in(self):
         self.upstream(Response(200))
         user_id, _, _ = self.authenticate("SuperUser", "pw")
         self.assertEqual(user_id, login_module.AUTH_FALLTHROUGH)
+
+    def test_a_name_this_authenticator_does_not_own_is_refused(self):
+        """本认证器不认识的名字要**拒绝**，不是交回 Murmur。
+
+        这里原来回的是 -2（fallthrough），依据是"内部库不认识的名字最终照样
+        登不进来"。那个前提不成立：-2 的含义是"这个用户不归我管，用你自己的
+        账号库"，而 Murmur 只在 serverpassword 非空时才拦未注册的访客——这个
+        部署里 serverpassword 从没设过（Dockerfile 只改 ice= 和 logfile=，
+        start.sh 只写 icesecretwrite，全仓 grep 不到第三处）。与此同时
+        fix_acl.py 把 Enter/Speak/Whisper/Listen/MakeTempChannel 授给 `all`
+        组，而 Mumble 的 `all` 是**包含未认证用户**的（`auth` 才不包含）。
+
+        于是用户名填 guest、口令随便填就能落地，并在任意 FREQ_* 频道上对实时
+        流量收发话音——verify() 一次都没被调用过。
+        """
+        fake = self.upstream(Response(200))
+        user_id, _, _ = self.authenticate("guest", "无所谓")
+        self.assertEqual(user_id, login_module.AUTH_FAILED)
+        self.assertEqual(fake.calls, [], "不归我们管的名字不该拿去问上游")
+
+    def test_only_the_exact_superuser_name_falls_through(self):
+        """放行名单要精确匹配，否则它自己就成了新的绕过口子。
+
+        Murmur 的 SuperUser 就是这个拼写，不可改名。任何变体都不是它。
+        """
+        self.upstream(Response(200))
+        for name in ("superuser", "SUPERUSER", "SuperUser ", "SuperUserX",
+                     "_SuperUser"):
+            with self.subTest(name=name):
+                user_id, _, _ = self.authenticate(name, "pw")
+                self.assertEqual(user_id, login_module.AUTH_FAILED)
 
     def test_a_malformed_atis_name_is_not_given_a_bogus_id(self):
         """`_atis` 后面不是正好 6 位的，不能当通播账号放行。
 
         旧正则不卡结尾，1000_atis1180001 也算匹配，取 id 时 split 拿到 7 位的
         1180001——凭空造出一个谁也不认识的用户 id，而且它和任何真实频率都对不上。
-        现在这种名字既不匹配通播格式、也不是纯数字，交回 Murmur 内部账号库
-        （那边不认识它，最终照样被拒），**绝不会**拿到任何用户 id。
+        现在这种名字既不匹配通播格式、也不是纯数字，且不在
+        MURMUR_LOCAL_ACCOUNTS 里，所以直接被拒，**绝不会**拿到任何用户 id。
         """
         self.upstream(Response(200))
         user_id, _, _ = self.authenticate("1000_atis1180001", "pw")
-        self.assertEqual(user_id, login_module.AUTH_FALLTHROUGH)
+        self.assertEqual(user_id, login_module.AUTH_FAILED)
 
     def test_a_fullwidth_numeric_name_is_not_the_same_account(self):
         """int("１０００") == 1000——全角数字的名字绝不能拿到 1000 的用户 id。
@@ -340,7 +358,7 @@ class AuthenticateTest(UpstreamTestCase):
         self.upstream(Response(200))
         user_id, _, _ = self.authenticate("１０００", "pw")
         self.assertNotEqual(user_id, 1000)
-        self.assertEqual(user_id, login_module.AUTH_FALLTHROUGH)
+        self.assertEqual(user_id, login_module.AUTH_FAILED)
 
 
 class UserIdAgreementTest(unittest.TestCase):
@@ -418,9 +436,6 @@ class WatchConnectionTest(unittest.TestCase):
         login_module.watch_connection(Server(), {"secret": "s"}, interval=0.01)
         self.assertEqual(seen, [{"secret": "s"}])
 
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 class KickTest(unittest.TestCase):
     """真的去踢人的那一半。
@@ -528,3 +543,10 @@ class KickTest(unittest.TestCase):
         output = self.capture(
             lambda: self.make(server).kick_previous_session("1000"))
         self.assertEqual(output, "")
+
+
+# **必须放在文件末尾。** 原来它在 KickTest 之前，于是 `python test_login.py`
+# 在 KickTest 还没定义时就开跑，静默少收 5 个测试（32 而不是 37）——而漏掉的
+# 恰好是踢人那一组，也就是当年"整组静默失效、其余照常绿"的那个盲区。
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

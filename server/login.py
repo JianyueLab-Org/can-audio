@@ -51,6 +51,23 @@ AUTH_FAILED = -1
 AUTH_FALLTHROUGH = -2
 AUTH_TEMPORARY_FAILURE = -3
 
+# 允许交回 Murmur 内部账号库的名字，**精确匹配，只有这些**。
+#
+# -2 不是"先放过去、后面还有一道关"。它的意思是"这个用户不归我管"，而 Murmur
+# 只在 serverpassword 非空时才拦未注册的访客。这个部署里 serverpassword 从来
+# 没设过：Dockerfile 只改 ice= 和 logfile=，start.sh 只写 icesecretwrite。
+# 与此同时 fix_acl.py 按设计把 Enter/Speak/Whisper/Listen/MakeTempChannel 授给
+# `all` 组，而 Mumble 的 `all` **包含未认证用户**（不含未认证的是 `auth`）。
+#
+# 所以对任意名字回 -2，等于让任何人填个用户名就落地并在所有 FREQ_* 频道上收发
+# 话音。这里原来是"凡是 user_id_for 认不出的就 -2"，理由是 SuperUser 要能登进
+# 来——那个需求是真的（回 -1 会把服务器自己的管理入口锁死），但它只需要这一个
+# 名字，不需要整个补集。
+#
+# 名单要精确匹配：大小写变体、带空格、带前后缀的都不是 SuperUser。Mumble 的
+# SuperUser 就是这个拼写且不可改名，所以不必也不该放宽。
+MURMUR_LOCAL_ACCOUNTS = frozenset({"SuperUser"})
+
 # 全局关闭标志，Ctrl+C 时立即设置，阻止清理时再做 Ice 调用
 _shutting_down = False
 
@@ -157,14 +174,17 @@ class AuthenticatorI(MumbleIce.ServerAuthenticator):
     def authenticate(self, name, pw, certificates, certhash, certstrong, current=None):
         try:
             print(f"认证用户: {name}")
-            # 名字既不是纯数字也不是通播格式的（SuperUser、Murmur 本地账号）
-            # 要**放行**给 Murmur 自己的账号库，不是拒绝。原来这一步是在
-            # try 里靠 int(name) 抛异常兜到 AUTH_FAILED 的——SuperUser 从此
-            # 永远登不进来，服务器自己的管理入口被这只认证器锁死。
+            # 名字既不是纯数字也不是通播格式的，只有 MURMUR_LOCAL_ACCOUNTS
+            # 里那几个才**放行**给 Murmur 自己的账号库（SuperUser 要能登进来，
+            # 否则服务器自己的管理入口被这只认证器锁死）。其余一律拒绝：
+            # 这个部署没有 serverpassword，而 `all` 组带着收发话音的权限，
+            # 所以放行给未注册的名字就是直接放人进来。见常量处的说明。
             try:
                 user_id = user_id_for(name)
             except ValueError:
-                return (AUTH_FALLTHROUGH, "", [])
+                if name in MURMUR_LOCAL_ACCOUNTS:
+                    return (AUTH_FALLTHROUGH, "", [])
+                return (AUTH_FAILED, "", [])
             if is_atis_name(name):
                 print(f"匹配到ATIS登录: {name}")
                 result = login_ATIS(name, pw)

@@ -180,6 +180,12 @@ class MsfsWindow(QMainWindow):
         self.traffic_timer.timeout.connect(self.traffic_tick)
         self.traffic_timer.start(200)
 
+        # 老配置里的明文密码刚被清掉的话，说一声。**不能不说**：密码还在这
+        # 次运行的内存里，所以现在连得上，但下次启动那一格就是空的——不解释
+        # 一句的话，那看起来就是客户端把密码弄丢了。
+        if getattr(self.settings, "password_migrated", False):
+            self.add_message(t("msg.password_dropped"), theme.ACTIVE_COLOR)
+
         # 起来之后在后台问一次有没有新版。查不到就当没这回事。
         self.check_for_update()
 
@@ -241,6 +247,11 @@ class MsfsWindow(QMainWindow):
         self.cid_input.setPlaceholderText(t("connect.cid"))
         self.password_input = PasswordLineEdit()
         self.password_input.setText(self.settings.password)
+        # 默认不勾：这一格里的是成员的**网站密码**，而配置文件就写在双击 exe
+        # 的那个目录里（见 settings.py 开头）。想省事的人自己勾。
+        self.remember_check = CheckBox(t("connect.remember"))
+        self.remember_check.setChecked(bool(self.settings.remember_password))
+        self.remember_check.setToolTip(t("connect.remember_hint"))
         self.aircraft_input = LineEdit()
         self.aircraft_input.setText(self.settings.aircraft)
         self.aircraft_input.setPlaceholderText(t("connect.aircraft_hint"))
@@ -282,6 +293,14 @@ class MsfsWindow(QMainWindow):
         observer_hint.setStyleSheet(f"color: {theme.IDLE_COLOR};")
         observer_hint.setWordWrap(True)
         grid.addWidget(observer_hint, 2, 3, 1, 6)
+
+        # 排在密码那两列的正下方（0 行 4-5 列），中间隔着的两行是状态和观察员。
+        # 放这儿而不是塞进设置对话框：勾不勾是每次填密码时该看见的事。
+        grid.addWidget(self.remember_check, 3, 4, 1, 2)
+        remember_hint = CaptionLabel(t("connect.remember_hint"))
+        remember_hint.setStyleSheet(f"color: {theme.IDLE_COLOR};")
+        remember_hint.setWordWrap(True)
+        grid.addWidget(remember_hint, 3, 6, 1, 3)
         return card.body(grid)
 
     def _build_messages(self):
@@ -429,10 +448,12 @@ class MsfsWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return
 
-        # 存下来，下次开机不用重填
+        # 存下来，下次开机不用重填。密码是例外：勾了"记住密码"才落盘，
+        # 没勾的话它只活在内存里（settings.save() 会写空串）。
         self.settings.callsign = callsign
         self.settings.cid = cid
         self.settings.password = password
+        self.settings.remember_password = self.remember_check.isChecked()
         self.settings.aircraft = self.aircraft_input.text().strip().upper()
         self.settings.save()
 
