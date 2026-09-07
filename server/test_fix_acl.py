@@ -14,42 +14,59 @@ import types
 import unittest
 
 
+class _ACL:
+    """替身要和 slice 生成的类一样：字段全部可写，构造不要求参数。"""
+
+    def __init__(self):
+        self.applyHere = False
+        self.applySubs = False
+        self.inherited = False
+        self.userid = 0
+        self.group = ""
+        self.allow = 0
+        self.deny = 0
+
+
 def _install_stubs():
-    if "Ice" not in sys.modules:
-        ice = types.ModuleType("Ice")
+    """装上 fix_acl 导入时要的替身。
+
+    **补齐已有模块，不是「有就跳过」。** unittest discover 在同一个进程里按
+    字母序导入所有 test_*，所以这里和 test_login 的替身会撞在一起：谁先跑，
+    后一个就看到 sys.modules 里已经有了。两份替身各自只装自己要的东西——
+    test_login 装 ServerAuthenticator/ServerCallback，这里装 ACL——于是
+    「有就跳过」的写法必然让后来者拿到一个缺字段的模块。两个方向都会炸，
+    而分文件单独跑（各自新进程）永远看不到。
+    """
+    ice = sys.modules.setdefault("Ice", types.ModuleType("Ice"))
+    if not hasattr(ice, "Exception"):
         ice.Exception = type("Exception", (Exception,), {})
+    if not hasattr(ice, "ConnectionTimeoutException"):
+        ice.ConnectionTimeoutException = type(
+            "ConnectionTimeoutException", (ice.Exception,), {})
+    if not hasattr(ice, "InitializationData"):
         ice.InitializationData = lambda: types.SimpleNamespace(properties=None)
         ice.createProperties = lambda: types.SimpleNamespace(
             setProperty=lambda *a: None)
         ice.initialize = lambda *a, **k: None
-        sys.modules["Ice"] = ice
 
-    if "MumbleServer" not in sys.modules:
-        mumble = types.ModuleType("MumbleServer")
-
-        class ACL:
-            """替身要和 slice 生成的类一样：字段全部可写，构造不要求参数。"""
-
-            def __init__(self):
-                self.applyHere = False
-                self.applySubs = False
-                self.inherited = False
-                self.userid = 0
-                self.group = ""
-                self.allow = 0
-                self.deny = 0
-
-        mumble.ACL = ACL
-        for name in ("ServerPrx", "MetaPrx"):
+    mumble = sys.modules.setdefault("MumbleServer", types.ModuleType("MumbleServer"))
+    if not hasattr(mumble, "ACL"):
+        mumble.ACL = _ACL
+    # login.py 继承这两个，所以它们必须是真的类。
+    for name in ("ServerAuthenticator", "ServerCallback"):
+        if not hasattr(mumble, name):
+            setattr(mumble, name, type(name, (), {}))
+    for name in ("ServerPrx", "MetaPrx", "ServerAuthenticatorPrx",
+                 "ServerCallbackPrx"):
+        if not hasattr(mumble, name):
             setattr(mumble, name, types.SimpleNamespace(
                 checkedCast=lambda p: p, uncheckedCast=lambda p: p))
-        sys.modules["MumbleServer"] = mumble
 
-    if "serverconf" not in sys.modules:
-        conf = types.ModuleType("serverconf")
-        conf.MissingSecret = type("MissingSecret", (Exception,), {})
-        conf.ice_secret = lambda: "s"
-        sys.modules["serverconf"] = conf
+    # **serverconf 不能替身。** fix_acl 只在 main() 里用它，导入期不需要，
+    # 而 unittest discover 是在同一个进程里按字母序导入所有 test_*：往
+    # sys.modules 里塞一个假 serverconf，后面导入的 test_serverconf 拿到的
+    # 就是这一份，于是它的每个 setUp 都在 serverconf.SECRETS_FILE 上炸掉。
+    # 分文件单独跑看不到（各自新进程），CI 跑 discover 才会红。
 
 
 _install_stubs()
