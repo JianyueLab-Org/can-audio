@@ -18,8 +18,26 @@
 频率频道都是根下的临时频道，ACL 从根继承，所以在根上放开一次就够，不用给每个
 FREQ_* 单独配。
 
-    python fix_acl.py            # 只看，不改
-    python fix_acl.py --apply    # 真的写进去
+**授给哪个组是有安全后果的。** Mumble 的 `all` 组**包含未认证用户**（不含未认证
+的那个组叫 `auth`）。历史上这些权限一直授给 `all`，而 `login.py` 当时对任何它认
+不出的名字都回 -2（交回 Murmur 自己的账号库）；这个部署又从来没设过
+`serverpassword`，于是"用户名随便填"就能落地，并在所有 FREQ_* 频道上收发话音。
+
+那个洞已经在 `login.py` 堵上了（见 `MURMUR_LOCAL_ACCOUNTS`）：认不出的名字现在
+一律 AUTH_FAILED，未认证用户根本连不进来。所以授给 `all` **目前不是一个活的漏
+洞**，但它是唯一一道门。把这些位迁到 `auth` 就多一道：将来谁再把 -2 放宽，未认
+证用户拿到的也只是一个进不了任何频道、说不了话的连接。
+
+    python fix_acl.py                   # 只看，不改
+    python fix_acl.py --apply           # 授给 all（历史行为，默认）
+    python fix_acl.py --group auth      # 预览迁移到 auth：授给 auth 并从 all 收回
+    python fix_acl.py --group auth --apply
+
+**迁移前务必先看 dry-run 的输出。** 判断依据：这台服务器上每一个合法连接都必须
+是"已认证"的。本仓库的三类连接都满足——会员用纯数字 CAN 号、通播机器人用
+`{cid}_atis{频率}`、两者都由 `login.py` 返回真实 user id；SuperUser 走 Murmur 自
+己的账号库，同样是已认证。如果这台服务器上还有别的东西以访客身份连进来（本仓库
+里没有），迁移会让它静默失去收发话音的能力。
 
 在 Mumble 主机上跑（Ice 只监听 127.0.0.1）。要先能 import MumbleServer，
 生成办法和 login.py 一样：
@@ -117,16 +135,45 @@ def show(acls, groups, inherit):
         print(f"组：{', '.join(g.name for g in groups)}")
 
 
-def find_all_group_acl(acls):
-    """找到给 all 组、且作用于子频道的那条——临时频率频道靠它继承。
+def find_group_acl(acls, group):
+    """找到给指定组、且作用于子频道的那条——临时频率频道靠它继承。
 
     只认非继承的：继承来的 ACL 是只读的，改了写不回去。
     """
     for acl in acls:
-        if (acl.userid < 0 and acl.group == "all"
+        if (acl.userid < 0 and acl.group == group
                 and acl.applySubs and not acl.inherited):
             return acl
     return None
+
+
+def new_group_acl(group):
+    """给某个组新建一条作用于本频道和子频道的空 ACL。
+
+    逐字段赋值而不是靠构造函数的位置参数：slice 生成的类字段顺序是 Ice 说了算
+    的，写错一个位置不会报错，只会写进去一条语义完全不同的 ACL。
+    """
+    acl = MumbleIce.ACL()
+    acl.applyHere = True
+    acl.applySubs = True
+    acl.inherited = False
+    acl.userid = -1
+    acl.group = group
+    acl.allow = 0
+    acl.deny = 0
+    return acl
+
+
+def unauthenticated_exposure(acls):
+    """`all` 组当前握着哪些 REQUIRED 位。
+
+    Mumble 的 `all` 包含未认证用户，所以这些位在 `all` 上就等于"任何能落地的
+    连接都能收发话音"。返回 (位, 名字, 后果) 的列表，空表示没有暴露面。
+    """
+    entry = find_group_acl(acls, "all")
+    if entry is None:
+        return []
+    return [(bit, name, why) for bit, name, why in REQUIRED if entry.allow & bit]
 
 
 def missing_permissions(allow):
@@ -136,6 +183,18 @@ def missing_permissions(allow):
 
 def main():
     apply = "--apply" in sys.argv
+
+    # 默认仍是 all，也就是历史行为——迁移到 auth 要显式要求，且必须先看 dry-run。
+    group = "all"
+    if "--group" in sys.argv:
+        index = sys.argv.index("--group")
+        if index + 1 >= len(sys.argv):
+            print("--group 后面要跟组名（all 或 auth）")
+            return 2
+        group = sys.argv[index + 1]
+    if group not in ("all", "auth"):
+        print(f"不认识的组 {group!r}：只支持 all（含未认证用户）和 auth（不含）")
+        return 2
 
     init_data = Ice.InitializationData()
     init_data.properties = Ice.createProperties()
@@ -167,27 +226,62 @@ def main():
         acls, groups, inherit = server.getACL(ROOT_CHANNEL, context)
         show(acls, groups, inherit)
 
-        target = find_all_group_acl(acls)
-        if target is None:
-            print("\n根频道上没有给 all 组、作用于子频道的 ACL。"
-                  "这不太正常，建议用 Mumble 客户端手工看一眼再决定怎么改。")
-            return 1
+        # 不管这次要做什么，先把未认证用户当前拿着什么说清楚。这是唯一一个
+        # 从客户端完全看不出来的东西，而它决定了"谁能在频率上说话"。
+        exposure = unauthenticated_exposure(acls)
+        if exposure:
+            print("\n注意：以下权限当前授给 `all` 组，而 Mumble 的 `all` "
+                  "**包含未认证用户**：")
+            for bit, name, _ in exposure:
+                print(f"  {name}（0x{bit:x}）")
+            if group == "all":
+                print("  一个能落地的未认证连接就能收发话音。login.py 现在会拒掉"
+                      "认不出的名字，所以目前进不来；要多一道，用 --group auth。")
+
+        target = find_group_acl(acls, group)
+        created = target is None
+        if created:
+            if group == "all":
+                print("\n根频道上没有给 all 组、作用于子频道的 ACL。"
+                      "这不太正常，建议用 Mumble 客户端手工看一眼再决定怎么改。")
+                return 1
+            print(f"\n根频道上还没有给 {group} 组的 ACL，打算新建一条"
+                  "（作用于本频道和子频道）。")
+            target = new_group_acl(group)
 
         missing = missing_permissions(target.allow)
-        if not missing:
+        # 迁移的第二半：授给 auth 之后必须把同样的位从 all 收回，否则 all 那份
+        # 还在，等于什么都没做。
+        strip = [] if group == "all" else [
+            (bit, name, why) for bit, name, why in REQUIRED
+            if (find_group_acl(acls, "all") or new_group_acl("all")).allow & bit]
+
+        if not missing and not strip:
             print("\n需要的权限都有了。客户端还是不正常的话，看看 mumble-server.ini"
                   " 里的 listenersperuser / listenersperchannel 是不是限制了数量。")
             return 0
 
-        print("\n缺这些权限：")
-        for bit, name, why in missing:
-            print(f"  {name}（0x{bit:x}）—— 缺了会：{why}")
+        if missing:
+            print(f"\n{group} 组缺这些权限：")
+            for bit, name, why in missing:
+                print(f"  {name}（0x{bit:x}）—— 缺了会：{why}")
 
         wanted = target.allow
         for bit, _, _ in missing:
             wanted |= bit
-        print(f"\n打算把 all 组的允许位从\n  {describe(target.allow)}\n改成\n  "
+        print(f"\n打算把 {group} 组的允许位从\n  {describe(target.allow)}\n改成\n  "
               f"{describe(wanted)}")
+
+        all_entry = find_group_acl(acls, "all") if strip else None
+        if strip and all_entry is not None:
+            stripped = all_entry.allow
+            for bit, _, _ in strip:
+                stripped &= ~bit
+            print(f"\n并把 all 组的允许位从\n  {describe(all_entry.allow)}\n收回成\n  "
+                  f"{describe(stripped)}")
+            print("\n**这一步会让未认证连接失去收发话音的能力。** 确认这台服务器上"
+                  "每一个合法连接都是已认证的再动手——本仓库的会员、通播机器人和"
+                  "SuperUser 都是。")
 
         if not apply:
             print("\n这是预览。确认没问题就加 --apply 真的写进去。")
@@ -200,16 +294,27 @@ def main():
             print(f"（略过 {len(acls) - len(own)} 条继承来的 ACL，它们是只读的）")
 
         target.allow = wanted
+        if created:
+            # 放在 all 之前：Mumble 按顺序求值 ACL，后面的覆盖前面的，所以
+            # 收紧用的条目必须排在被收紧的那条前面才不会被它盖掉。
+            own.insert(0, target)
+        if strip and all_entry is not None:
+            all_entry.allow = stripped
         server.setACL(ROOT_CHANNEL, own, groups, inherit, context)
         print("已写入。")
 
         # 回读确认，别只信写入没抛异常
         acls, _, _ = server.getACL(ROOT_CHANNEL, context)
-        again = find_all_group_acl(acls)
+        again = find_group_acl(acls, group)
         still = missing_permissions(again.allow if again else 0)
         if still:
             print("回读之后这些还是没有：" +
                   "、".join(name for _, name, _ in still) + "，写入可能没成功。")
+            return 1
+        left = unauthenticated_exposure(acls)
+        if group != "all" and left:
+            print("回读之后 all 组还握着：" +
+                  "、".join(name for _, name, _ in left) + "，收回可能没成功。")
             return 1
         print("回读确认：都生效了。客户端重连一次即可。")
         return 0

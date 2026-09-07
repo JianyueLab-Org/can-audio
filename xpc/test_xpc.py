@@ -1609,6 +1609,14 @@ class UpdateCheckTest(unittest.TestCase):
 
     走的是 can 而不是 GitHub：大陆连 github.com 很不稳，60 MB 的包经常
     下到一半就断，而 ceruleanavi.net 是成员本来就连得上的。
+
+    **这里的回包照抄 can-api 真发的那个**（`internal/api/clients.go`），不是
+    一个方便测试的形状。以前这里造的是 can-web 时代的 `update_available` +
+    `client` 对象，两条都和服务端对不上：`update_available` 服务端从来没发
+    过（真的字段是嵌套的 `update.available`），而顶层 `client` 是**包名
+    字符串**，那一包的信息在 `clients[包名]` 里。造错了的后果是这一整类测试
+    全绿而四个客户端的查更新全是死的，所以 `payload()` 是这一类里最要紧的
+    几行。
     """
 
     def setUp(self):
@@ -1622,18 +1630,31 @@ class UpdateCheckTest(unittest.TestCase):
             payload).encode("utf-8")
         return mock.patch("urllib.request.urlopen", return_value=response)
 
-    def payload(self, version="2.0.2", available=True):
+    def payload(self, version="2.0.2", available=True, current="2.0.1"):
+        """can-api 对 `?client=xpc-for-can&version=…` 的真实回包。"""
         return {
-            "status": 200,
             "version": version,
+            "publishedAt": "2026-08-07T12:00:00Z",
             "notes": "https://example/releases/tag/v" + version,
-            "update_available": available,
-            "client": {
-                "name": "xpc-for-can",
-                "version": version,
-                "size": 59057038,
-                "download": "https://ceruleanavi.net/api/v1/clients/download/"
-                            "xpc-for-can?v=v" + version,
+            "clients": {
+                name: {
+                    "name": name,
+                    "version": version,
+                    "size": 59057038,
+                    "download": "https://ceruleanavi.net/api/v1/clients/download/"
+                                + name + "?v=" + version,
+                    "origin": "https://github.com/example/releases/download/v"
+                              + version + "/" + name + ".zip",
+                }
+                for name in ("audio-for-can", "atis-for-can",
+                             "msfs-for-can", "xpc-for-can")
+            },
+            # 带了 ?client= 才有这两项，而且 client 是名字，不是那一包
+            "client": "xpc-for-can",
+            "update": {
+                "available": available,
+                "current": current,
+                "latest": version,
             },
         }
 
@@ -1702,13 +1723,74 @@ class UpdateCheckTest(unittest.TestCase):
             self.assertIsNone(self.update.check("xpc-for-can", "2.0.1"))
 
     def test_a_payload_without_a_client_block_still_works(self):
-        """服务端只回了总版本、没回单个包，也不该崩。"""
-        payload = {"update_available": True, "version": "2.0.2", "notes": "n"}
+        """服务端只回了总版本、没回单个包，也不该崩。
+
+        `clients` 里那一包会缺，是因为那次构建挂了——服务端宁可不提它，也
+        不肯广播一个 404 的下载地址。这时还是要报"有新版"，只是没有下载
+        地址，界面会去开说明页。
+        """
+        payload = {"version": "2.0.2", "notes": "n"}
         with self.answer(payload):
             found = self.update.check("xpc-for-can", "2.0.1")
         self.assertIsNotNone(found)
         self.assertEqual(found.version, "2.0.2")
         self.assertEqual(found.download, "")     # 没有下载地址，界面会去开说明页
+
+    def test_the_verdict_is_nested_under_update_not_a_top_level_flag(self):
+        """**有没有新版在 `update.available`。**
+
+        以前这里读的是顶层 `update_available`，而 can-api 从来没发过那个
+        键——`data.get()` 拿到 None，于是每次都当作"已经是最新"，四个客户端
+        的查更新一起是死的，而且安静得像本来就没有新版。造一个只有嵌套
+        `update` 的回包（也就是服务端真发的那个）就能钉住。
+        """
+        payload = self.payload("2.0.2")
+        self.assertNotIn("update_available", payload,
+                         "can-api 没有这个字段，测试里也不许有")
+        self.assertTrue(payload["update"]["available"])
+        with self.answer(payload):
+            found = self.update.check("xpc-for-can", "2.0.1")
+        self.assertIsNotNone(found, "嵌套的 update.available 没被读到")
+        self.assertEqual(found.version, "2.0.2")
+
+    def test_the_top_level_client_field_is_a_name_not_an_object(self):
+        """**顶层 `client` 是包名字符串**，那一包在 `clients[包名]` 里。
+
+        当成 dict 去 `.get("version")` 抛的是 `AttributeError`，而调用方是
+        `gui.py` 里一个裸的 worker 线程，异常在那儿就没了：界面上和"没有
+        新版"分辨不出来。
+        """
+        payload = self.payload("2.0.2")
+        self.assertIsInstance(payload["client"], str)
+        with self.answer(payload):
+            found = self.update.check("xpc-for-can", "2.0.1")
+        self.assertIsNotNone(found)
+        self.assertEqual(found.size, 59057038)
+        self.assertIn("clients/download/xpc-for-can", found.download)
+
+    def test_each_client_gets_its_own_build(self):
+        """四个包在同一个回包里，别拿错别人的。"""
+        payload = self.payload("2.0.2")
+        for name in ("audio-for-can", "atis-for-can", "msfs-for-can",
+                     "xpc-for-can"):
+            with self.answer(payload):
+                found = self.update.check(name, "2.0.1")
+            self.assertIsNotNone(found, name)
+            self.assertIn("clients/download/" + name + "?", found.download)
+
+    def test_a_broken_payload_shape_is_not_an_exception(self):
+        """解析也得包在 try 里：worker 线程没人接异常。"""
+        for payload in ({"update": "yes", "version": "2.0.2"},
+                        {"clients": "nope", "version": "2.0.2",
+                         "update": {"available": True, "latest": "2.0.2"}},
+                        {"clients": {"xpc-for-can": "nope"}, "version": "2.0.2"},
+                        {"update": {"available": True, "latest": None}},
+                        []):
+            with self.answer(payload):
+                try:
+                    self.update.check("xpc-for-can", "2.0.1")
+                except Exception as e:        # noqa: BLE001 —— 就是要证明它不抛
+                    self.fail(f"{payload!r} 让查更新抛了 {e!r}")
 
 
 class ChannelNameTest(unittest.TestCase):
@@ -3359,6 +3441,122 @@ class ObserverFormatTest(unittest.TestCase):
     def test_it_round_trips_through_the_parser(self):
         import observer
         self.assertEqual(observer.parse_frequency(self.format(121.8)), 121.8)
+
+
+class StoredPasswordTest(unittest.TestCase):
+    """密码不再默认落盘。
+
+    这一格里的 password 不是"这个客户端的密码"——它就是成员的**网站密码**：
+    can-api 的 `VerifyNetworkCredential` 对两个列都认，注册和改密写进去的是
+    同一个秘密。所以配置文件泄露一次，泄露的是整个账号。
+
+    而它躺的地方偏偏最容易被端走：写在**当前工作目录**，也就是用户双击 exe
+    的地方——X-Plane 的 Community 文件夹、会被云同步的游戏目录、报障时打包发过来的那个 zip。
+
+    迁移的形状照着 OLD_MUMBLE_HOSTS 那个来：认得出老样子，就地改掉，并且
+    说出来。这里最要紧的一条是**不能把人悄悄锁在外面**，所以老密码这一次
+    还在内存里，连接照常。
+    """
+
+    def setUp(self):
+        import settings as settings_module
+        self.module = settings_module
+        self.temp = tempfile.mkdtemp(prefix="xpc_settings_")
+        self.addCleanup(shutil.rmtree, self.temp, True)
+        self.path = os.path.join(self.temp, "xpc_settings.json")
+
+    def write(self, data):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    def read(self):
+        with open(self.path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    # ---------- 默认 ----------
+    def test_remembering_is_off_by_default(self):
+        self.assertIs(self.module.DEFAULTS["remember_password"], False,
+                      "默认存网站密码是不行的")
+
+    def test_a_password_is_not_written_unless_asked(self):
+        s = self.module.Settings(self.path)
+        s.cid = "1234"
+        s.password = "hunter2"
+        s.save()
+        self.assertEqual(self.read()["password"], "",
+                         "没勾记住密码，密码不该出现在文件里")
+        self.assertEqual(self.read()["cid"], "1234", "别的字段照旧存")
+
+    def test_ticking_the_box_stores_it(self):
+        """勾了就是勾了——这是用户自己的决定，不能替他做主。"""
+        s = self.module.Settings(self.path)
+        s.password = "hunter2"
+        s.remember_password = True
+        s.save()
+        self.assertEqual(self.read()["password"], "hunter2")
+        self.assertIs(self.read()["remember_password"], True)
+        again = self.module.Settings(self.path)
+        self.assertEqual(again.password, "hunter2")
+        self.assertIs(again.remember_password, True)
+        self.assertFalse(again.password_migrated, "这不是待迁移的老配置")
+
+    # ---------- 老配置 ----------
+    def test_an_old_file_still_connects_this_session(self):
+        """**不能悄悄把人锁在外面。**
+
+        老版本存下来的密码这一次还要能用：读进内存，连接照常。下次启动那一格
+        才是空的，而界面会说明原因（msg.password_dropped）。
+        """
+        self.write({"cid": "1234", "password": "hunter2"})
+        s = self.module.Settings(self.path)
+        self.assertEqual(s.password, "hunter2", "这一次运行还得连得上")
+        self.assertTrue(s.password_migrated, "界面要靠它提示一句")
+
+    def test_an_old_file_is_rewritten_at_once(self):
+        """当场重写，不等下一次 save()。
+
+        等的话，一个只是打开看看就关掉的用户，明文密码原封不动留在那儿。
+        """
+        self.write({"cid": "1234", "password": "hunter2"})
+        self.module.Settings(self.path)
+        self.assertEqual(self.read()["password"], "")
+        self.assertIs(self.read()["remember_password"], False)
+
+    def test_the_migration_only_happens_once(self):
+        self.write({"cid": "1234", "password": "hunter2"})
+        self.module.Settings(self.path)
+        second = self.module.Settings(self.path)
+        self.assertFalse(second.password_migrated,
+                         "已经迁过的文件不该再被当成老配置")
+        self.assertEqual(second.password, "")
+
+    def test_turning_it_back_off_clears_what_was_stored(self):
+        """取消勾选要真的把文件里那份删掉，不能只是不再更新它。"""
+        self.write({"cid": "1234", "password": "hunter2",
+                    "remember_password": True})
+        s = self.module.Settings(self.path)
+        self.assertEqual(s.password, "hunter2")
+        self.assertFalse(s.password_migrated)
+        s.remember_password = False
+        s.save()
+        self.assertEqual(self.read()["password"], "")
+
+    def test_an_empty_old_password_is_not_a_migration(self):
+        """没存过密码的老配置不该弹那句提示。"""
+        for value in ("", "   "):
+            self.write({"cid": "1234", "password": value})
+            s = self.module.Settings(self.path)
+            self.assertFalse(s.password_migrated)
+
+    def test_a_user_who_cleared_their_password_is_not_re_migrated(self):
+        """自己关掉记住密码之后，password 是空串但键是在的。
+
+        判据认的是 `remember_password` 这个键在不在，不是密码空不空——否则
+        每次启动都会重跑一遍迁移，提示也会每次都弹。
+        """
+        self.write({"cid": "1234", "password": "", "remember_password": False})
+        s = self.module.Settings(self.path)
+        self.assertFalse(s.password_migrated)
 
 
 if __name__ == "__main__":

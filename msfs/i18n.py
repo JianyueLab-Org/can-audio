@@ -60,6 +60,14 @@ TEXT = {
     "connect.callsign_hint": {"zh": "如 CCA1501", "en": "e.g. CCA1501"},
     "connect.cid":          {"zh": "CAN ID", "en": "CAN ID"},
     "connect.password":     {"zh": "密码", "en": "Password"},
+    # 默认不勾。这一格里的是成员的**网站密码**，而配置文件就写在双击 exe 的
+    # 那个目录里——同步的游戏目录、报障打包的 zip 都会把它一起带走。
+    "connect.remember":     {"zh": "记住密码", "en": "Remember my password"},
+    "connect.remember_hint": {
+        "zh": "不勾就只在本次运行里保留。这里填的是网站密码，"
+              "存进配置文件等于把整个账号放在这个目录里。",
+        "en": "Left off, it is kept only for this session. This is your website "
+              "password, so saving it puts the whole account in this folder."},
     "connect.aircraft":     {"zh": "机型", "en": "Aircraft"},
     "connect.aircraft_hint": {"zh": "如 B738", "en": "e.g. B738"},
     "connect.observer":     {"zh": "观察员模式（双人机组）",
@@ -244,6 +252,13 @@ TEXT = {
                              "en": "You are on the latest version ({version})."},
     "msg.update_available": {"zh": "[更新] 有新版 {version}（已跳过）",
                              "en": "[Update] {version} is available (skipped)"},
+    "msg.password_dropped": {
+        "zh": "[安全] 旧版本把密码明文存在配置文件里，已经清掉。这次连接不受"
+              "影响；想让它记住，就勾上密码旁边的「记住密码」。",
+        "en": "[Security] an older version stored your password in cleartext in "
+              "the settings file; it has been removed. This session is "
+              "unaffected — tick \u300cRemember my password\u300d next to the "
+              "password box if you want it kept."},
     "msg.update_downloading": {"zh": "[更新] 正在浏览器里下载 {version}",
                                "en": "[Update] downloading {version} in your browser"},
     "msg.update_skipped":   {"zh": "[更新] 已跳过 {version}",

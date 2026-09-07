@@ -37,11 +37,23 @@ VERSION = "2.2.0"
 # ---- Dev 测试版 ----
 # 测试版把 DEV 置 True：版本号显示成**下一个补丁号**加 (Dev Build N)。
 # 最新正式版是 v2.1.1 时，第一个 Dev 包就是 v2.1.2 (Dev Build 1)；同一个
-# 版本再出一个测试包，把 DEV_BUILD 加一（v2.1.2 (Dev Build 2)）。正式发布
-# 那个补丁号时，把 DEV 关回 False、DEV_BUILD 归 1。
+# 版本再出一个测试包，把 DEV_BUILD 加一（v2.1.2 (Dev Build 2)）。
 #
 # 取"下一个补丁号"而不是照抄最新版，是为了让测试包在排序上永远新于它基于
 # 的正式版——用户拿版本号对话时（"我这个比他新"）不会把测试包错认成旧版。
+#
+# **这个常量只管从源码跑的情况，管不着 CI 打的包**，而且是故意的。以前它管：
+# release.yml 每次推到 main 都打一个包，却从来不去改 version.py（工作流里没有
+# 任何一条 sed 碰它），于是 `DEV = True` 一进 main，之后每个正式包都把自己报成
+# 下一个补丁号——打了 v2.2.3 的包报 2.2.4，标题栏写 "2.2.4 (Dev Build 1)"。
+# 后果不止是显示难看：查更新是数值比较，装了 v2.2.3 的人自报 2.2.4，等
+# v2.2.4 真的发出来时 CompareVersions("2.2.4","2.2.4") 不大于 0，服务端说
+# "已经是最新"——**每个版本都会永久跳过它的下一个版本**，而且四个客户端
+# 一起，没有任何地方会报错。
+#
+# 所以判断改成看事实而不是看常量：CI 打包时 `freeze()` 会把它算出来的正式
+# 版本号写进 buildinfo.json 并标上 RELEASE_KEY，`is_dev()` 认这个标记。忘了
+# 翻常量不再有后果，因为没有什么要翻的。
 DEV = True
 DEV_BUILD = 1
 
@@ -49,6 +61,15 @@ DEV_BUILD = 1
 VERSION_ENV = "CAN_VERSION"
 
 BUILDINFO_NAME = "buildinfo.json"
+
+# buildinfo.json 里那个"这是 CI 打的正式包"的标记。
+#
+# 为什么不是"有 buildinfo.json 就算正式包"：在组件目录里手工跑一次
+# `pyinstaller gui.spec` 也会写出一个（`freeze()` 写在 SPEC 所在目录），而且
+# 它就留在源码树里。那之后从源码跑就会被当成正式包，报一个根本没发过的号。
+# CI 和手工打包的区别是环境变量 CAN_VERSION——那个号是工作流数 tag 算出来、
+# 真的会被打成 tag 发出去的——所以 `freeze()` 把"有没有拿到它"记下来。
+RELEASE_KEY = "release"
 
 _cached = None
 _cached_version = None
@@ -118,6 +139,25 @@ def release_version():
     return _cached_version
 
 
+def is_release_build():
+    """这一份是不是 CI 打出来的正式包。
+
+    看的是 buildinfo.json 里的标记，不是 DEV 常量：常量要人记得翻，而这个
+    标记是打包时按事实写下的。故意不缓存——缓存了就得再多一个测试要记得
+    重置的全局量，而这只是读一个几十字节的文件。
+    """
+    return bool(_buildinfo().get(RELEASE_KEY))
+
+
+def is_dev():
+    """对外要不要按测试版报告版本号。
+
+    **正式包永远说不是**，哪怕 DEV 还留在 True——见上面 DEV 那段。DEV 于是
+    只影响从源码跑和手工打的包，那两种本来就是测试版。
+    """
+    return bool(DEV) and not is_release_build()
+
+
 def _bump_patch(number):
     """2.1.1 → 2.1.2。从后往前找到第一段纯数字加一。"""
     pieces = str(number).split(".")
@@ -129,9 +169,13 @@ def _bump_patch(number):
 
 
 def version():
-    """对外报告的版本号。Dev 包报下一个补丁号，正式包就是正式号。"""
+    """对外报告的版本号。Dev 包报下一个补丁号，正式包就是正式号。
+
+    **查更新拿的就是这个号**，所以正式包报错了不只是难看：服务端按数值比，
+    自报大一号的包会被判成"已经是最新"，然后永久收不到下一个版本。
+    """
     base = release_version()
-    return _bump_patch(base) if DEV else base
+    return _bump_patch(base) if is_dev() else base
 
 
 def display():
@@ -140,7 +184,7 @@ def display():
     正式版就是 "2.1.1"；Dev 版是 "2.1.2 (Dev Build 1)"——用户一眼能看出
     自己跑的是测试包，报问题时也能说清是第几个测试包。
     """
-    if DEV:
+    if is_dev():
         return f"{version()} (Dev Build {DEV_BUILD})"
     return version()
 
@@ -156,7 +200,7 @@ def build():
 def full():
     """给界面和日志用的完整版本串。Dev 包把两种号都带上：Dev Build 号给
     用户对话用，git build 号给排查定位用。"""
-    if DEV:
+    if is_dev():
         return f"v{version()} (Dev Build {DEV_BUILD}; build {build()})"
     return f"v{version()} (build {build()})"
 
@@ -168,20 +212,29 @@ def freeze(target_dir, source_dir=None):
     之后会算出下一个补丁号（v2.1.xxx 里的 xxx）并从那里传进来；本地打包没设
     这个变量，就用 VERSION。
 
+    **拿没拿到 CAN_VERSION 也一起写下来**（RELEASE_KEY）：拿到了就是 CI 在打
+    一个真的会被打成 tag 发出去的包，`is_dev()` 认这个标记而不认 DEV 常量。
+    CAN_VERSION 没设时标记是 False，于是手工打的包照旧显示成测试版——它本来
+    就是。万一哪天 CI 忘了传这个变量，包会显示成 Dev 而不是悄悄报一个从来
+    没发过的号，这也是有意的：错得看得见比错得安静好。
+
     写不出来也不让打包失败——没有 build 号的包仍然是能用的，为了一行版本号让
     CI 挂掉不值得，只是会退回显示 "dev"。
     """
     value = from_git(cwd=source_dir or target_dir) or "dev"
-    number = (os.environ.get(VERSION_ENV) or "").strip() or VERSION
+    supplied = (os.environ.get(VERSION_ENV) or "").strip()
+    number = supplied or VERSION
     path = os.path.join(target_dir, BUILDINFO_NAME)
     try:
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({"version": number, "build": value}, f,
+            json.dump({"version": number, "build": value,
+                       RELEASE_KEY: bool(supplied)}, f,
                       ensure_ascii=False)
     except Exception as e:
         print(f"警告: 写不了 {path}（build 号会显示成 dev）: {e}")
         return None
-    print(f"版本 {number}，build 号 {value}")
+    print(f"版本 {number}，build 号 {value}"
+          + ("" if supplied else f"（没有 {VERSION_ENV}，按测试包处理）"))
     return path
 
 
