@@ -42,17 +42,28 @@ serde 默认忽略未知键,所以不加这个字段的客户端会把服务端�
 ### C2 — 驱逐会变成无限登录循环
 
 **裁定:必改,这是 P3 最重要的一条。** `LinkState` 加 `Evicted`,并且
-**客户端必须读 QUIC 的应用层关闭码**。quinn 的路径是
-`ConnectionError::ApplicationClosed(ApplicationClose { error_code, reason })`。
+**客户端必须读 QUIC 的应用层关闭码**。quinn 里这条路径大致是
+`ConnectionError::ApplicationClosed(ApplicationClose { error_code, reason })`——
+**这个类型名和字段名是凭记忆写的,动手前先对着实际依赖的 quinn 版本核一遍。**
+要紧的是"必须读到应用层关闭码、并据此决定要不要重连",不是这一行的拼写。
+
 映射表(与 `server/internal/transport/codes.go` 一一对应):
 
 | 码 | 含义 | 客户端行为 |
 |---|---|---|
-| 0 `CloseNormal` | 正常收工 | 终态,不重连 |
-| 1 `CloseHandshakeRefused` | 握手被拒(看 reason 区分 `token_expired` / `token_invalid` / `refused`) | 终态;`token_expired` 例外,见 H3 |
-| 2 `CloseEvicted` | 同账号在别处登录,你被踢了 | **终态,绝不重连** |
-| 3 `CloseProtocolViolation` | 客户端违反协议 | 终态,且应当报 bug |
+| 0 `CloseNormal` | 服务端正常收工(进程退出/重启部署),或客户端自己断的 | **可以重连**,走 `ReconnectPolicy` |
+| 1 `CloseHandshakeRefused` | 握手被拒 | **不要原样重连**;先看 reason(见 H3):`token_expired` → 去换新 token 再连,`token_invalid` / `refused` → 停 |
+| 2 `CloseEvicted` | 同账号在别处登录,你被顶掉了 | **终态,绝不重连**,并告诉用户"账号在别处登录了" |
+| 3 `CloseProtocolViolation` | 客户端把协议用坏了(今天只有一种:不读控制流,reason `control_write_stalled`) | **终态,去修客户端**,不要重连 |
 | 其他 / 传输层错误 | 网络断了 | 走 `ReconnectPolicy`,三次 |
+
+> **码 0 是"可以重连",不是终态——我第一版这张表把它写成了终态,那是错的。**
+> 服务端重启部署走的正是这个码,把它当终态意味着**每次部署之后所有客户端永不回来**。
+> 权威定义在 `server/internal/transport/codes.go` 的注释里,它明写了这四条的客户端契约。
+>
+> 注意码 3 和码 2 是同一类形状:`ReconnectPolicy` 的三次上限**两个都挡不住**,
+> 因为重连本身是**成功**的,计数器一成功就清零,真正的失败发生在几秒之后。
+> codes.go 自己把这一点写下来了——这也正是它不复用码 0 的理由。
 
 **为什么:** `ReconnectPolicy` 只数**连续失败**。驱逐后的重连是**成功的**,
 于是 `on_session_established()` 把 attempts 清零。两个客户端用同一个 CID 会
@@ -124,21 +135,27 @@ serde 默认忽略未知键,所以不加这个字段的客户端会把服务端�
 
 ### H2 — `rejected` 把 TX 限额拒和 RX 限额拒混成一件事
 
-**裁定:客户端**可以**且**必须**自己分辨,不改服务端协议。规则是:
+**裁定(经 P2 终审 B 修正——用差集,不要用 `rejected` 推断):**
 
 ```
-f ∈ rejected ∧ f ∈ ack.rx   → TX 被限额拒了,但 RX 给了(可以收,不能发)
-f ∈ rejected ∧ f ∉ ack.rx   → RX 被限额拒了(既不能收也不能发)
+被拒的 TX = 我声明的 tx − ack.tx
+被拒的 RX = 我声明的 rx − ack.rx
 ```
 
-这条规则**已经写在服务端 `router.go` 的注释里**,并且是 `Subscribe` 的实际行为
-(我核过源码:`ack.RX` 是从 `next.rx` 遍历出来的,TX 被拒的频率因为 TX⊆RX 传播不会进 `next.rx`,
-但 RX 循环会把它按普通 RX 声明再收一次)。Task 11 的 `pump` 按这条规则分派
-`Event::TxDenied` 和 `Event::RxDenied`,**不要**把 `rejected` 里的每一项都当成 TxDenied。
+**不要**去读 `rejected` 来判断方向。`ack.TX` 和 `ack.RX` 是**完整且权威**的:
+服务端把授权后的全集放进去,长度受 `MaxTX`/`MaxRX` 约束(默认 32),不存在截断。
+差集因此是精确的、完备的,而且**天然覆盖了 `maxRejected = 256` 截断的那部分**——
+超过 256 个被拒频率时第 257 个以后根本不进 `rejected`,任何基于 `rejected` 的推断在那里都会失效。
 
-**一个边界要写进注释:** `ack.Rejected` 在服务端有 `maxRejected = 256` 的截断(排序后截断)。
-超过 256 个被拒频率时,第 257 个以后既不在 `rx` 里也不在 `rejected` 里——
-**客户端必须把"我声明了但两个列表里都没有"也当成被拒**,否则界面会显示一个根本没生效的频率。
+`rejected` 只当作一个补充信号用(它带着"服务端确实看见并拒了这一条"的含义),
+**绝不作为方向判断的依据**。
+
+> 我最初的裁定是按 `f ∈ rejected ∧ f ∈ ack.rx` 这个交集规则分辨的。那条规则在没有截断时成立,
+> 服务端 `router.go` 的注释也确实这么写——**但它在截断之后是错的**,而差集在任何情况下都对。
+> 终审 B 同时要求服务端 README 补一节 SUBACK,把这个公式写下来,因为今天没有任何东西告诉客户端。
+
+Task 11 的 `pump` 按差集分派 `Event::TxDenied` 和 `Event::RxDenied`,
+**不要**把 `rejected` 里的每一项都当成 TxDenied。
 
 **判错的代价(原计划):** 声明 40 个 RX 频率,客户端弹出 8 条"不能发射"的提示,
 而那 8 个频率其实发射得好好的。
@@ -244,3 +261,25 @@ Task 4 和 Task 6 按本文件改写之前不要开工(C4、H4、M15)。
 Task 8 的 QUIC 部分(Step 6)在原计划里**明确未测**,而 C2、C3、M7、M8、M12 全在那里——
 **裁定:Task 8 Step 6 必须带测试**,至少覆盖关闭码映射(C2)和控制流读取的取消安全(C3)。
 这两条都是"本地跑起来像好的,上线之后无法解释"的形态,而这正是本项目已经栽过的那类。
+
+---
+
+## 八、P3 依赖的 P2 修复(来自 P2 终审 B)
+
+P2 终审在协议面查出 12 条,其中四条**直接决定 P3 怎么写**。P3 开工前先确认这些已在服务端落地,
+否则 P3 会照着一份说法不明的契约写代码。
+
+1. **`seq` 的语义至今没有定义。** 是每次发话重新起算,还是每个会话单调?uint16 在 20 ms 一帧下
+   约 21 分钟回绕一次——**Task 4 的抖动缓冲区正是照着这个字段写的**,而它现在用非回绕的
+   `<`/`>` 比较却用 `wrapping_add` 推进(L3)。服务端把语义写进 wire 的文档和金文件之前,
+   Task 4 的回绕处理没有依据。**这是 P3 对 P2 唯一的硬依赖。**
+2. **下行 `qual` 恒为 1–255、永不为 0**,这一点哪里都没写,而金文件里唯一的 `qual=0` 样例是上行的。
+   P3 的 `quality_gain`/`squelch_level` 要不要处理 0,取决于这条被写下来。
+3. **`flags` 的第 2–7 位没有"保留,必须为零"的约定**,而服务端 `fanout.go` 是**原样转发**的。
+   P3 解析时应当忽略未知位而不是拒绝,但这要等服务端把约定写下来才算有据。
+4. **金文件第 4 个样例用了 `199998`** 当普通频率例子——那正是 can-audio 里"未设频率"的占位值。
+   跨实现的金文件不该把一个有特殊含义的值当普通样例供着;P3 不要照抄它做测试夹具。
+
+另有两条改善 P3 的体验,不阻塞:服务端 README 会补一节 SUBACK 写明差集公式(见 H2);
+驱逐的 reason 会变成常量 `ReasonEvicted = "evicted"` 并被钉住(C2 读的是关闭**码**,不受影响,
+但有个稳定字符串更好认)。
