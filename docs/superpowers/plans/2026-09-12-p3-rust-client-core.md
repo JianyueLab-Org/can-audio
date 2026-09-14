@@ -2,6 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **状态：已实施（2026-09-15）。** 11 个任务全部落地，在 `can-voice` 的
+> `feat/p3-rust-client-core` 分支上，12 个提交、136 个测试、clippy `-D warnings` 干净。
+> **本计划与 `2026-09-12-p3-rust-client-core-amendments.md` 一并生效，冲突时以修订件为准**；
+> 而修订件本身也有几条裁定被实施证伪，逐条记在它的 §十一《执行回执》里——
+> 包括 C4 的两个测试在算术上互相矛盾、M2 的方子盖不住 `null`、`audiopus 0.3` 这个版本
+> 根本不存在。**照本计划原文执行之前，先读那一节。**
+
 **Goal:** 实现 `can-voice-client` —— 四个 Tauri 客户端和服务端 ATIS 机器人共用的 Rust 语音核心：QUIC 连接、声明式订阅、抖动缓冲、Opus 编解码、按频率混音、同频干扰音、射程衰减、无线电栈模型。
 
 **Architecture:** 公开 API 是**声明式**的 —— 调用方声明"我要收哪些频率、发哪些频率"，库负责让服务端状态收敛过去，重连后自动重发。没有 `join_channel()`，没有 channel id，没有任何"需要记住"的连接状态。业务逻辑（订阅状态机、抖动缓冲、混音、无线电栈）全部是无 I/O 的纯逻辑，可以不碰网络和声卡地测试。

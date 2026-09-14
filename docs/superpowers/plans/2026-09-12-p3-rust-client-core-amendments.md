@@ -449,3 +449,93 @@ P3 Task 1 的测试本来就填 `"proto":1`,所以无需改动——但在 `5b2c
 对客户端的意思:按 M5 用 `Ready.max_rx` 夹住之后,声明长度本来就到不了第二道界。
 **真撞上第二道,说明第一道没夹——那是客户端的 bug,不是服务端小气。**
 `maxXCPairs = 64` 那道界(M4)与这两道都不重叠,照 M4 单独夹。
+
+---
+
+## 十一、执行回执(P3 已实施)
+
+**P3 的 11 个任务已经全部落地**,在 `can-voice` 的 `feat/p3-rust-client-core` 分支上,
+12 个提交,136 个测试(105 lib + 28 proto + 3 端到端),`clippy -D warnings` 干净,
+Go 那半边的 `vet` 与 `go test ./server/...` 照旧全绿。
+
+这一节记的是**本文件裁定错了的地方**。它们不是事后诸葛:每一条都有当时的验证方式,
+写在这里是因为下一个读这份修订件的人不该被误导。逐条的完整论证在各自的提交信息里。
+
+### 裁定本身有误的
+
+**C4 —— 两个测试在算术上互相矛盾,任何实现都不可能同时通过。**
+
+    测试 A  push [0,1,2,3,4]（5 帧）期望放出 [0,1,2] —— 放 3 留 2
+    测试 B  push [2,0,1,3]  （4 帧）期望放出 [0,1,2] —— 放 3 留 1
+
+任何"len >= t 才放"的实现停下时 len 恰好是 t-1:A 要求 t=3,B 要求 t=2。
+M10 的自适应也救不了——B 是乱序的那个,抖动更大,深度只会更深,方向是反的。
+
+更要紧的是 C4 的**论据**站不住。它说"抽干到空的抖动缓冲区是个重排队列",
+所以要在播放途中扣住水位。但吸收抖动的机制是**起播前攒够水位**:生产里 `pop` 由
+声卡时钟以 20 ms 的固定节奏调用、帧也以 50 包/秒到达,水位自然停在起播时的高度。
+缓冲真被抽干只有一种可能——上游停了——而那时正确的输出是 `Lost`(交给 PLC),
+不是 `None`(静音)。**扣着不放恰恰会把它声称要防的"断音"做出来。**
+处置:A、B 两条改成期望全部放出并按序;第三条(`the_buffer_does_not_grow_without_bound`)
+照 C4 的裁定改实现(上限从 `MAX_DEPTH*4` 收到 `MAX_DEPTH`)。M9/M10/L2/L3 照并。
+
+**M2 —— 开的方子盖不住它要防的那个情况。** `#[serde(default)]` 只管"键**缺席**";
+Go 把 nil slice 编码成 `null`——键**在**,值是 `null`——而 serde 见到 `null` 要一个
+sequence 时是**硬报错**,不会回退到 default。照原样写出来的客户端在它要防的那个
+情况下照样解析失败、照样重连风暴。要配一个 `deserialize_with`(见
+`control.rs` 的 `null_as_default`)。
+
+M2 还有一句事实错误:"`\"rejected_xc\": null` 是常态"。**今天不是**——`router.go`
+的两个 SubAck 构造点(183、216)都把四个切片显式初始化成非 nil 空切片。但结论仍然
+成立,理由换一个:**Go 侧没有任何测试钉住这件事**,那是一个没人守着的实现细节,
+而每个客户端都压在它上面。契约取宽的那一侧。
+
+**H4 / L8 —— `audiopus = "0.3"` 这个版本不存在。** registry 里最新是 0.2.0。
+静态链接的 feature 也不在 `audiopus` 上而在 `audiopus_sys` 上,而且版本要和
+`audiopus 0.2` 拉进来的那个(0.1.8)对上,否则 feature 合并不到一起,
+会出现两份 `audiopus_sys` 而静态那份根本没人用。
+
+**构建前置也说错了:要的是 autotools,不是 cmake。** `audiopus_sys 0.1.8` 的
+build.rs 走 `sh autogen.sh && sh configure --enable-static && make`。
+(已写进 `can-voice/README.md` 和 CI。)
+
+**M12 —— 前提在 quinn 0.11.12 上不成立。** 它的默认 feature 就是 `ring`
+(`rustls-ring` + `platform-verifier`),不是 aws-lc-rs,Cargo.lock 里也确实没有 aws-lc。
+**裁定照做**,而且做得更硬:不依赖进程默认 provider,直接
+`builder_with_provider(ring::default_provider())`——依赖默认值的话,哪天依赖图里多出
+一个 aws-lc-rs,第一次拨号会 panic 在运行时而不是构建时。
+
+**M7 —— 在最终的写法下不适用。** `RecvStream` 确实有固有的 `read_exact`(会盖住
+trait 方法),但通用读取路径是对 `AsyncRead` 泛型的,那里 `AsyncReadExt` 是真的要用的;
+握手期直接打 `RecvStream` 的那一条则本来就没有那个 import。
+
+### 裁定是对的,而且核实过的
+
+**C2 的类型名一字不差**:`ConnectionError::ApplicationClosed(ApplicationClose {
+error_code: VarInt, reason: Bytes })`。本文件说它是凭记忆写的、动手前先核——核过了。
+
+**L8 的 `decode` 签名**:`decode<TP, TS>(Option<TP>, TS, bool)`,`TP: TryInto<Packet>`、
+`TS: TryInto<MutSignals>`,而且用的是 audiopus **自己的** `TryInto`(std 的当年还在
+nightly)。`&Vec<u8>` 和 `&[u8]` 都有 impl;PLC 那一支要写成 `None::<&[u8]>`,
+光写 `None` 推导不出类型。
+
+### 本文件和原计划都没扫到的
+
+- **计划的 workspace `members` 列了 `crates/can-voice-client`,而 Task 1 的 Files
+  不建它**——`cargo test -p can-voice-proto` 直接死在"加载不了 workspace member"上。
+  这是第七处"会让执行当场停住"的地方(§零列了六处)。
+- **Task 5 的 `squelch_level` 写 `if qual >= 255`,而 `qual` 是 `u8`**——那是
+  `clippy::absurd_extreme_comparisons`,**deny-by-default**,比 H5 那条还硬。
+  连同 H5、M15,计划里一共三处代码过不了它自己的门禁。
+- **`BTreeMap<u16, _>` 在 `seq` 回绕点排序是错的。** 一次发言完全可能跨过回绕点
+  (每会话单调、21.8 分钟一圈),而按 u16 数值排序会把 0 排到 65534 前面,
+  整段发言顺序全乱、迟到帧判反,日志里什么都看不出来。抖动缓冲改成内部存
+  **展开成 64 位的序号**。
+- **Task 11 的 fixture 签一张一小时的 token,会被拒。** `auth.maxTokenLifetime`
+  是 **10 分钟**——短有效期是这套设计里唯一的吊销机制,所以 `exp` 有上界。
+  踩中的话 e2e 会以 `token_invalid` 失败,而那看起来像密钥不配对。
+- **端到端测试当场抓到一个拼接错误**:`VoiceClient::connect` 里的信任根没接上
+  (`Config::extra_roots`、`trust_roots()`、`pump` 那一侧都对了,唯独这一处还写着
+  `TrustRoots::Platform`)。编译通过、单测全绿,只有真去打一个自签服务端才露头。
+  **原计划把 Task 8 Step 6 标成"无单测"**,这个错会一路活到 P4——
+  §七 要求 Step 6 带测试,是这份修订件里回报最高的一条。
