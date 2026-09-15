@@ -1,0 +1,541 @@
+# P3(Rust 客户端核心库)计划修订件
+
+> **给执行者:** 这份文件与 `2026-09-12-p3-rust-client-core.md` **一并生效,且在冲突时以本文件为准**。
+> 它裁定了执行前冲突扫描的全部 37 条发现。每条裁定给出:改什么、为什么、判错的代价。
+> 原计划里凡与本文件抵触的文字,以本文件为准而不是照抄原文。
+
+**裁定依据的事实基准:** `can-voice` @ `main` / `2f90548`(2026-09-14),P2 Task 1–11 已全部落地并通过评审。
+P2 Task 12(流式回退)**未做**——P1 探针未部署,`docs/p1-connectivity-findings.md` 不存在。
+
+> **基准从 `5b2c7ed` 推到 `2f90548`,中间 13 个提交全是 P2 的终审修复。**
+> 它们改的恰好是**契约面**,所以与本文件相关的不止是"又过了几天":
+> **§八那四条硬依赖已经全部落地**(该节已改写成落地记录,连同各自的钉子),
+> C2 的关闭码表和 H3 的原因枚举都因为服务端新增的原因串而需要改(已改),
+> 另有六条新裁定(N1–N6)收在 §十。**开工前读 §八和 §十,它们是这次刷新的全部内容。**
+
+---
+
+## 零、先读这一段
+
+原计划有六处会让执行**当场停住**:编译不过、测试与实现自相矛盾、或 clippy 门禁挡住计划自己的代码。
+它们是 C3、C4、H5、M7、M15,加上 H1(端到端测试不可能通过)。
+**Task 4 和 Task 6 在按本文件改写之前不要开工。**
+
+---
+
+## 一、Critical
+
+### C1 — `SubAck` 缺 `rejected_xc`,交叉耦合被拒会静默丢失
+
+**裁定:必改。** Task 1 的 `SubAck` 加:
+
+```rust
+#[serde(default)]
+pub rejected_xc: Vec<[u32; 2]>,
+```
+
+Task 7 的 `on_ack` 必须存下它;Task 11 的 `pump` 必须为每一对发
+`Event::XcDenied { a_khz, b_khz, reason }`。
+
+**为什么:** 服务端这个字段是**专门**为了不静默丢弃而加的,P2 的裁定原文是
+"一个设好了交叉耦合却不生效、又不知道为什么的管制员,正是整个重写要逃离的那类故障"。
+serde 默认忽略未知键,所以不加这个字段的客户端会把服务端专门发来的拒绝理由丢掉——
+**把这条裁定要防的故障原样复现一遍**。
+
+**判错的代价:** 管制员把 DEL 和 GND 耦合起来,服务端拒了,界面显示已耦合,
+一个频率上的通话在另一个频率上永远听不到,而且没有任何线索。
+
+### C2 — 驱逐会变成无限登录循环
+
+**裁定:必改,这是 P3 最重要的一条。** `LinkState` 加 `Evicted`,并且
+**客户端必须读 QUIC 的应用层关闭码**。quinn 里这条路径大致是
+`ConnectionError::ApplicationClosed(ApplicationClose { error_code, reason })`——
+**这个类型名和字段名是凭记忆写的,动手前先对着实际依赖的 quinn 版本核一遍。**
+要紧的是"必须读到应用层关闭码、并据此决定要不要重连",不是这一行的拼写。
+
+映射表(与 `server/internal/transport/codes.go` 一一对应):
+
+| 码 | 含义 | 客户端行为 |
+|---|---|---|
+| 0 `CloseNormal` | 服务端正常收工(进程退出/重启部署),或客户端自己断的 | **可以重连**,走 `ReconnectPolicy` |
+| 1 `CloseHandshakeRefused` | 握手被拒 | **不要原样重连**;先看 reason(见 H3):`token_expired` → 去换新 token 再连,`token_invalid` / `refused` → 停,`proto_unsupported` → 停,且对用户说的是**"请更新客户端"**(见 N2) |
+| 2 `CloseEvicted` | 同账号在别处登录,你被顶掉了 | **终态,绝不重连**,并告诉用户"账号在别处登录了" |
+| 3 `CloseProtocolViolation` | 客户端把协议用坏了。**三种,reason 分辨**:`control_write_stalled`(不读控制流)、`control_read_stalled`(发了长度前缀不发完)、`ack_undeliverable`(声明太大,SUBACK 发不出去) | **终态,去修客户端**,不要重连。三条的处置相同,但**必须把 reason 透给上层**——它们指向三个完全不同的 bug(见 N3) |
+| 其他 / 传输层错误 | 网络断了 | 走 `ReconnectPolicy`,三次 |
+
+> **码 0 是"可以重连",不是终态——我第一版这张表把它写成了终态,那是错的。**
+> 服务端重启部署走的正是这个码,把它当终态意味着**每次部署之后所有客户端永不回来**。
+> 权威定义在 `server/internal/transport/codes.go` 的注释里,它明写了这四条的客户端契约。
+>
+> 注意码 3 和码 2 是同一类形状:`ReconnectPolicy` 的三次上限**两个都挡不住**,
+> 因为重连本身是**成功**的,计数器一成功就清零,真正的失败发生在几秒之后。
+> codes.go 自己把这一点写下来了——这也正是它不复用码 0 的理由。
+
+**为什么:** `ReconnectPolicy` 只数**连续失败**。驱逐后的重连是**成功的**,
+于是 `on_session_established()` 把 attempts 清零。两个客户端用同一个 CID 会
+**永远互相驱逐**——三次上限根本拦不住,因为没有任何一次是失败。
+`can-audio/CLAUDE.md` 已经记过这个故障的 Mumble 版本(僵尸重连循环把账号锁死),
+这里更糟:循环发生在两个活着的客户端之间,而且每一轮都"成功"。
+
+**判错的代价:** 两台机器登同一个账号,互相踢到天荒地老,两边都听不到任何声音,
+两边的界面都显示"已连接"。服务端日志被登录风暴淹没。
+
+### C3 — `read_msg` 在 `select!` 里不是取消安全的
+
+**裁定:必改,改结构而不是打补丁。** 控制流的读取交给**一个独立的 task**,
+它独占 `RecvStream`,把解析完整的 `Message` 通过 `tokio::sync::mpsc` 送出来;
+`pump` 的 `select!` 只从 channel 上 `recv()`——**`mpsc::Receiver::recv()` 本身是取消安全的**。
+
+**为什么:** `read_msg` 连着做两次 `read_exact`(4 字节长度前缀,然后包体)。
+`select!` 里别的分支赢了的时候,这个 future 会在两次读之间被丢掉,**已经消费掉的字节回不来了**,
+控制流从此错位。之后每一帧都解析失败,最可能的表现是被读成"控制流结束"→ 断开 → 重连,
+而链路其实一直是好的。
+
+**不要**试图用"加个缓冲区记住读了多少"来救——那是在手写一个状态机去模拟取消安全,
+而独立 task 这个写法把整类问题消掉了。
+
+**判错的代价:** 健康的链路上出现无法解释的周期性重连,而且只在控制面有并发活动时出现,
+本地必现不了。
+
+### C4 — Task 4 的实现通不过它自己的测试
+
+**裁定:测试是对的,实现是错的。按测试重写实现,并且把 Task 4 改成真正的 TDD 循环。**
+
+原计划写着"Expected: PASS(十七个测试)",而实测三个 FAIL:
+`frames_come_out_in_sequence_order` 得到 `[0,1,2,3,4]` 而期望 `[0,1,2]`;
+`out_of_order_frames_are_reordered` 得到 `[0,1,2,3]` 而期望 `[0,1,2]`;
+`the_buffer_does_not_grow_without_bound` 得到 `depth()==24` 而断言 `<= 6`。
+根因一致:**测试假定 `pop()` 会一直保持 `START_DEPTH` 帧的水位,实现却把缓冲区抽干**。
+
+测试是对的,因为**抽干到空的抖动缓冲区不是抖动缓冲区,是个重排队列**——
+它没有任何吸收抖动的能力,网络一抖就断音,而吸收抖动正是这个模块存在的唯一理由。
+
+同时并入两条原本无人认领的规格要求:
+
+- **M9** — 规格 §9.2 要求"连续丢超过 3 帧则结束这次发言"。原计划把它推给 Task 5,
+  而 Task 5 是 `mix.rs`,不碰这件事;Task 6 也不碰。**归 Task 4**,连带测试。
+- **M10** — 规格 §9.2 要求深度在 40–120 ms 之间自适应。原实现把 `self.depth` 赋成
+  `START_DEPTH` 之后再没动过,`MIN_DEPTH` 全篇没人引用。**归 Task 4**,连带测试。
+
+另修 **L2**(`depth()` 返回占用量而字段 `depth` 是起播水位,八行里一个词两个意思——
+把字段改名 `target_depth`)和 **L3**(`seq` 用非回绕的 `<`/`>` 比较却用 `wrapping_add` 推进;
+且封顶循环在起播之前就设了 `next`,绕过了 `START_DEPTH` 等待)。
+
+**判错的代价:** 语音在任何抖动下都断续,而且因为"测试全绿"没人会去看这个模块。
+
+---
+
+## 二、High
+
+### H1 — 端到端测试不可能通过(自签证书 vs 系统信任库)
+
+**裁定:加一条"调用方提供根证书"的路径,而不是加一个跳过校验的开关。**
+
+`conn::connect` 增加一个可选参数(或 builder 上的一个方法),接受一组额外的根证书 DER。
+生产路径仍然是 `rustls_platform_verifier::tls_config()`;端到端测试把自签证书的 DER 传进去。
+
+**为什么不用 `InsecureSkipVerify` 的等价物:** 那个开关一旦存在,就会有人在生产里打开它,
+而这条链路上跑的是成员的网络密码。"多传一个根证书"和"不校验"在测试里一样方便,在生产里天差地别。
+
+**判错的代价:** 要么端到端测试根本跑不起来(计划原样),要么发布版里带着一个能关掉 TLS 校验的开关。
+
+### H2 — `rejected` 把 TX 限额拒和 RX 限额拒混成一件事
+
+**裁定(经 P2 终审 B 修正——用差集,不要用 `rejected` 推断):**
+
+```
+被拒的 TX = 我声明的 tx − ack.tx
+被拒的 RX = 我声明的 rx − ack.rx
+```
+
+**不要**去读 `rejected` 来判断方向。`ack.TX` 和 `ack.RX` 是**完整且权威**的:
+服务端把授权后的全集放进去,长度受 `MaxTX`/`MaxRX` 约束(默认 32),不存在截断。
+差集因此是精确的、完备的,而且**天然覆盖了 `maxRejected = 256` 截断的那部分**——
+超过 256 个被拒频率时第 257 个以后根本不进 `rejected`,任何基于 `rejected` 的推断在那里都会失效。
+
+`rejected` 只当作一个补充信号用(它带着"服务端确实看见并拒了这一条"的含义),
+**绝不作为方向判断的依据**。
+
+> 我最初的裁定是按 `f ∈ rejected ∧ f ∈ ack.rx` 这个交集规则分辨的。那条规则在没有截断时成立,
+> 服务端 `router.go` 的注释也确实这么写——**但它在截断之后是错的**,而差集在任何情况下都对。
+> 终审 B 同时要求服务端 README 补一节 SUBACK,把这个公式写下来,因为今天没有任何东西告诉客户端。
+
+Task 11 的 `pump` 按差集分派 `Event::TxDenied` 和 `Event::RxDenied`,
+**不要**把 `rejected` 里的每一项都当成 TxDenied。
+
+**判错的代价(原计划):** 声明 40 个 RX 频率,客户端弹出 8 条"不能发射"的提示,
+而那 8 个频率其实发射得好好的。
+
+### H3 — BYE 的原因死在一行日志里
+
+**裁定:必改。** 加 `Event::Refused { reason: RefusedReason }`,`RefusedReason` 是个枚举:
+
+```rust
+pub enum RefusedReason {
+    TokenExpired,     // "token_expired"      —— 去换一个新 token 再来,这一条是可恢复的
+    TokenInvalid,     // "token_invalid"      —— 停,别重试
+    Refused,          // "refused"            —— 停,别重试
+    ProtoUnsupported, // "proto_unsupported"  —— 停,别重试,也别换 token:去更新客户端(N2)
+    Other(String),
+}
+```
+
+**为什么:** 服务端这几个字符串是**专门为客户端造的**,而且有测试钉住它们稳定
+(基准刷新后是八个串,全部定义在 `server/internal/transport/codes.go`:
+握手被拒的四个 `token_expired` / `token_invalid` / `refused` / `proto_unsupported`,
+驱逐的 `evicted`,协议违规的三个 `control_write_stalled` / `control_read_stalled` /
+`ack_undeliverable`)。
+原计划把它们送进 `tracing::warn!` 就完事,Tauri 层永远拿不到,用户只看到一个没有理由的 Offline——
+**协议里唯一一处专门为客户端设计的东西,客户端用不上。**
+
+`TokenExpired` 是唯一可恢复的:上层应当去换 token 然后重连一次,而不是走 `ReconnectPolicy`。
+
+### H4 — `audiopus = "0.3"` 不保证静态链接 libopus
+
+**裁定:必改。** Task 6 Step 1 明确写出 vendored/static 的 feature,不要裸依赖。
+
+**为什么:** `audiopus_sys` 先探 `pkg-config`,系统上装了 libopus 就链系统的,从源码编译只是**回退**。
+Task 6 Step 6 却把"不依赖动态 libopus"列成硬性完成条件——于是在任何装了 libopus 的开发机上,
+这个任务会卡在它自己的检查上。更要紧的是发布版:这正是 `can-audio/CLAUDE.md` 里
+`opus.dll` 那个坑的重演——**文件没跟着打包走,程序照常启动,功能悄无声息地死了**。
+
+### H5 — `NoiseGen::next` 撞 clippy 门禁
+
+**裁定:改名 `sample()`。** `clippy::should_implement_trait` 是 warn-by-default,
+而每个任务的门禁是 `cargo clippy --workspace -- -D warnings`,所以 Task 5 过不了自己的门。
+
+---
+
+## 三、Medium — 会当场炸的
+
+| # | 裁定 |
+|---|---|
+| **M15** | Task 6 的 Files 列表加 `crates/*/src/rx/mod.rs`,步骤里加 `pub mod decode;`。否则 Task 6 Step 5 硬编译失败,Task 9 也跟着挂。 |
+| **M2** | **每一个控制面消息的每一个 `Vec` 字段都加 `#[serde(default)]`**,两个方向都加。Go 把 nil slice 编码成 `null`,而 `rejected_xc` 按 P2 的明确指令**没有** `omitempty`,所以 `"rejected_xc": null` 是常态而不是边角。少一个 default,**每一个 SUBACK 都解不出来**,`pump` 会把它读成"控制流结束"→ 重连风暴。 |
+| **M7** | 删掉 `use tokio::io::AsyncReadExt`——quinn 0.11 的 `RecvStream::read_exact` 是固有方法,把它盖住了,`-D warnings` 会因 `unused_imports` 失败。 |
+| **M8** | tokio 的 feature 加 `net`。Task 11 的 `run` 调 `tokio::net::lookup_host`,现在只是**碰巧**靠 quinn 的 feature 合并编译过去——quinn 换个版本就塌。 |
+| **M12** | rustls 被钉在 `features=["ring"]`,而 quinn 0.11 默认 `aws-lc-rs`,且没有任何地方调 `CryptoProvider::install_default()`。**二选一并写死**:要么统一到 aws-lc-rs,要么保留 ring 并在进程启动时显式装。否则第一次拨号 panic:"no process-level CryptoProvider available"。 |
+| **M13** | P2 Task 11 已落地,`server/cmd/can-voice/` 存在,这条的前半已消解。后半仍然生效:**Rust 任务往 Go 仓库写 Go 文件,必须把两个 Go 文件列进 Files,并且只按显式 pathspec 提交,绝不 `git add -A`。** |
+| **M3** | `read_msg` 不要自己重写一遍长度前缀和 `MAX_FRAME` 检查。把长度检查抽成一个函数给两边共用,或者干脆只留异步版本。否则**被测的那份实现从不上线,上线的那份从不被测**,两者一旦分叉就是协议错位且无测试可catch。(与 C3 的重构一起做。) |
+
+## 四、Medium — 质量与完整性
+
+| # | 裁定 |
+|---|---|
+| **M1** | **从 P3 里彻底删掉 `Hello.transport` 字段。** 它只存在于 P2 的 `task-12-brief`,而 Task 12 因 P1 未部署而**停在未做**。一个宣称了未构建行为的字段比没有这个字段更糟:真设成 `"stream"` 时服务端会忽略它,客户端却以为自己走了回退通道。等 Task 12 真做了再加。 |
+| **M4** | 客户端在发 SUB 之前自己按 `maxXCPairs = 64` 夹一下,并把夹掉的部分报给上层。另外:**任何被 `MaxTX` 截掉的频率会让所有含它的耦合对失效**,这一点连同 C1 一起,是客户端必须向界面解释的。12 个交叉耦合的电台就是 66 对,尾巴会被拒。 |
+| **M5** | `Link` 保留 `Ready.max_rx`,不要在边界上丢掉。客户端要能在声明**之前**夹住,而不是靠 `rejected` 事后发现。 |
+| **M6** | `connect()` 改成真正等握手完成再返回,这样它的 `Result` 才可能是 `Err`,`Error::BadAddress` 才有构造点。现在它在 `tokio::spawn` 之后立刻 `Ok`,任何 I/O 都还没发生——错的主机名和坏 token 都只会变成一个没有理由的 `State(Offline)`(与 H3 叠加)。 |
+| **M11** | **实现 PING/PONG,不要删掉 `Event::Health`。** `can-audio/CLAUDE.md` 的规矩是"**掉线必须自己解释**"——RTT、发送缓冲拥塞、收发帧数,正是区分"上行真的扛不住"和"抖了一下"的东西,这两者的处置完全不同。留着一个永远不发的公开事件变体,等于对上层撒谎。 |
+| **M14** | `Event::RxEnd { frames, secs }` 的两个字段在 `pump` 里实算,不要硬编码 0。Task 10 专门写了测试论证这两个字段的意义("每次通话一行,自带时长和帧数"),而唯一的生产者填 0。 |
+| **M9 / M10** | 已并入 C4。 |
+
+## 五、Low — 批量处理,一次提交
+
+L1(`serde_json` 重复声明且在 workspace 表外重钉版本)、L2/L3(并入 C4)、
+L5(Task 8 的 Interfaces 块声称消费 `SubscriptionState`,实际消费者是 Task 11)、
+L6(Task 3 的 Interfaces 块漏了 `set_gain`/`set_primary`)、
+L7(Task 2 的 Interfaces 块写了 `Result<...>` 但 `wire.rs` 没有这个别名)、
+L8(`let _ = SAMPLE_RATE;` 这行强制的空操作删掉;另核 audiopus 0.3 的
+`decode` 签名是否真是 `Option<&[u8]>` + `&mut [i16]`——0.3 把它们包在
+`Packet`/`MutSignals` newtype 里,**这条没有验证过,执行者要先核再写**)、
+L9(`format!("{:?}")` 比字符串改成用已派生的 `PartialEq`)、
+L10(两处 `/* Task 12 接入 */` 注释改成 P4,P3 只有 11 个任务)、
+L11(`run` 每轮都重发 `Event::State`,改成只在变化时发)、
+L12(`set_tx(f,false)` 顺带清 `xc` 是对的也是必要的,但没有测试钉住,补一个)。
+
+**L4 要单独说:** `the_public_api_has_no_imperative_channel_verbs` 只 grep
+`include_str!("client.rs")` 一个文件,七个文件里管一个,而且是在源码文本上匹配而不是在导出的 API 上。
+`session.rs` 里加一个 `pub fn join_frequency` 它发现不了。**裁定:扫全部模块文件。**
+要真做对得看导出符号,但那要 proc-macro 或 `cargo public-api`;扫七个文件是成本合适的近似,
+而扫一个文件是**看起来在防守**。
+
+---
+
+## 六、命名陷阱(L13)——单独记一条
+
+**P3 的 `Radio.primary` 和服务端的"主频率"是两个毫不相干的东西。**
+
+- `Radio.primary` 是界面标记(电台列表里那个 `▸` 行),**不发给服务端**。
+- 服务端的"主频率"是**发话人**发射时用的那个频率,它决定了当一个监听者同时订阅了
+  一对耦合频率的两端时,包头的 `freq_khz` 填哪一个。
+
+把 Task 3 接到 Task 11 的人一定会想把这两个连起来。**裁定:把 P3 的字段改名 `selected`**,
+让这个诱惑消失。判错的代价很具体:恰好在"双订阅 + 交叉耦合"这个情况下,
+音频会显示在错误的电台行上。
+
+---
+
+## 七、执行顺序的一处调整
+
+Task 4 和 Task 6 按本文件改写之前不要开工(C4、H4、M15)。
+Task 8 的 QUIC 部分(Step 6)在原计划里**明确未测**,而 C2、C3、M7、M8、M12 全在那里——
+**裁定:Task 8 Step 6 必须带测试**,至少覆盖关闭码映射(C2)和控制流读取的取消安全(C3)。
+这两条都是"本地跑起来像好的,上线之后无法解释"的形态,而这正是本项目已经栽过的那类。
+
+---
+
+## 八、P3 依赖的 P2 修复(来自 P2 终审 B)——**四条全部已落地**
+
+P2 终审在协议面查出 12 条,其中四条**直接决定 P3 怎么写**。写这一节的时候它们都还没落地,
+所以原文是"开工前先确认"。**在 `2f90548` 上逐条核过源码,四条全部落地,各自都有钉子。**
+下面记的是落在哪儿、钉子是哪一条——P3 现在照着这些写,不必再等。
+
+1. **`seq` 的语义已经定义:每会话单调,不按发言重置,不说话时不走。**
+   写在 `server/internal/wire/header.go` 的 `Header.Seq` 注释与 `server/README.md`
+   的《数据面包头》一节。比较用 16 位回绕算术,**有两处照这里写而不是照 RFC 1982 写**:
+   `b == a` 时式子给"在后面",所以**先判相等再判先后**,否则重复帧会被当成新帧收下;
+   差值恰好是 2¹⁵ 时 RFC 说"未定义",这里定成**不在后面**(丢弃那一侧)。
+   **L3 于是有了依据:回绕推进是对的,非回绕的 `<`/`>` 比较是错的,照上面两条改。**
+
+   > **但要知道这一条的钉子在哪一侧:服务端只转发、从不重排,所以 Go 侧没有任何
+   > `seq` 比较的实现,也没有测试。这段语义在 Go 那边是纯散文。**
+   > 也就是说 **Rust 是 `seq` 的第一个实现**,写错了没有任何东西会红——
+   > 金文件只管编解码,管不到比较。Task 4 的回绕处理必须自带钉子,
+   > 尤其是上面那两条与 RFC 不一致的地方。
+
+2. **下行 `qual` 恒在 1–255、永不为 0,已经写下来并钉住。**
+   实现在 `server/internal/geo/range.go` 的 `Quality`:射程外返回 `(0, false)`
+   而服务端**根本不投递**;衰减带最外侧四舍五入本来会得到 0 的那一小段被夹到 1。
+   钉子是 `TestQualityNeverReportsZeroWhileStillInRange`,金文件也补了一个 `qual=1` 的样例。
+   **对 P3 的结论是反过来的:不要给下行的 0 写"最弱信号"分支。**那种包不存在,
+   那条分支永远不会执行,也就永远不会被发现写错了。上行相反,客户端填 0、服务端连看都不看。
+
+3. **`flags` 第 2–7 位的保留约定已经写下来:`wire.ReservedFlags = 0xFC`。**
+   规则是**发送方置零、接收方忽略自己不认识的位、服务端原样转发**——既不拒绝也不清零,
+   为的是将来的一位可以只升级客户端就部署。两道钉子:`header_test.go` 断言
+   `FlagFirst|FlagLast|ReservedFlags == 0xFF` 且三组互不重叠(每一位要么有定义要么被保留),
+   `fanout_test.go` 的 `TestFanoutRelaysTheReservedFlagBitsUntouched` 钉住原样转发。
+   **P3 照原计划解析即可:忽略未知位,不要拒绝。**
+
+4. **金文件第 4 个样例已经从 `199998` 换成 `132500`**,并且新增了第 5 个样例
+   (下行衰减带最外侧:`qual=1`、`seq=32768` 取回绕中点)。文件头的 comment 也补了一句
+   "样例里的频率不带任何含义,别从取值上推断什么"。**现在是 5 个用例**——
+   Task 2 的测试是遍历 `cases` 的,不写死数量,所以不用改;但别在别处把"4 个"写死。
+
+原文那两条"不阻塞的改善"也都做了:服务端 README 补了《SUBACK 怎么对账》一节写明差集公式(见 H2);
+`ReasonEvicted = "evicted"` 成了常量并被钉住(C2 读的是关闭**码**,不受影响,但有个稳定字符串更好认)。
+
+---
+
+## 九、一条服务端查不出来的客户端义务(P2 第四轮带出)
+
+**发射端必须为每一个 TX 频率各发一个数据报,同一个音频帧在每份副本上带同一个 `seq`。**
+
+这不是新规矩,而是一直就成立的:包头只写得下**一个** `freq_khz`,而服务端的 `MayTransmit`
+是按那个频率鉴权的。所以一个没有交叉耦合、但在两个频率上都开了 TX 的管制员,
+本来就得发两个数据报。P2 第四轮只是让交叉耦合也守这条规矩,并把它写进了契约。
+
+**为什么它必须写在 P3 这边:服务端检查不了。**
+一个声明了 `xc` 却只发一个数据报的客户端,在另一个频率上**完全静默**,
+而服务端日志一切正常——它收到了一个合法的数据报,鉴权通过,扇出成功。
+没有任何一端会报错。这正是整套重写要逃离的那类故障,而这一次拦不住它的是协议本身。
+
+配套的两条接收端规则(同样来自第四轮,写进 `wire.Header.Seq` 与 `server/README.md`):
+
+- **服务端会扣掉"发话人自己也在发"的那个耦合副本。** 于是只订阅耦合对其中一边的听众
+  每帧**恰好收到一份**,`seq` 在 `(speaker, freq_khz)` 这个键下是连号的。
+- **同时订阅耦合对两边的听众,每个频率各收一份,`seq` 相同,两个独立缓冲区。**
+  **这是有意的,不要跨频率去重**——RX 开在两个频率上的无线电台面本来就会在两行上
+  都听到耦合通话。Rust 实现者看到"同一个 seq 出现两次"时第一反应会是去重,那是错的。
+
+**另记:`FlagLast` 不是结束发话的机制,只是一个优化。** 它走不可靠数据报,而且听众飞出射程时
+服务端**不打招呼就停发**——那正是 `FlagLast` 保证不会到达的情形。
+**接收端必须另有静音超时**,否则 RX 指示灯会亮一整个会话。
+这是 `can-audio` 那个老 bug 的升级版:那边是亮半秒,这边是永久。
+
+---
+
+## 十、基准刷新带出的新裁定(`5b2c7ed` → `2f90548`)
+
+P2 终审后续的 13 个提交在契约面新增了七个符号,**每一个在 `5b2c7ed` 上都不存在**:
+`RejectedTruncated`、`ReservedFlags`、`ReasonProtoUnsupported`、`ReasonControlReadStalled`、
+`ReasonAckUndeliverable`、`declarationLimit`、`isValidCallsign`。
+`ReservedFlags` 归 §八.3,其余六个的裁定在这里。
+
+### N1 — `SubAck` 又少一个字段:`rejected_truncated`
+
+**裁定:必改。** C1 给 `SubAck` 加了 `rejected_xc`,现在还要加:
+
+```rust
+#[serde(default)]
+pub rejected_truncated: bool,
+```
+
+`#[serde(default)]` 这次是**硬性的**而不是 M2 那种保险:服务端这个字段带 `omitempty`,
+所以它在常规 SUBACK 里**根本不出现**——少了 default 就不是"读成 null",而是每一份
+正常的 SUBACK 都解析失败,`pump` 把它读成控制流结束,于是重连风暴。
+(注意它和 `rejected_xc` 正相反:那个**没有** `omitempty`,常态是 `null`。同一个结构体里
+两个字段两种缺省行为,两边都得照做。)
+
+**怎么用它:** 为 `true` 时**不要再读 `rejected`**,改用 H2 的差集公式。
+H2 早就说了差集在任何时候都对、`rejected` 只是便利字段——这个字段是服务端
+把"这次真的截断了"明说出来,让客户端不必自己猜。
+
+**为什么服务端要加它:** 实测声明 1000 个频率、`MaxRX=32` 时,有 712 条拒绝
+无标记、无日志地消失,而客户端拿到的 ACK 看起来完全正常。
+
+**判错的代价:** 不加字段 → 每一次正常 SUB 之后都断线重连,而且只在连上服务端之后才复现;
+加了字段却仍然信 `rejected` → 大声明下界面漏报一批被拒频率,和它要防的故障一模一样。
+
+### N2 — `proto_unsupported`:动作和 `refused` 一样,**对用户说的话不一样**
+
+**裁定:必改,而且改的是 UI 那一层。** `RefusedReason` 加 `ProtoUnsupported`(见 H3),
+Tauri 层为它单独出一句**"请更新客户端"**。
+
+**为什么单独占一个变体:** 处置确实和 `refused` 一样(都别原样重试),
+但这个网络的客户端是装在成员机器上的桌面程序。告诉一个版本太旧的用户"被拒绝",
+会把他送去查密码、去 can-api 换票、去怀疑自己的账号——三件事一件都帮不上忙,
+他目录里那个旧 exe 才是原因。服务端明确为这件事造了一个串,客户端把它并回
+`Refused` 等于又把它扔了。
+
+**顺带一条不必改但要知道的:** `HELLO.proto` 现在是**真的被检查**的
+(`conn.go` 判 `h.Proto != control.ProtoVersion`,缺席即 0 同样被拒)。
+P3 Task 1 的测试本来就填 `"proto":1`,所以无需改动——但在 `5b2c7ed` 上填错是不会被发现的,
+现在会以关闭码 1 + `proto_unsupported` 被拒。
+
+### N3 — 关闭码 3 从"只有一种"变成三种,reason 必须透给上层
+
+**裁定:C2 的表已改(见上)。三条的处置相同——终态、不重连、去修客户端——但
+`Event::Refused` 之外还要让上层拿到是哪一条**,因为它们指向三个完全不同的 bug:
+
+| reason | 客户端哪里坏了 |
+|---|---|
+| `control_write_stalled` | 不读控制流了(服务端写卡在流控上,于是它也不再读你的 SUB) |
+| `control_read_stalled` | 发了长度前缀却不把这一帧发完 |
+| `ack_undeliverable` | 声明太大,SUBACK 超过 64 KiB 发不出去——**而那份 SUB 已经生效了** |
+
+第三条要特别看:它意味着**服务端的订阅状态和客户端的对不上**,
+而按 N1/H2 正确对账的客户端本来就不该走到这里。碰到它就是 M4/M5 的夹没夹住。
+
+**判错的代价:** 三条并成一句"协议违规",下一个人拿到的只有一个无法定位的终态断线,
+而这三个 bug 在本地都复现不了。
+
+### N4 — `follow` 要在客户端先自校验
+
+**裁定:必改,但很小。** 观察员模式填的 `Hello.follow` 现在被服务端校验
+(`conn.go` 的 `isValidCallsign`,照抄 can-fsd:**2–10 个字符,只许 `A-Z` `0-9` `-` `_`**)。
+不合规则的直接以关闭码 1 + `refused` 拒掉。P3 在发 HELLO **之前**照同一条规则自己判一次,
+判不过就返回 `Error::BadCallsign` 之类的本地错误,不要发出去。
+
+**为什么:** 服务端在这里只会回 `refused`——那个串按 H3 的表意思是"停,别重试",
+用户看到的是一个没有解释的终态。而这是四个客户端里唯一一个**用户直接手输**的协议字段,
+输错是日常。本地判一次,错误信息才说得出"呼号只能是 2–10 位字母数字"。
+
+**别把规则放松或收紧:** 松了会放进永远查不到位置的值(它是去 datafeed 快照里按呼号查位置的键),
+紧了会把合法呼号挡在外面。can-fsd 那张 `reservedCallsigns` 表不要抄,服务端也没抄。
+
+### N5 — 起播不能等首帧(直接修正 C4 的抖动缓冲区)
+
+**裁定:必改,归 Task 4,和 C4 一起做。**
+**接收端从它收到的第一个包起就进缓冲、就起播,不管那个包有没有 `FlagFirst`。**
+`FlagFirst` 只用来"点亮 RX 灯 + 重置缓冲",**不是"可以开始播放"的判据**。
+
+**为什么这不是边角:** 首帧未必是你收到的第一个包,而且那是日常——
+`SUB` 是全量声明、立即整体替换,所以管制员在别人说到一半时把一个频率加进台面,
+**下一帧**就投给他,那一帧没有首帧位;一架飞机**飞进**射程也一样,
+投递在距离跌破 cutoff 的那一帧就开始。
+
+**判错的代价:** 飞行员复诵到第 8 秒,管制员把 121.800 加进台面,他一声不响,
+直到飞行员下一次按下 PTT——而服务端日志完全正常。这正是 `can-audio` 那一整类
+"界面是绿的、声音是没有的"故障的形状。
+
+### N6 — 声明有**两道**上界,客户端夹的时候两道都要知道
+
+**裁定:M4/M5 的补充。** 除了 `MaxTX`/`MaxRX`(从 READY 拿,默认 32,服务端配置上限 1024),
+还有一道 `declarationLimit = 4 × max(MaxTX, MaxRX)`:**超出的部分在服务端拿写锁之前就被截掉**,
+和其它被拒频率一起回报。它挡的不是"能订阅几个",而是"服务端愿意为一句声明在全局写锁里干多少活"。
+
+对客户端的意思:按 M5 用 `Ready.max_rx` 夹住之后,声明长度本来就到不了第二道界。
+**真撞上第二道,说明第一道没夹——那是客户端的 bug,不是服务端小气。**
+`maxXCPairs = 64` 那道界(M4)与这两道都不重叠,照 M4 单独夹。
+
+---
+
+## 十一、执行回执(P3 已实施)
+
+**P3 的 11 个任务已经全部落地**,在 `can-voice` 的 `feat/p3-rust-client-core` 分支上,
+12 个提交,136 个测试(105 lib + 28 proto + 3 端到端),`clippy -D warnings` 干净,
+Go 那半边的 `vet` 与 `go test ./server/...` 照旧全绿。
+
+这一节记的是**本文件裁定错了的地方**。它们不是事后诸葛:每一条都有当时的验证方式,
+写在这里是因为下一个读这份修订件的人不该被误导。逐条的完整论证在各自的提交信息里。
+
+### 裁定本身有误的
+
+**C4 —— 两个测试在算术上互相矛盾,任何实现都不可能同时通过。**
+
+    测试 A  push [0,1,2,3,4]（5 帧）期望放出 [0,1,2] —— 放 3 留 2
+    测试 B  push [2,0,1,3]  （4 帧）期望放出 [0,1,2] —— 放 3 留 1
+
+任何"len >= t 才放"的实现停下时 len 恰好是 t-1:A 要求 t=3,B 要求 t=2。
+M10 的自适应也救不了——B 是乱序的那个,抖动更大,深度只会更深,方向是反的。
+
+更要紧的是 C4 的**论据**站不住。它说"抽干到空的抖动缓冲区是个重排队列",
+所以要在播放途中扣住水位。但吸收抖动的机制是**起播前攒够水位**:生产里 `pop` 由
+声卡时钟以 20 ms 的固定节奏调用、帧也以 50 包/秒到达,水位自然停在起播时的高度。
+缓冲真被抽干只有一种可能——上游停了——而那时正确的输出是 `Lost`(交给 PLC),
+不是 `None`(静音)。**扣着不放恰恰会把它声称要防的"断音"做出来。**
+处置:A、B 两条改成期望全部放出并按序;第三条(`the_buffer_does_not_grow_without_bound`)
+照 C4 的裁定改实现(上限从 `MAX_DEPTH*4` 收到 `MAX_DEPTH`)。M9/M10/L2/L3 照并。
+
+**M2 —— 开的方子盖不住它要防的那个情况。** `#[serde(default)]` 只管"键**缺席**";
+Go 把 nil slice 编码成 `null`——键**在**,值是 `null`——而 serde 见到 `null` 要一个
+sequence 时是**硬报错**,不会回退到 default。照原样写出来的客户端在它要防的那个
+情况下照样解析失败、照样重连风暴。要配一个 `deserialize_with`(见
+`control.rs` 的 `null_as_default`)。
+
+M2 还有一句事实错误:"`\"rejected_xc\": null` 是常态"。**今天不是**——`router.go`
+的两个 SubAck 构造点(183、216)都把四个切片显式初始化成非 nil 空切片。但结论仍然
+成立,理由换一个:**Go 侧没有任何测试钉住这件事**,那是一个没人守着的实现细节,
+而每个客户端都压在它上面。契约取宽的那一侧。
+
+**H4 / L8 —— `audiopus = "0.3"` 这个版本不存在。** registry 里最新是 0.2.0。
+静态链接的 feature 也不在 `audiopus` 上而在 `audiopus_sys` 上,而且版本要和
+`audiopus 0.2` 拉进来的那个(0.1.8)对上,否则 feature 合并不到一起,
+会出现两份 `audiopus_sys` 而静态那份根本没人用。
+
+**构建前置也说错了:要的是 autotools,不是 cmake。** `audiopus_sys 0.1.8` 的
+build.rs 走 `sh autogen.sh && sh configure --enable-static && make`。
+(已写进 `can-voice/README.md` 和 CI。)
+
+**M12 —— 前提在 quinn 0.11.12 上不成立。** 它的默认 feature 就是 `ring`
+(`rustls-ring` + `platform-verifier`),不是 aws-lc-rs,Cargo.lock 里也确实没有 aws-lc。
+**裁定照做**,而且做得更硬:不依赖进程默认 provider,直接
+`builder_with_provider(ring::default_provider())`——依赖默认值的话,哪天依赖图里多出
+一个 aws-lc-rs,第一次拨号会 panic 在运行时而不是构建时。
+
+**M7 —— 在最终的写法下不适用。** `RecvStream` 确实有固有的 `read_exact`(会盖住
+trait 方法),但通用读取路径是对 `AsyncRead` 泛型的,那里 `AsyncReadExt` 是真的要用的;
+握手期直接打 `RecvStream` 的那一条则本来就没有那个 import。
+
+### 裁定是对的,而且核实过的
+
+**C2 的类型名一字不差**:`ConnectionError::ApplicationClosed(ApplicationClose {
+error_code: VarInt, reason: Bytes })`。本文件说它是凭记忆写的、动手前先核——核过了。
+
+**L8 的 `decode` 签名**:`decode<TP, TS>(Option<TP>, TS, bool)`,`TP: TryInto<Packet>`、
+`TS: TryInto<MutSignals>`,而且用的是 audiopus **自己的** `TryInto`(std 的当年还在
+nightly)。`&Vec<u8>` 和 `&[u8]` 都有 impl;PLC 那一支要写成 `None::<&[u8]>`,
+光写 `None` 推导不出类型。
+
+### 本文件和原计划都没扫到的
+
+- **计划的 workspace `members` 列了 `crates/can-voice-client`,而 Task 1 的 Files
+  不建它**——`cargo test -p can-voice-proto` 直接死在"加载不了 workspace member"上。
+  这是第七处"会让执行当场停住"的地方(§零列了六处)。
+- **Task 5 的 `squelch_level` 写 `if qual >= 255`,而 `qual` 是 `u8`**——那是
+  `clippy::absurd_extreme_comparisons`,**deny-by-default**,比 H5 那条还硬。
+  连同 H5、M15,计划里一共三处代码过不了它自己的门禁。
+- **`BTreeMap<u16, _>` 在 `seq` 回绕点排序是错的。** 一次发言完全可能跨过回绕点
+  (每会话单调、21.8 分钟一圈),而按 u16 数值排序会把 0 排到 65534 前面,
+  整段发言顺序全乱、迟到帧判反,日志里什么都看不出来。抖动缓冲改成内部存
+  **展开成 64 位的序号**。
+- **Task 11 的 fixture 签一张一小时的 token,会被拒。** `auth.maxTokenLifetime`
+  是 **10 分钟**——短有效期是这套设计里唯一的吊销机制,所以 `exp` 有上界。
+  踩中的话 e2e 会以 `token_invalid` 失败,而那看起来像密钥不配对。
+- **端到端测试当场抓到一个拼接错误**:`VoiceClient::connect` 里的信任根没接上
+  (`Config::extra_roots`、`trust_roots()`、`pump` 那一侧都对了,唯独这一处还写着
+  `TrustRoots::Platform`)。编译通过、单测全绿,只有真去打一个自签服务端才露头。
+  **原计划把 Task 8 Step 6 标成"无单测"**,这个错会一路活到 P4——
+  §七 要求 Step 6 带测试,是这份修订件里回报最高的一条。

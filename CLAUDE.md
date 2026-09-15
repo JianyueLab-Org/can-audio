@@ -627,14 +627,25 @@ immediately rather than at the next save, and `password_migrated` makes the clie
 same shape as the `OLD_MUMBLE_HOSTS` rewrite. Dropping it without saying anything would look like
 the client losing the password; keeping it would leave the leak in place.
 
-**Still open: the pbh sign, and it is not safe to guess.** can-fsd's `normaliseSigned`
-(`internal/fsd/packet.go`) begins `v = -v`, so it decodes pitch and bank as the negation of what
-`xpc`/`msfs`'s `fsdpilot.py` encodes. `test_xpc.py`'s reference `unpack_pbh` — which
-`fsdpilot.py` names as the arbiter — is a transcription of that Go function that dropped the same
-line, so `PbhTest` round-trips can-audio against a copy of its own convention and passes while both
-halves may be wrong. Neither side's tests pin it: can-fsd's `TestPitchBankHeading` checks only the
-heading round-trip and that all three axes stay in range, and `docs/protocol.md` documents the bit
-layout without mentioning a sign. **Which side matches the external openfsd/EuroScope convention
-cannot be decided from this tree**, and changing the wrong one inverts aircraft attitude for
-everybody, so it has been left alone. Settle it against openfsd or a real EuroScope capture, not
-against either copy here.
+**The pbh sign is settled: can-audio was right and can-fsd was negating.** This used to be
+recorded here as open and unsafe to guess — can-fsd's `normaliseSigned` (`internal/fsd/packet.go`)
+began `v = -v`, so it decoded pitch and bank as the negation of what `xpc`/`msfs`'s `fsdpilot.py`
+encodes, while `test_xpc.py`'s reference `unpack_pbh` — which `fsdpilot.py` names as the arbiter —
+was a transcription of that Go function that dropped the same line. So `PbhTest` round-tripped
+can-audio against a copy of its own convention and passed while both halves might have been wrong.
+
+Three independent implementations settle it, and **none of them negates**:
+
+- **`Vatsim.Network`'s `PDUBase.PackPitchBankHeading` / `UnpackPitchBankHeading`** (the client-side
+  library vATIS and friends use). Pack is `p = pitch/360; if p < 0 { p += 1 }; p *= 1024`; unpack is
+  `raw/1024*360` folded at ±180. **This is the authority** — it is what real clients put on the wire.
+- **openfsd's `fsd/util.go`**: `raw * 359/1023`, no sign handling at all.
+- **can-audio's own `pack_pbh`**, which matches both.
+
+So `pack_pbh` and `unpack_pbh` here are correct and stay as they are; the `v = -v` was removed in
+can-fsd (`fix/pbh-sign`) together with a test that pins the sign against the Vatsim.Network pack
+algorithm rather than against our own encoder — round-tripping against our own encoder is exactly
+how this survived. Two reasons it lasted: can-fsd's `TestPitchBankHeading` checked only the heading
+round-trip and that every axis stayed in range (a negated value passes both), and the raw packet is
+relayed to other pilots **verbatim**, so traffic rendering was always right and only can-fsd's own
+datafeed — and therefore the website's radar — showed every aircraft inverted.
