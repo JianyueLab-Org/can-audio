@@ -41,33 +41,28 @@ P4 不是一个任务，是**五个独立的产品**。被替换掉的那四个 
 （一栈频率加状态栏），atis 次之（模板编辑器复杂但不接模拟器），xpc/msfs 最后，
 因为要处理 SimConnect 和 X-Plane 桥接的 FFI。
 
-### 0.2 硬前置一：can-api 还没有 `POST /api/v1/voice/token`
+### 0.2 硬前置一：`POST /api/v1/voice/token` —— **已做**
 
-设计文档 §11.3 把它列为"**新版能否登录的前提，不是可选项**"。核过了：
+设计文档 §11.3 把它列为"**新版能否登录的前提，不是可选项**"，而它此前不存在：
+can-api 的 110 条路由里相关的 0 条，整个仓库 0 处 ed25519。现在有了，
+在 can-api 的 `feat/voice-token` 分支上。
 
-```
-can-api 的 /api/v1 路由：110 条
-其中与语音 token 有关的：0 条
-can-api 里的 ed25519：0 处
-```
+- **非对称**（Ed25519）而不是像 `atcauth` 那样用 HMAC：can-voice 必须能验签而
+  **不能签发**，共享密钥等于在每台语音服务器上放一个伪造者。
+- **线格式是跨仓库契约，而且钉住了**：can-api 的 `voiceauth_test.go` 里那张黄金
+  token 是**由 can-voice 自己的 `auth.Sign` 签出来的**。两个仓库之间没有共享代码，
+  分岔的症状是"所有人都被 `token_invalid` 拒掉"，读起来像密钥不配对。
+  另外做过一次真的跨仓库验证：can-api 签、can-voice 验，claims 一字不差。
+- **私钥放 can-api**（`VOICE_TOKEN_KEY`，32 字节种子的 base64），公钥放 can-voice
+  （`CAN_VOICE_API_PUBKEY`）。`go run ./cmd/voice-keygen` 一次生成两半并各自打上
+  该去的变量名——放反了的症状是另一头的 `token signature does not verify`，
+  那读起来像密钥不对而不是像拿反了。
+- TTL 默认 60 秒、上限 10 分钟（对齐 `auth.maxTokenLifetime`）；`max_tx` 默认 8。
 
-现在能连上 can-voice 的**只有端到端测试**，因为夹具用自己的密钥签票。
-**在这个端点存在之前，四个客户端一个都登录不了**，P4 做到最后也是不能用的。
-
-它要做的事很小，但有一个必须由人来定的决定：**Ed25519 私钥放在哪**。
-can-voice 服务端只认 `CAN_VOICE_API_PUBKEY`（裸 32 字节的 base64），
-而签名那一半在 can-api。相关约束：
-
-- token 的有效期上限是 **10 分钟**（`auth.maxTokenLifetime`）。设计文档说签 60 秒。
-  **短有效期是这套设计里唯一的吊销机制**——`auth` 包明令禁止任何网络调用，
-  所以一张签出去的票在过期之前没有任何办法作废。
-- claims 是 `{cid, rating, max_tx, exp}`。`rating < 1` 的成员不能用语音，
-  和 `/api/v1/public/auth` 同一条规则——但**那条规则要在 can-api 这一侧判**，
-  can-voice 只按 claims 里的 rating 拒。
-- 鉴权复用现有的 `/api/v1/public/auth` 逻辑（CAN 号 + 网站密码）。
-
-**这一条不在本计划的任务里**：它是 can-api 的改动，有自己的 CI 和部署。
-列在这里是因为不先谈好，P4 做完那天没有人能登录。
+**还差一步，属于 Task 3：** 客户端要真的去调它。`can-voice-client` 的 `Config.token`
+现在是调用方传进来的，四个应用要在连接前拿 CAN 号和密码换一张票，并在
+`token_expired` 时换新票重连（`RefusedReason::TokenExpired` 是唯一可恢复的那一条，
+而换票不是核心库能做的事——它拿不到凭据）。
 
 ### 0.3 硬前置二：`@jianyuelab-org/can-ui` 的访问
 
@@ -440,7 +435,7 @@ Python 版两边都硬编码成 0，所以网络看到的是未修正的真高�
 
 | # | 事 | 影响 |
 |---|---|---|
-| R1 | **can-api 的 `/api/v1/voice/token` 不存在** | P4 做完也没人能登录。见 §0.2 |
+| R1 | ~~can-api 的 `/api/v1/voice/token` 不存在~~ **已做**（can-api `feat/voice-token`） | 剩下的是客户端去调它，属于 Task 3。见 §0.2 |
 | R2 | `@jianyuelab-org/can-ui` 的访问未验证 | 到第一个 `bun install` 才发现，那时骨架已搭一半 |
 | R3 | **PBH 的符号仍未定** | `can-audio/CLAUDE.md` 明写这条没有结论：can-fsd 的 `normaliseSigned` 开头就是 `v = -v`，而 `test_xpc.py` 里那份"仲裁用"的参考实现恰好漏了这一行，于是两边在自己的约定里自洽而可能都是错的。**改错一侧会让所有人的飞机姿态倒过来。** 要对着 openfsd 或一次真实的 EuroScope 抓包定，不要对着这两份任何一份 |
 | R4 | Tauri 2 的三平台打包与签名 | macOS 公证、Windows 签名都要证书；不签的话用户看到的是"这个程序不安全" |
