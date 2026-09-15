@@ -64,14 +64,34 @@ can-api 的 110 条路由里相关的 0 条，整个仓库 0 处 ed25519。现�
 `token_expired` 时换新票重连（`RefusedReason::TokenExpired` 是唯一可恢复的那一条，
 而换票不是核心库能做的事——它拿不到凭据）。
 
-### 0.3 硬前置二：`@jianyuelab-org/can-ui` 的访问
+### 0.3 硬前置二：`@jianyuelab-org/can-ui` 的访问 —— **已验证，能装**
 
-四个前端要装 GitHub Packages 上的私有包，需要一个有 `read:packages` 的 token。
-**开工前先确认 `bun install` 装得下来**——这是那种"到第一个 `bun install` 才发现"的前置，
-而那时骨架已经搭了一半。
+实测过，不是看文档：
 
-装不下来时的退路是**不用 can-ui**，前端自带一套最小样式。那会让四个客户端和网站的
-观感分家，是一个要明确做的决定，不是默默绕过去。
+```
++ @jianyuelab-org/can-ui@0.3.5
+203 packages installed [4.52s]
+```
+
+做法和树里六个 Astro 站点（can-dev / can-radar / can-exam / can-efb /
+can-controller / can-database）完全一样，各自都有一份 `.npmrc`：
+
+```
+@jianyuelab-org:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
+```
+
+**这个文件要提交**：它写的是 registry 地址，不是凭据。GitHub 的 npm registry
+**即使是公开包也要求带令牌**，那是 GitHub 的规矩。本地用一个带 `read:packages`
+的个人令牌，CI 里用工作流自带的 `secrets.GITHUB_TOKEN`。
+
+**它在 Tauri 里能用，而且不必引 Astro。** 包里 35 个组件**有 34 个是 `.vue`**，
+只有一个 `.astro`——Vue 应用不 import 它就是了。`astro` 虽然列在
+`peerDependencies` 里，但留空不影响，真正要的两个 peer 是 `tailwindcss` 和 `vue`。
+导出面：`.`、`./styles`、`./motion`、`./composables`、`./icons`、`./i18n`、
+`./nav`、`./sites`、`./components/*`、`./assets/*`。
+
+所以"不用 can-ui、前端自带一套最小样式"那条退路**不需要了**。
 
 ### 0.4 四个产品名是 can-api 的固定白名单
 
@@ -456,7 +476,7 @@ Python 版两边都硬编码成 0，所以网络看到的是未修正的真高�
 | # | 事 | 影响 |
 |---|---|---|
 | R1 | ~~can-api 的 `/api/v1/voice/token` 不存在~~ **已做**（can-api `feat/voice-token`） | 剩下的是客户端去调它，属于 Task 3。见 §0.2 |
-| R2 | `@jianyuelab-org/can-ui` 的访问未验证 | 到第一个 `bun install` 才发现，那时骨架已搭一半 |
+| R2 | ~~`@jianyuelab-org/can-ui` 的访问未验证~~ **已验证，能装** | 0.3.5，203 个包；35 个组件里 34 个是 `.vue`，Tauri 里不必引 Astro。见 §0.3 |
 | R3 | ~~PBH 的符号仍未定~~ **已定：can-audio 是对的，can-fsd 在取负** | 三份独立实现都不取负：`Vatsim.Network` 的 `PDUBase.PackPitchBankHeading`（真实客户端往线上发的东西，是权威）、openfsd 的 `fsd/util.go`、以及 can-audio 自己的 `pack_pbh`。修在 can-fsd 的 `fix/pbh-sign`。xpc/msfs 的编码**不用改** |
 | R4 | Tauri 2 的三平台打包与签名 | macOS 公证、Windows 签名都要证书；不签的话用户看到的是"这个程序不安全" |
 | R5 | 44,800 行 Python 的领域知识 | §五 列的是**已知**的那些。`can-audio` 归档前应当再过一遍 `CLAUDE.md`，那是唯一的记录 |
