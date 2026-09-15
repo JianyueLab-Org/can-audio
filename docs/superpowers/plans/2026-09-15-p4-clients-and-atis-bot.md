@@ -309,7 +309,8 @@ vATIS 的词汇：profile → station → preset → template。
 - [ ] 订阅而不是轮询 dataref（位置报告一秒五次，一问一答扛不住）
 - [ ] Windows 上的 `ConnectionResetError` 是**正常**的（UDP 打到没人听的端口），
       当成超时而不是致命错误
-- [ ] PBH 打包要是 can-fsd 解包的**精确逆运算** —— 并见 §六 关于符号的未决问题
+- [ ] PBH 打包沿用 `pack_pbh` **原样**——符号已经定了（R3），它和 `Vatsim.Network`
+      的 pack 一致，改它才会出问题
 - [ ] 机型匹配的分级顺序见 §五.3
 - [ ] 观察员模式：**不开 FSD 连接**，频率可手输（空 = 跟随 COM1）
 
@@ -437,8 +438,8 @@ Python 版两边都硬编码成 0，所以网络看到的是未修正的真高�
 |---|---|---|
 | R1 | ~~can-api 的 `/api/v1/voice/token` 不存在~~ **已做**（can-api `feat/voice-token`） | 剩下的是客户端去调它，属于 Task 3。见 §0.2 |
 | R2 | `@jianyuelab-org/can-ui` 的访问未验证 | 到第一个 `bun install` 才发现，那时骨架已搭一半 |
-| R3 | **PBH 的符号仍未定** | `can-audio/CLAUDE.md` 明写这条没有结论：can-fsd 的 `normaliseSigned` 开头就是 `v = -v`，而 `test_xpc.py` 里那份"仲裁用"的参考实现恰好漏了这一行，于是两边在自己的约定里自洽而可能都是错的。**改错一侧会让所有人的飞机姿态倒过来。** 要对着 openfsd 或一次真实的 EuroScope 抓包定，不要对着这两份任何一份 |
+| R3 | ~~PBH 的符号仍未定~~ **已定：can-audio 是对的，can-fsd 在取负** | 三份独立实现都不取负：`Vatsim.Network` 的 `PDUBase.PackPitchBankHeading`（真实客户端往线上发的东西，是权威）、openfsd 的 `fsd/util.go`、以及 can-audio 自己的 `pack_pbh`。修在 can-fsd 的 `fix/pbh-sign`。xpc/msfs 的编码**不用改** |
 | R4 | Tauri 2 的三平台打包与签名 | macOS 公证、Windows 签名都要证书；不签的话用户看到的是"这个程序不安全" |
 | R5 | 44,800 行 Python 的领域知识 | §五 列的是**已知**的那些。`can-audio` 归档前应当再过一遍 `CLAUDE.md`，那是唯一的记录 |
-| R7 | **macOS 上没有鼠标侧键 PTT** | rdev 0.5.3 在 macOS 上完全不报 `OtherMouse` 事件（连中键都不报）。要么接受这个缺口并在界面上明说，要么自己写 `CGEventTap`。见 Task 2 Step 2 |
+| R7 | ~~macOS 上没有鼠标侧键 PTT~~ **已定：接受这个缺口** | 不写 `CGEventTap`。`mouse_supported()` 返回 false，界面要**明说**在本系统上不可用——一个绑好了、显示正常、却从来不响的 PTT 才是要躲开的那种故障。键盘与手柄在 macOS 上照常 |
 | R6 | 四个客户端的封闭测试 | 设计文档 §11.1：大爆炸切换唯一能做的验证就是把它提前。要覆盖不同网络环境和三个平台 |
