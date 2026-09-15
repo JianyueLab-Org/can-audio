@@ -129,11 +129,41 @@ can-voice 服务端只认 `CAN_VOICE_API_PUBKEY`（裸 32 字节的 base64），
 不是单个键——`ptt.py` 当年从 `ptt_key` + `joystick_ptt` 升级过来时专门做了迁移，
 因为"升级时悄悄丢掉某人的 PTT 键"看起来和麦克风坏了一模一样。
 
-- [ ] **Step 2: 鼠标只认侧键 X1/X2**
+- [ ] **Step 2: 鼠标只认侧键 X1/X2 —— 但 rdev 给不出名字，而且 macOS 根本给不出**
 
 **绑左键意味着在任何窗口里点任何东西都会发话**，而 TX 指示灯还被挡在他点的东西后面。
-`mouse_name()` 对左/右/中键返回空。按**按钮名字**匹配而不是编号：X11 把同一组物理键叫
-`button8`/`button9`，而 Windows 和 macOS 叫 `x1`/`x2`。
+所以左/右/中键一律不可绑，这一条无论如何都要有。
+
+Python 版的规矩是"按**按钮名字**匹配而不是编号"（X11 叫 `button8`/`button9`，
+Windows 和 macOS 叫 `x1`/`x2`）。**rdev 0.5.3 做不到这一条**，核过源码：
+
+```rust
+pub enum Button { Left, Right, Middle, Unknown(u8) }   // 没有任何侧键的名字
+```
+
+`Unknown(u8)` 里那个数是**平台相关**的，三个平台三个样：
+
+| 平台 | 侧键怎么来 | 值 |
+|---|---|---|
+| Windows | `WM_XBUTTONDOWN` → `Unknown(HIWORD(mouseData))` | `Unknown(1)` = X1，`Unknown(2)` = X2 |
+| Linux/X11 | `Unknown(X11 按钮号)`（4–7 是滚轮，已滤掉） | `Unknown(8)` = X1，`Unknown(9)` = X2 |
+| **macOS** | **完全没有** | —— |
+
+**macOS 那一行不是"待补"，是 rdev 压根没实现。** `macos/common.rs` 只处理
+`LeftMouseDown/Up` 与 `RightMouseDown/Up`，`OtherMouseDown`/`OtherMouseUp` 一处都没有
+——连中键都报不出来，`simulate.rs` 里还留着一句注释
+`// ignored because we don't use OtherMouse EventType`。
+
+三条后果，都要落实：
+
+1. 存进设置的必须是**规范化后的 X1/X2**，不是 `Unknown(n)` 的原始值。否则同一份设置
+   在 Windows 上是 X1、在 Linux 上什么都不是——而症状是"我的 PTT 突然不灵了"，
+   没有任何报错。规范化表要有测试钉住，这样将来改一个数字是一行可见的 diff。
+2. **macOS 上鼠标绑定要在界面上明说不可用**，而不是让它静默地永远不触发。
+   一个绑好了、显示正常、却从来不响的 PTT，正是这个项目反复要躲开的那类故障。
+3. 真要在 macOS 上支持，得自己下一层写 `CGEventTap` 收 `OtherMouseDown/Up`
+   （或者给 rdev 提 PR）。**那是一件独立的事，不要塞进这个 task 里**——
+   先把键盘和手柄做对，鼠标侧键在 macOS 上作为已知缺口列出来。
 
 - [ ] **Step 3: 绝不吞事件**
 
@@ -145,16 +175,19 @@ Python 版的规矩是"never `suppress=True`"。吞掉事件意味着那个键�
 macOS 上创建全局键盘监听会触发辅助功能授权弹窗。**用户只绑了手柄却被要求授权键盘监控，
 读起来像恶意软件。**
 
-- [ ] **Step 5: 手柄要轮询，而且要先核那条 SDL 线程陷阱还在不在**
+- [ ] **Step 5: 手柄要轮询。那条 SDL 线程陷阱**不成立**，但要写明为什么**
 
 Python 版踩的是这个：`SDL_Init(SDL_INIT_JOYSTICK)` 会为 DirectInput 建一个隐藏窗口，
 而 **Win32 在线程退出时销毁该线程的窗口**；SDL 只建一次，于是第一个初始化 SDL 的线程
 一旦退出，之后每次打开手柄都以 `E_HANDLE` 失败，直到进程重启。一条真实日志里是
 01:28:11 成功捕获一次、01:28:13 之后每 3 秒失败一次、持续到结束。
 
-**`gilrs` 不是 SDL，所以这条陷阱不一定成立——先核实，不要假设。**
-无论结论如何都要写下来：成立的话照 Python 版的做法把初始化钉在 UI 线程上；
-不成立的话写明为什么，省得下一个人照抄一条不存在的约束。
+**核过了：`gilrs 0.11.2` 不依赖 SDL**（Cargo.toml 里没有），所以那个隐藏窗口的机制
+不存在，这条陷阱**不适用**。把结论写进代码注释——否则下一个人会照抄一条不存在的
+约束，然后为了满足它把初始化硬钉在 UI 线程上，白白多一处耦合。
+
+**但不要就此认为手柄没有线程问题**：gilrs 在 Windows 上走的是 XInput/DirectInput，
+它自己怎么初始化尚未核实。真机上第一次跑手柄 PTT 时要专门看一眼"插拔之后还能不能打开"。
 
 - [ ] **Step 6: 打不开的设备只报一次**
 
@@ -396,4 +429,5 @@ Python 版两边都硬编码成 0，所以网络看到的是未修正的真高�
 | R3 | **PBH 的符号仍未定** | `can-audio/CLAUDE.md` 明写这条没有结论：can-fsd 的 `normaliseSigned` 开头就是 `v = -v`，而 `test_xpc.py` 里那份"仲裁用"的参考实现恰好漏了这一行，于是两边在自己的约定里自洽而可能都是错的。**改错一侧会让所有人的飞机姿态倒过来。** 要对着 openfsd 或一次真实的 EuroScope 抓包定，不要对着这两份任何一份 |
 | R4 | Tauri 2 的三平台打包与签名 | macOS 公证、Windows 签名都要证书；不签的话用户看到的是"这个程序不安全" |
 | R5 | 44,800 行 Python 的领域知识 | §五 列的是**已知**的那些。`can-audio` 归档前应当再过一遍 `CLAUDE.md`，那是唯一的记录 |
+| R7 | **macOS 上没有鼠标侧键 PTT** | rdev 0.5.3 在 macOS 上完全不报 `OtherMouse` 事件（连中键都不报）。要么接受这个缺口并在界面上明说，要么自己写 `CGEventTap`。见 Task 2 Step 2 |
 | R6 | 四个客户端的封闭测试 | 设计文档 §11.1：大爆炸切换唯一能做的验证就是把它提前。要覆盖不同网络环境和三个平台 |
