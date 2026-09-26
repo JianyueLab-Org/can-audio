@@ -17,6 +17,8 @@ import types
 import unittest
 from unittest import mock
 
+import numpy as np
+
 for _name in ("opuslib", "opuslib.api", "opuslib.api.decoder",
               "opuslib.api.encoder", "opuslib.api.info", "opuslib.exceptions"):
     sys.modules.setdefault(_name, mock.MagicMock())
@@ -185,6 +187,61 @@ class TransmitThreadTest(unittest.TestCase):
         client._tx_channels = []
         client.start_transmit()
         self.assertFalse(client.transmitting, "没有 TX 频率时不该开始发话")
+
+
+class HalvingDenoiser:
+    def __init__(self, rate):
+        self.rate = rate
+        self.active = True
+        self.frames = 0
+
+    def process(self, samples):
+        self.frames += 1
+        return (np.asarray(samples, dtype=np.int16) // 2).astype(np.int16)
+
+    def close(self):
+        self.active = False
+
+
+class MicProcessingTest(unittest.TestCase):
+    """发送前的麦克风处理：降噪 → 基准 × 乘数 → 限幅器，不回绕。"""
+
+    def client(self, denoise=False):
+        client = make_client()
+        client._denoiser_factory = HalvingDenoiser
+        client.set_mic_denoise(denoise)
+        return client
+
+    def test_baseline_and_multiplier_multiply(self):
+        client = self.client()
+        client.set_mic_baseline(6.0206)          # ×2
+        client.set_mic_volume(150)               # ×1.5
+        out = client._process_mic(np.full(960, 1000, np.int16).tobytes())
+        self.assertTrue(np.all(np.abs(out.astype(np.int32) - 3000) <= 1))
+
+    def test_denoise_runs_before_the_gain(self):
+        client = self.client(denoise=True)
+        client.set_mic_baseline(6.0206)          # ×2
+        out = client._process_mic(np.full(960, 1000, np.int16).tobytes())
+        self.assertTrue(np.all(np.abs(out.astype(np.int32) - 1000) <= 1))
+
+    def test_denoise_off_skips_the_denoiser(self):
+        client = self.client(denoise=False)
+        out = client._process_mic(np.full(960, 1000, np.int16).tobytes())
+        self.assertTrue(np.all(out == 1000))
+
+    def test_loud_input_never_wraps(self):
+        client = self.client()
+        client.set_mic_volume(200)
+        out = client._process_mic(np.full(960, 30000, np.int16).tobytes())
+        self.assertTrue(np.all(out > 0), "int16 回绕会变成负数")
+
+    def test_baseline_is_clamped(self):
+        client = self.client()
+        client.set_mic_baseline(40)
+        self.assertEqual(client.mic_baseline_db, 20.0)
+        client.set_mic_baseline(-40)
+        self.assertEqual(client.mic_baseline_db, -12.0)
 
 
 class RxIndicatorTest(unittest.TestCase):

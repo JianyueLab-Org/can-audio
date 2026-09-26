@@ -1211,10 +1211,15 @@ class SharedCopyTest(unittest.TestCase):
     `ptt.py` 和 `theme.py` 是后加的共享件，同样一处都不能自己改。`chime.py`
     也一样：提示音的判定和播放只在 xpc/test_xpc.py 里测，两份不一致的话
     这边就成了没人测过的代码。
+
+    `micgain.py`、`denoise.py` 和它们的测试也是共享件：降噪、增益和限幅两边
+    必须一致，否则两个客户端发出去的响度和底噪不一样，校准就白做了。
     """
 
     SHARED = ("voice.py", "traffic.py", "mumblecompat.py", "ptt.py",
-              "theme.py", "update.py", "chime.py", "observer.py")
+              "theme.py", "update.py", "chime.py", "observer.py",
+              "micgain.py", "test_micgain.py", "denoise.py", "test_denoise.py",
+              "calibration.py")
 
     def test_shared_files_are_byte_identical_to_xpc(self):
         here = os.path.dirname(os.path.abspath(__file__))
@@ -1349,6 +1354,62 @@ class StoredPasswordTest(unittest.TestCase):
         self.write({"cid": "1234", "password": "", "remember_password": False})
         s = self.module.Settings(self.path)
         self.assertFalse(s.password_migrated)
+
+
+class MicCalibrationSettingsTest(unittest.TestCase):
+    """mic_calibration、mic_denoise 落盘；mic_volume 是本次会话的乘数，不落盘。"""
+
+    def setUp(self):
+        import denoise
+        import settings as settings_module
+        self.denoise = denoise
+        self.settings_module = settings_module
+        self._available = denoise.available
+        denoise.available = lambda: True
+        self.path = os.path.join(tempfile.mkdtemp(prefix="can-settings-"),
+                                 "settings.json")
+
+    def tearDown(self):
+        self.denoise.available = self._available
+
+    def test_calibration_and_denoise_round_trip(self):
+        s = self.settings_module.Settings(self.path)
+        s.mic_calibration["Mic A"] = {"gain_db": 8.5, "denoise": True}
+        s.save()
+        again = self.settings_module.Settings(self.path)
+        self.assertEqual(again.mic_calibration, {"Mic A": {"gain_db": 8.5, "denoise": True}})
+        self.assertTrue(again.mic_denoise)
+        self.assertEqual(again.baseline_for("Mic A"), 8.5)
+
+    def test_toggling_denoise_invalidates_the_baseline(self):
+        s = self.settings_module.Settings(self.path)
+        s.mic_calibration["Mic A"] = {"gain_db": 8.5, "denoise": True}
+        s.mic_denoise = False
+        self.assertIsNone(s.baseline_for("Mic A"))
+
+    def test_instances_do_not_share_the_dict(self):
+        a = self.settings_module.Settings(self.path + ".a")
+        b = self.settings_module.Settings(self.path + ".b")
+        a.mic_calibration["Mic A"] = {"gain_db": 1.0}
+        self.assertEqual(b.mic_calibration, {})
+
+    def test_mic_volume_is_not_persisted(self):
+        s = self.settings_module.Settings(self.path)
+        s.mic_volume = 150
+        s.save()
+        with open(self.path, encoding="utf-8") as f:
+            self.assertNotIn("mic_volume", json.load(f))
+        self.assertEqual(self.settings_module.Settings(self.path).mic_volume, 100)
+
+    def test_old_mic_volume_is_ignored(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"mic_volume": 170}, f)
+        self.assertEqual(self.settings_module.Settings(self.path).mic_volume, 100)
+
+    def test_corrupt_calibration_becomes_empty(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"mic_calibration": "x"}, f)
+        self.assertEqual(self.settings_module.Settings(self.path).mic_calibration, {})
 
 
 if __name__ == "__main__":

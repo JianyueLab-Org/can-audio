@@ -121,6 +121,9 @@ class NoHardcodedUiStringTest(unittest.TestCase):
         """这些 ValueError 会原样显示在 InfoBar 里。"""
         self.assertEqual(self.offenders("radiostack.py"), [])
 
+    def test_calibration_dialog_has_no_hardcoded_chinese(self):
+        self.assertEqual(self.offenders("calibration.py"), [])
+
 
 class LookupTest(unittest.TestCase):
 

@@ -20,7 +20,7 @@ from PyQt6.QtCore import (QPoint, QRect, QSize, Qt, QObject, QTimer, QUrl,
                           pyqtSignal)
 from PyQt6.QtGui import (QColor, QDesktopServices, QFont, QIcon, QPainter,
                          QPen)
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+from PyQt6.QtWidgets import (QApplication, QDialog, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QLayout, QPushButton,
                              QStackedWidget, QMessageBox)
 from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, FluentIcon,
@@ -31,8 +31,10 @@ from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, FluentIcon,
                             TransparentToolButton)
 
 import applog
+import calibration
 import datafeed
 import i18n
+import micgain
 import ptt
 from i18n import t
 import radiostack
@@ -89,6 +91,15 @@ def resource_path(name):
     """
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, name)
+
+
+def calibration_state_changed(old_device, old_denoise, new_device, new_denoise):
+    """设置对话框关掉后，输入设备或降噪状态是不是真的变了。
+
+    只有变了才可能需要重新校准——纯粹改了语言之类的话，每次保存设置都弹一次
+    校准框，会把设置对话框变成一个陷阱。
+    """
+    return old_device != new_device or old_denoise != new_denoise
 
 
 icon_path = resource_path("favicon.ico")
@@ -447,6 +458,9 @@ class ControllerWindow(QMainWindow):
 
         # 起来之后在后台问一次有没有新版。查不到就当没这回事。
         self.check_for_update()
+
+        # 所选麦克风在当前降噪状态下没校准过就弹一次。open() 不阻塞，窗口先显示出来。
+        QTimer.singleShot(0, self.maybe_prompt_calibration)
 
         # 电台栈**不做持久化**：每次启动都是空的。频率该从数据源来——上了席位
         # 的自动加，别人的席位在"在线频率"里点。留着上一场的频率反而危险：
@@ -1046,6 +1060,7 @@ class ControllerWindow(QMainWindow):
             on_tx=self.signals.tx.emit,
             on_connection_change=self.signals.connection.emit)
         self.voice.set_mic_volume(self.settings.mic_volume)
+        self.apply_mic_baseline()
         self.voice.set_speaker_volume(self.settings.speaker_volume)
         self.voice._input_device = self.settings.input_device_index
         self.voice._output_device = self.settings.output_device_index
@@ -1234,19 +1249,69 @@ class ControllerWindow(QMainWindow):
             self.settings.skipped_version = found.version
             self.settings.save_settings()
 
+    # ---------- 麦克风校准 ----------
+    def apply_mic_baseline(self):
+        """按当前输入设备和降噪状态取基准增益，交给语音客户端，并记一行日志。"""
+        name = calibration.input_device_name(self.settings.input_device_index)
+        baseline = self.settings.baseline_for(name)
+        log.info("mic baseline for %s: %s (denoise %s)", name or "unknown device",
+                 "uncalibrated" if baseline is None else f"{baseline:+.1f} dB",
+                 "on" if self.settings.denoise_active() else "off")
+        if self.voice:
+            self.voice.set_mic_baseline(baseline or 0.0)
+            self.voice.set_mic_denoise(self.settings.mic_denoise)
+        return name, baseline
+
+    def maybe_prompt_calibration(self):
+        name, baseline = self.apply_mic_baseline()
+        if name is not None and baseline is None:
+            self.run_calibration(name)
+
+    def run_calibration(self, device_name):
+        was_running = hasattr(self, 'ptt_watcher')
+        if was_running:
+            self.ptt_watcher.stop()
+        dialog = calibration.CalibrationDialog(
+            self.settings.input_device_index, device_name,
+            self.settings.denoise_active(), self)
+
+        def done(code):
+            if code == QDialog.DialogCode.Accepted and dialog.entry():
+                self.settings.mic_calibration[device_name] = dialog.entry()
+                self.settings.save_settings()
+            else:
+                log.info("calibration skipped on %s", device_name)
+            self.apply_mic_baseline()
+            if was_running:
+                self.ptt_watcher.set_bindings(self.settings.ptt_bindings)
+                self.ptt_watcher.start()
+
+        dialog.finished.connect(done)
+        dialog.open()
+
     def open_settings(self):
         # 开设置期间把监听整个停掉。录绑定时 PttCapture 要独占 SDL 的事件队列
         # （两个线程一起 pump 不是线程安全的），而且用户为了录绑定按的那一下
         # 不该真的发出去一段语音。
         if hasattr(self, 'ptt_watcher'):
             self.ptt_watcher.stop()
+        old_mic = self.settings.mic_volume
+        old_device = self.settings.input_device_index
+        old_denoise = self.settings.denoise_active()
         dialog = SettingsDialog(self.settings, self)
         accepted = dialog.exec()
         if hasattr(self, 'ptt_watcher'):
             self.ptt_watcher.set_bindings(self.settings.ptt_bindings)
             self.ptt_watcher.start()
+        # 对话框里的"校准"按钮会立即把新基准存进 settings 并落盘，哪怕这次
+        # 设置整体被取消——不管 accepted 与否都要重新套用一次，否则要等凑巧
+        # 换了设备或降噪状态才会生效。
+        _, baseline = self.apply_mic_baseline()
         if accepted:
             self.retranslate()
+            if self.settings.mic_volume != old_mic:
+                log.info(micgain.describe_multiplier(
+                    old_mic, self.settings.mic_volume, baseline or 0.0))
             if self.voice:
                 self.voice.set_mic_volume(self.settings.mic_volume)
                 self.voice.set_speaker_volume(self.settings.speaker_volume)
@@ -1255,6 +1320,10 @@ class ControllerWindow(QMainWindow):
                                            self.settings.output_device_index)
                 except Exception as e:
                     QMessageBox.warning(self, t("status.audio_device"), t("status.audio_failed", error=e))
+            if calibration_state_changed(old_device, old_denoise,
+                                         self.settings.input_device_index,
+                                         self.settings.denoise_active()):
+                QTimer.singleShot(0, self.maybe_prompt_calibration)
 
     def closeEvent(self, event):
         try:

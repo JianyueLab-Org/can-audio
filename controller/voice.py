@@ -34,6 +34,8 @@ from pymumble_py3.constants import (
     PYMUMBLE_MSG_TYPES_VOICETARGET,
 )
 
+import denoise
+import micgain
 import mumblecompat
 import radiostack
 from i18n import t
@@ -308,6 +310,13 @@ class VoiceClient:
         self._stream_lock = threading.Lock()
 
         self.mic_volume = 100
+        # 发送链路：降噪 → × 校准基准（dB）× 会话乘数（mic_volume）→ 限幅。
+        # 降噪器和限幅器按采样率懒建，跨 PTT 保留状态。
+        self.mic_baseline_db = 0.0
+        self.mic_denoise = True
+        self._denoiser_factory = denoise.Denoiser
+        self._denoiser = None
+        self._mic_limiter = None
         self.speaker_volume = 100
         self.transmitting = False
 
@@ -738,6 +747,13 @@ class VoiceClient:
 
     def set_mic_volume(self, percent):
         self.mic_volume = max(0, min(200, int(percent)))
+
+    def set_mic_baseline(self, db):
+        self.mic_baseline_db = max(micgain.MIN_GAIN_DB,
+                                   min(micgain.MAX_GAIN_DB, float(db)))
+
+    def set_mic_denoise(self, enabled):
+        self.mic_denoise = bool(enabled)
 
     def set_speaker_volume(self, percent):
         self.speaker_volume = max(0, min(200, int(percent)))
@@ -1265,6 +1281,20 @@ class VoiceClient:
         if self.on_tx:
             self.on_tx(False)
 
+    def _process_mic(self, data):
+        """一帧麦克风 PCM → 要发出去的 int16。"""
+        samples = np.frombuffer(data, dtype=np.int16)
+        if self.mic_denoise:
+            if self._denoiser is None or self._denoiser.rate != self.RATE:
+                if self._denoiser is not None:
+                    self._denoiser.close()
+                self._denoiser = self._denoiser_factory(self.RATE)
+            samples = self._denoiser.process(samples)
+        if self._mic_limiter is None or self._mic_limiter.rate != self.RATE:
+            self._mic_limiter = micgain.Limiter(self.RATE)
+        return micgain.apply_gain(samples, self.mic_baseline_db, self.mic_volume,
+                                  self._mic_limiter)
+
     def _transmit_loop(self):
         try:
             with self._audio_lock:
@@ -1280,10 +1310,7 @@ class VoiceClient:
                         break
                     data = stream.read(self.CHUNK, exception_on_overflow=False)
                 if data:
-                    audio = np.frombuffer(data, dtype=np.int16)
-                    audio = np.clip(audio * (self.mic_volume / 100.0),
-                                    np.iinfo(np.int16).min,
-                                    np.iinfo(np.int16).max).astype(np.int16)
+                    audio = self._process_mic(data)
                     # 断线期间不要往外灌音频，否则会在缓冲里堆积
                     if not self.connected:
                         continue

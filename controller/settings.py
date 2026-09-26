@@ -17,7 +17,10 @@ from qfluentwidgets import (BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentI
                             TransparentToolButton)
 
 import applog
+import calibration
+import denoise
 import i18n
+import micgain
 import ptt
 import theme
 import version
@@ -35,7 +38,12 @@ class Settings:
         # PTT 现在是一串绑定（键盘 / 鼠标侧键 / 摇杆），任意一个按住即发话。
         # 原来的 ptt_key 单字段读得进来，见 load_settings()。
         self.ptt_bindings = [ptt.keyboard_binding(DEFAULT_PTT_KEY)]
+        # 麦克风音量是乘在校准基准上的本次会话乘数：每次启动都是 100%，不落盘。
         self.mic_volume = 100
+        # 设备名 → 校准记录，见 micgain.calibration_entry()。按名字存是因为
+        # PyAudio 的设备序号跨启动不稳定。
+        self.mic_calibration = {}
+        self.mic_denoise = True
         self.speaker_volume = 100
         self.input_device_index = None
         self.output_device_index = None
@@ -67,7 +75,9 @@ class Settings:
                     self.ptt_bindings = ptt.load(
                         data.get("ptt_bindings"),
                         legacy_key=data.get("ptt_key", DEFAULT_PTT_KEY))
-                    self.mic_volume = data.get("mic_volume", 100)
+                    stored_calibration = data.get("mic_calibration")
+                    self.mic_calibration = stored_calibration if isinstance(stored_calibration, dict) else {}
+                    self.mic_denoise = bool(data.get("mic_denoise", True))
                     self.speaker_volume = data.get("speaker_volume", 100)
                     self.input_device_index = data.get("input_device_index", None)
                     self.output_device_index = data.get("output_device_index", None)
@@ -88,7 +98,8 @@ class Settings:
                 # ptt_key 不再写回去。留着它就有两个说了算的地方，而且它只能表达
                 # 三种绑定里的一种，回头必然和实际用的那条对不上。
                 "ptt_bindings": ptt.dump(self.ptt_bindings),
-                "mic_volume": self.mic_volume,
+                "mic_calibration": self.mic_calibration,
+                "mic_denoise": self.mic_denoise,
                 "speaker_volume": self.speaker_volume,
                 "input_device_index": self.input_device_index,
                 "output_device_index": self.output_device_index,
@@ -102,6 +113,13 @@ class Settings:
                 json.dump(data, f, ensure_ascii=False)
         except Exception as e:
             log.warning(f"could not save the settings: {e}")
+
+    def denoise_active(self):
+        return denoise.effective(self.mic_denoise)
+
+    def baseline_for(self, device_name):
+        return micgain.baseline_db(self.mic_calibration, device_name,
+                                   self.denoise_active())
 
 
 class PttBindingList(QWidget):
@@ -238,6 +256,25 @@ class SettingsDialog(QDialog):
         mic_layout.addWidget(self.mic_value)
         layout.addLayout(mic_layout)
 
+        calib_layout = QHBoxLayout()
+        self.baseline_label = CaptionLabel("")
+        self.baseline_label.setStyleSheet(f"color: {theme.IDLE_COLOR};")
+        calib_button = PushButton(t("calib.button"))
+        calib_button.clicked.connect(self.calibrate)
+        calib_layout.addWidget(self.baseline_label)
+        calib_layout.addStretch()
+        calib_layout.addWidget(calib_button)
+        layout.addLayout(calib_layout)
+
+        self.denoise_checkbox = CheckBox(t("calib.denoise"))
+        if denoise.available():
+            self.denoise_checkbox.setChecked(self.settings.mic_denoise)
+        else:
+            self.denoise_checkbox.setChecked(False)
+            self.denoise_checkbox.setEnabled(False)
+            self.denoise_checkbox.setText(t("calib.denoise_unavailable"))
+        layout.addWidget(self.denoise_checkbox)
+
         speaker_layout = QHBoxLayout()
         self.speaker_slider = Slider(Qt.Orientation.Horizontal)
         self.speaker_slider.setRange(0, 200)
@@ -270,6 +307,8 @@ class SettingsDialog(QDialog):
         input_layout.addWidget(BodyLabel(t("settings.input")))
         input_layout.addWidget(self.input_combo)
         layout.addLayout(input_layout)
+        self.input_combo.currentIndexChanged.connect(lambda _: self._refresh_baseline())
+        self._refresh_baseline()
 
         output_layout = QHBoxLayout()
         self.output_combo = ComboBox()
@@ -348,6 +387,27 @@ class SettingsDialog(QDialog):
         self.cleanup()
         super().accept()
 
+    def _refresh_baseline(self):
+        name = calibration.input_device_name(self.input_combo.currentData())
+        baseline = self.settings.baseline_for(name)
+        self.baseline_label.setText(
+            t("calib.uncalibrated") if baseline is None
+            else t("calib.baseline", db=f"{baseline:+.1f}"))
+
+    def calibrate(self):
+        """校准下拉框里当前选中的输入设备，按设置里已保存的降噪状态测，结果立即落盘。"""
+        index = self.input_combo.currentData()
+        name = calibration.input_device_name(index)
+        if name is None:
+            self.baseline_label.setText(t("calib.no_device"))
+            return
+        dialog = calibration.CalibrationDialog(index, name,
+                                               self.settings.denoise_active(), self)
+        if dialog.exec() and dialog.entry():
+            self.settings.mic_calibration[name] = dialog.entry()
+            self.settings.save_settings()
+        self._refresh_baseline()
+
     def save_and_close(self):
         self.settings.ptt_bindings = list(self.ptt_list.bindings)
         self.settings.mic_volume = self.mic_slider.value()
@@ -355,6 +415,8 @@ class SettingsDialog(QDialog):
         self.settings.input_device_index = self.input_combo.currentData()
         self.settings.output_device_index = self.output_combo.currentData()
         self.settings.debug = self.debug_checkbox.isChecked()
+        if denoise.available():
+            self.settings.mic_denoise = self.denoise_checkbox.isChecked()
         self.settings.language = self.language_combo.currentData()
         i18n.set_language(self.settings.language)
         self.settings.save_settings()

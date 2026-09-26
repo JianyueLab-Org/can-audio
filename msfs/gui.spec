@@ -76,9 +76,23 @@ def find_simconnect():
     return [(path, 'SimConnect')]
 
 
+def find_rnnoise():
+    """rnnoise.dll 是 denoise.py 运行时用 ctypes 加载的，PyInstaller 看不见。
+
+    CI 用 native/rnnoise/build.ps1 构建后放进组件目录。缺了不会打包失败，
+    只会让用户拿到一个没有降噪的包，所以这里要警告、发布流程要验。
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(SPEC)), 'rnnoise.dll')
+    if os.path.exists(path):
+        return [(path, '.')]
+    print('警告: 没有找到 rnnoise.dll，打出来的程序没有麦克风降噪。'
+          '先运行 native/rnnoise/build.ps1 -Out <组件目录>。')
+    return []
+
+
 opus_path = find_opus()
 opus_binaries = [(opus_path, '.')] if opus_path else []
-binaries = opus_binaries + find_simconnect()
+binaries = opus_binaries + find_simconnect() + find_rnnoise()
 
 a = Analysis(
     ['gui.py'],

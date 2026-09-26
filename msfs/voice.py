@@ -14,6 +14,8 @@ import logging
 import threading
 import time
 
+import denoise
+import micgain
 import mumblecompat
 from i18n import t
 
@@ -229,6 +231,9 @@ class Voice:
         self._input = None
         self._output = None
         self._rate = 48000
+        self._denoiser_factory = denoise.Denoiser
+        self._denoiser = None
+        self._mic_limiter = None
         self._chunk = 960
         self._last_rx = 0.0
         self._sent_frames = 0           # 本次 PTT 已发出的帧数
@@ -338,6 +343,26 @@ class Voice:
             return self._audio.get_device_info_by_index(index).get("name", "?")
         except Exception as e:
             return f"取不到设备信息（{e}）"
+
+    def _process_mic(self, data):
+        """一帧麦克风 PCM → 要发出去的 int16：降噪 → × 基准 × 乘数 → 限幅。
+
+        基准来自校准（settings.mic_baseline_db，GUI 按当前输入设备设置），
+        乘数是设置里的麦克风音量，只在本次启动有效。
+        """
+        rate = getattr(self, "_rate", None) or 48000
+        samples = np.frombuffer(data, dtype=np.int16)
+        if getattr(self.settings, "mic_denoise", True):
+            if self._denoiser is None or self._denoiser.rate != rate:
+                if self._denoiser is not None:
+                    self._denoiser.close()
+                self._denoiser = self._denoiser_factory(rate)
+            samples = self._denoiser.process(samples)
+        if self._mic_limiter is None or self._mic_limiter.rate != rate:
+            self._mic_limiter = micgain.Limiter(rate)
+        baseline = getattr(self.settings, "mic_baseline_db", 0.0) or 0.0
+        percent = getattr(self.settings, "mic_volume", 100)
+        return micgain.apply_gain(samples, baseline, percent, self._mic_limiter)
 
     def _best_rate(self):
         input_index = getattr(self.settings, "input_device_index", None)
@@ -1184,8 +1209,7 @@ class Voice:
                     time.sleep(0.05)
                     continue
 
-                volume = getattr(self.settings, "mic_volume", 100) / 100.0
-                samples = (np.frombuffer(data, dtype=np.int16) * volume).astype(np.int16)
+                samples = self._process_mic(data)
                 with self._lock:
                     self.mumble.sound_output.add_sound(samples.tobytes())
                 self._sent_frames += 1

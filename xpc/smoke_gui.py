@@ -95,6 +95,35 @@ def main():
             failures.append((name, e))
             print(f"  FAIL {name}: {type(e).__name__}: {e}")
 
+    # 冒烟测试不能弹校准框（dialog.open() 在离屏环境里没人点）；
+    # 对话框本身用假输入源单独建一次。
+    import calibration
+    import numpy as np
+    calibration.input_device_name = lambda index: None
+
+    class FakeSource:
+        rate = 48000
+        chunk = 960
+
+        def read_available(self):
+            return np.zeros(0, dtype=np.int16)
+
+        def close(self):
+            pass
+
+    def calibration_dialog():
+        for denoise_on in (False, True):
+            dialog = calibration.CalibrationDialog(
+                None, "Fake Mic", denoise_on,
+                source_factory=lambda index: FakeSource())
+            dialog.start()
+            dialog._tick()
+            dialog._finish()                   # 全静音 → too_short，不应抛异常
+            assert dialog.entry() is None
+            dialog.reject()
+
+    check("校准对话框", calibration_dialog)
+
     # 用临时配置，别动开发机上真实的 xpc_settings.json
     import settings as settings_module
     settings_module.Settings.save = lambda self: None
@@ -374,6 +403,69 @@ def main():
     settings_dialog = gui.SettingsDialog(window.settings, window)
     check("建立设置对话框", lambda: settings_dialog)
     check("设置可应用", lambda: settings_dialog.apply())
+
+    def settings_without_rnnoise():
+        import denoise
+        original = denoise.available
+        denoise.available = lambda: False
+        try:
+            dialog = gui.SettingsDialog(window.settings, window)
+            assert not dialog.denoise_check.isEnabled()
+            dialog.reject()
+        finally:
+            denoise.available = original
+
+    check("设置对话框（降噪不可用）", settings_without_rnnoise)
+
+    def calibration_prompt_only_when_device_or_denoise_changed():
+        """保存设置之后，只有真的换了输入设备或切了降噪才该再问一次校准——
+        单纯换个语言之类的保存不该每次都弹一次校准框。"""
+        cases = [
+            # (old_device, old_denoise, new_device, new_denoise, expected)
+            (None, True, None, True, False),      # 什么都没变
+            (None, True, 3, True, True),           # 换了设备
+            (None, True, None, False, True),       # 切了降噪
+            (None, False, 3, True, True),          # 两个都变了
+        ]
+        for old_device, old_denoise, new_device, new_denoise, expected in cases:
+            got = gui.calibration_state_changed(old_device, old_denoise,
+                                                new_device, new_denoise)
+            assert got == expected, (
+                f"calibration_state_changed({old_device!r}, {old_denoise!r}, "
+                f"{new_device!r}, {new_denoise!r}) = {got}, expected {expected}")
+    check("保存设置后只在设备或降噪变了才提示校准",
+          calibration_prompt_only_when_device_or_denoise_changed)
+
+    def recalibrating_reaches_the_live_baseline_even_if_cancelled():
+        """SettingsDialog.calibrate() 一点就把新校准落盘，哪怕这次设置整体
+        被取消，也不能等凑巧换了设备或降噪才把新基准套到发送链路上。"""
+        class RejectedDialog:
+            def __init__(self, settings, parent=None):
+                pass
+
+            def exec(self):
+                return 0    # QDialog.DialogCode.Rejected
+
+        original_dialog = gui.SettingsDialog
+        original_lookup = calibration.input_device_name
+        gui.SettingsDialog = RejectedDialog
+        calibration.input_device_name = lambda index: "Fake Calibration Mic"
+        try:
+            denoise_on = window.settings.denoise_active()
+            window.settings.mic_calibration["Fake Calibration Mic"] = {
+                "gain_db": -6.0, "speech_dbfs": -20.0, "noise_dbfs": -50.0,
+                "denoise": denoise_on,
+            }
+            window.settings.mic_baseline_db = 0.0
+            window.open_settings()
+            assert window.settings.mic_baseline_db == -6.0, (
+                f"取消设置之后基准没有套用: {window.settings.mic_baseline_db}")
+        finally:
+            gui.SettingsDialog = original_dialog
+            calibration.input_device_name = original_lookup
+            window.settings.mic_calibration.pop("Fake Calibration Mic", None)
+    check("取消设置也套用新校准的基准",
+          recalibrating_reaches_the_live_baseline_even_if_cancelled)
 
     def preview_button_plays_one():
         _chimes.clear()

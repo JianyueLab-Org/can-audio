@@ -67,8 +67,29 @@ jobs:
           echo "tag=v${SERIES}.${next}"   >> "$GITHUB_OUTPUT"
           echo "上一个补丁号 ${latest:-（无）}，这次发 v${SERIES}.${next}"
 
+  rnnoise:
+    # denoise.py 的原生库。从 xiph 的 v0.2 发布包构建（SHA-256 固定在脚本里），
+    # 不进仓库；test 和 build 都从这里拿。
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        id: cache
+        with:
+          path: native/rnnoise/out
+          key: rnnoise-0.2-${{ hashFiles('native/rnnoise/CMakeLists.txt', 'native/rnnoise/build.ps1', 'native/rnnoise/compat/os_support.h') }}
+      - name: 构建 rnnoise.dll
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: ./native/rnnoise/build.ps1 -Out native/rnnoise/out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rnnoise-dll
+          path: native/rnnoise/out/
+
   test:
     # 和 build 并行。测试没过就不发——release 同时依赖两者。
+    needs: rnnoise
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -81,6 +102,17 @@ jobs:
       - run: |
           python -m pip install --upgrade pip
           pip install -r requirements-build.txt
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rnnoise-dll
+          path: native/rnnoise/out
+      - name: 放 rnnoise.dll 进三个麦克风客户端
+        shell: pwsh
+        run: |
+          foreach ($d in @("controller", "xpc", "msfs")) {
+            Copy-Item native/rnnoise/out/rnnoise.dll $d/
+          }
 
       - name: 单元测试
         shell: pwsh
@@ -124,7 +156,7 @@ jobs:
           }
 
   build:
-    needs: version
+    needs: [version, rnnoise]
     runs-on: windows-latest
     strategy:
       fail-fast: false   # 一个挂了其余三个照打，一次看全问题
@@ -157,6 +189,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-build.txt
 
+      - uses: actions/download-artifact@v4
+        if: matrix.component != 'atis'
+        with:
+          name: rnnoise-dll
+          path: native/rnnoise/out
+      - name: 放 rnnoise.dll
+        if: matrix.component != 'atis'
+        shell: pwsh
+        run: Copy-Item native/rnnoise/out/rnnoise.dll ${{ matrix.component }}/
+
       - name: 打包 ${{ matrix.output }}
         working-directory: ${{ matrix.component }}
         env:
@@ -180,13 +222,17 @@ jobs:
       - name: 验原生库和版本号
         working-directory: ${{ matrix.component }}
         shell: pwsh
-        # opus.dll 和 SimConnect.dll 是 ctypes 运行时加载的，PyInstaller 的静态
-        # 分析看不见。漏了不会让打包失败，只会让用户拿到一个装上就用不了的包，
-        # 所以在这里显式验一遍。
+        # opus.dll、rnnoise.dll 和 SimConnect.dll 是 ctypes 运行时加载的，
+        # PyInstaller 的静态分析看不见。漏了不会让打包失败，只会让用户拿到一个
+        # 装上就用不了的包，所以在这里显式验一遍。
         run: |
           $root = "dist/${{ matrix.output }}/_internal"
           $missing = @()
           if (-not (Test-Path "$root/opus.dll")) { $missing += "opus.dll" }
+          if ("${{ matrix.component }}" -ne "atis" -and
+              -not (Test-Path "$root/rnnoise.dll")) {
+            $missing += "rnnoise.dll"
+          }
           if (-not (Test-Path "$root/buildinfo.json")) { $missing += "buildinfo.json" }
           if ("${{ matrix.component }}" -eq "msfs" -and
               -not (Test-Path "$root/SimConnect/SimConnect.dll")) {
