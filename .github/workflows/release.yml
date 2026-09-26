@@ -77,7 +77,7 @@ jobs:
         id: cache
         with:
           path: native/rnnoise/out
-          key: rnnoise-0.2-${{ hashFiles('native/rnnoise/CMakeLists.txt', 'native/rnnoise/build.ps1') }}
+          key: rnnoise-0.2-${{ hashFiles('native/rnnoise/CMakeLists.txt', 'native/rnnoise/build.ps1', 'native/rnnoise/compat/os_support.h') }}
       - name: 构建 rnnoise.dll
         if: steps.cache.outputs.cache-hit != 'true'
         shell: pwsh

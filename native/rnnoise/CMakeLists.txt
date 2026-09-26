@@ -23,12 +23,18 @@ add_library(rnnoise SHARED
 target_include_directories(rnnoise PRIVATE ${RNNOISE_SRC}/include ${RNNOISE_SRC}/src)
 if(MSVC)
   target_compile_definitions(rnnoise PRIVATE DLL_EXPORT RNNOISE_BUILD)
+  # vec.h 在没有 __SSE2__/__AVX__ 时走通用路径，那条路径用了 C99 的
+  # restrict 关键字；MSVC 的 C 编译器不认它，直接语法报错。MSVC 从不预定义
+  # __SSE2__/__AVX__（不论目标是不是 x86_64），所以这条通用路径在 MSVC 下
+  # 总会被编到，不是只有没有 SIMD 检测宏的平台才会走进去。把 restrict 定义
+  # 成 MSVC 自带的 __restrict，对每个 VS 工具集都管用。
+  target_compile_definitions(rnnoise PRIVATE restrict=__restrict)
 endif()
 
 # v0.2 的发布包里 vec.h / vec_neon.h 在没有走 SSE2/AVX 那条路径时会
 # #include "os_support.h" 取 OPUS_CLEAR，但这个头文件从未随 v0.2 一起发布
 # （上游主干后来把这些调用点换成了 common.h 自带的 RNN_CLEAR 并删掉了这个
-# include，但没有回补到 v0.2）。MSVC 编 x86_64 通常走的是 vec_avx.h，用不上
-# 这个符号，但没有 SSE2/AVX 检测宏的目标（比如本机做验证用的 macOS arm64）
-# 会掉进这条路径而编译失败。补一个只提供该宏的垫片目录，不改动发布包本身。
+# include，但没有回补到 v0.2）。这条通用路径在 MSVC 下总会被编到（见上），
+# 在没有 SSE2/AVX 检测宏的目标（比如本机做验证用的 macOS arm64）上也会走到。
+# 补一个只提供该宏的垫片目录，不改动发布包本身。
 target_include_directories(rnnoise PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compat)
