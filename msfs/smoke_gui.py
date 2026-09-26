@@ -94,6 +94,35 @@ def main():
             failures.append((name, e))
             print(f"  FAIL {name}: {type(e).__name__}: {e}")
 
+    # 冒烟测试不能弹校准框（dialog.open() 在离屏环境里没人点）；
+    # 对话框本身用假输入源单独建一次。
+    import calibration
+    import numpy as np
+    calibration.input_device_name = lambda index: None
+
+    class FakeSource:
+        rate = 48000
+        chunk = 960
+
+        def read_available(self):
+            return np.zeros(0, dtype=np.int16)
+
+        def close(self):
+            pass
+
+    def calibration_dialog():
+        for denoise_on in (False, True):
+            dialog = calibration.CalibrationDialog(
+                None, "Fake Mic", denoise_on,
+                source_factory=lambda index: FakeSource())
+            dialog.start()
+            dialog._tick()
+            dialog._finish()                   # 全静音 → too_short，不应抛异常
+            assert dialog.entry() is None
+            dialog.reject()
+
+    check("校准对话框", calibration_dialog)
+
     # 用临时配置，别动开发机上真实的 xpc_settings.json
     import settings as settings_module
     settings_module.Settings.save = lambda self: None
