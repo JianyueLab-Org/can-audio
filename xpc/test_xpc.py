@@ -20,6 +20,8 @@ import types
 import unittest
 from unittest import mock
 
+import numpy as np
+
 # pymumble 要本机的 opus 原生库，这些测试碰不到音频，缺库时放个替身。
 try:
     import opuslib  # noqa: F401
@@ -793,6 +795,18 @@ class FakeStream:
         pass
 
 
+class HalvingDenoiser:
+    def __init__(self, rate):
+        self.rate = rate
+        self.active = True
+
+    def process(self, samples):
+        return (np.asarray(samples, dtype=np.int16) // 2).astype(np.int16)
+
+    def close(self):
+        self.active = False
+
+
 class VoiceRuntimeTest(unittest.TestCase):
     """把 Voice 真的跑起来：切频道、发话音、掉线重连之后还能不能用。"""
 
@@ -849,6 +863,34 @@ class VoiceRuntimeTest(unittest.TestCase):
         time.sleep(seconds)
         self.voice.set_transmitting(False)
         return list(self.server.sent)
+
+    def _mic(self, value):
+        self.voice._denoiser_factory = HalvingDenoiser
+        return self.voice._process_mic(np.full(960, value, np.int16).tobytes())
+
+    def test_mic_baseline_and_multiplier_multiply(self):
+        self.voice.settings.mic_denoise = False
+        self.voice.settings.mic_baseline_db = 6.0206     # ×2
+        self.voice.settings.mic_volume = 150             # ×1.5
+        out = self._mic(1000)
+        self.assertTrue(np.all(np.abs(out.astype(np.int32) - 3000) <= 1))
+
+    def test_mic_denoise_runs_before_the_gain(self):
+        self.voice.settings.mic_denoise = True
+        self.voice.settings.mic_baseline_db = 6.0206
+        out = self._mic(1000)
+        self.assertTrue(np.all(np.abs(out.astype(np.int32) - 1000) <= 1))
+
+    def test_loud_mic_does_not_wrap_around(self):
+        """原来这里没有 clip：滑块过 100% 时大声说话会回绕成负数，听起来是爆音。"""
+        self.voice.settings.mic_denoise = False
+        self.voice.settings.mic_volume = 200
+        out = self._mic(30000)
+        self.assertTrue(np.all(out > 0))
+
+    def test_missing_settings_mean_unity_and_denoise_on(self):
+        out = self._mic(1000)
+        self.assertTrue(np.all(out == 500), "缺省应开降噪（替身减半）且增益为 1")
 
     def test_tuning_creates_the_channel_and_joins_it(self):
         self.run_loops()
