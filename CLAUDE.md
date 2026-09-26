@@ -267,6 +267,12 @@ That kick needs **two** Ice objects registered, which is easy to get wrong: `use
 
 **Audio path.** Mono `paInt16`, 20 ms frames (`CHUNK = int(RATE * 0.02)`). Each client runs `_find_best_sample_rate()`, probing `[48000, 44100, 32000, 24000, 16000]` against the selected devices at startup and again on every device change. Note that pymumble's `sound_output.add_sound()` expects 48 kHz PCM and no resampling is done — a fallback rate produces pitch-shifted audio, so 48 kHz is the intended path and lower rates are a last resort.
 
+**Microphone chain.** `voice.py` sends `Denoiser.process()` (RNNoise, 48 kHz only, pass-through when the library is missing) → `micgain.apply_gain()` = × calibrated baseline × session multiplier → limiter (−1 dBFS). The baseline is stored per input-device name in the settings file's `mic_calibration`, tagged with the denoise state it was measured under; a mismatch counts as uncalibrated. `mic_volume` is the session multiplier: 100% at every launch, never persisted. `mic_denoise` is persisted.
+
+**`rnnoise.dll` is built, not committed.** `native/rnnoise/build.ps1` builds it from xiph's v0.2 tarball (SHA-256 pinned); `release.yml`'s `rnnoise` job runs it for both the test and build jobs, the three mic clients' `gui.spec` bundle it, and the native-library check fails the release if `_internal/rnnoise.dll` is missing. It is loaded through ctypes, so PyInstaller cannot see it — same trap as `opus.dll`.
+
+`micgain.py`, `denoise.py` and `calibration.py` are byte-identical between `xpc/` and `msfs/` (`SharedCopyTest`); `controller/` carries its own copies.
+
 **PTT and indicators.** The three shipped clients that transmit share `ptt.py` (see above); the two legacy pilot clients still poll `keyboard.is_pressed()` plus a pygame joystick button in a background thread. RX indicators are lit from the `PYMUMBLE_CLBK_SOUNDRECEIVED` callback and cleared by a 0.5 s timeout loop.
 
 **pygame on Windows.** `os.environ['SDL_VIDEODRIVER'] = 'dummy'` and `SDL_AUDIODRIVER = 'dummy'` must be set *before* `import pygame` — that is why these lines sit above the imports in `gui.py`, `radio.py`, and `client/settings.py`. pygame is only used for joystick input; SDL video/audio must stay disabled so it does not fight PyQt6 and PyAudio.

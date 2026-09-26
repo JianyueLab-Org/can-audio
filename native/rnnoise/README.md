@@ -6,3 +6,4 @@
 - Windows：`pwsh native/rnnoise/build.ps1 -Out controller`（需要 CMake 和 MSVC）。CI 在 `release.yml` 的 `rnnoise` job 里执行同一脚本。
 - macOS 开发：`brew install rnnoise`。
 - 产物 `rnnoise.dll` 不进仓库。
+- `compat/os_support.h` supplies the `OPUS_CLEAR` macro the v0.2 tarball's `vec.h` includes but never shipped.
