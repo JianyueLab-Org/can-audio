@@ -608,6 +608,19 @@ def main():
         dialog.ptt_list.rebuild()
     check("绑定清空后仍能重画", an_empty_list_still_builds)
 
+    def settings_without_rnnoise():
+        import denoise
+        original = denoise.available
+        denoise.available = lambda: False
+        try:
+            dialog = gui.SettingsDialog(window.settings, window)
+            assert not dialog.denoise_checkbox.isEnabled()
+            dialog.reject()
+        finally:
+            denoise.available = original
+
+    check("设置对话框（降噪不可用）", settings_without_rnnoise)
+
     window.remove_radio(121700)
     window.ptt_watcher.stop()
 
