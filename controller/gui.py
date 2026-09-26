@@ -93,6 +93,15 @@ def resource_path(name):
     return os.path.join(base, name)
 
 
+def calibration_state_changed(old_device, old_denoise, new_device, new_denoise):
+    """设置对话框关掉后，输入设备或降噪状态是不是真的变了。
+
+    只有变了才可能需要重新校准——纯粹改了语言之类的话，每次保存设置都弹一次
+    校准框，会把设置对话框变成一个陷阱。
+    """
+    return old_device != new_device or old_denoise != new_denoise
+
+
 icon_path = resource_path("favicon.ico")
 
 
@@ -1287,6 +1296,8 @@ class ControllerWindow(QMainWindow):
         if hasattr(self, 'ptt_watcher'):
             self.ptt_watcher.stop()
         old_mic = self.settings.mic_volume
+        old_device = self.settings.input_device_index
+        old_denoise = self.settings.denoise_active()
         dialog = SettingsDialog(self.settings, self)
         accepted = dialog.exec()
         if hasattr(self, 'ptt_watcher'):
@@ -1306,8 +1317,10 @@ class ControllerWindow(QMainWindow):
                                            self.settings.output_device_index)
                 except Exception as e:
                     QMessageBox.warning(self, t("status.audio_device"), t("status.audio_failed", error=e))
-            # 换了输入设备或切了降噪，且新状态下没校准过，就再提示一次
-            QTimer.singleShot(0, self.maybe_prompt_calibration)
+            if calibration_state_changed(old_device, old_denoise,
+                                         self.settings.input_device_index,
+                                         self.settings.denoise_active()):
+                QTimer.singleShot(0, self.maybe_prompt_calibration)
 
     def closeEvent(self, event):
         try:
