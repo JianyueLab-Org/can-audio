@@ -75,8 +75,8 @@ class Settings:
                     self.ptt_bindings = ptt.load(
                         data.get("ptt_bindings"),
                         legacy_key=data.get("ptt_key", DEFAULT_PTT_KEY))
-                    calibration = data.get("mic_calibration")
-                    self.mic_calibration = calibration if isinstance(calibration, dict) else {}
+                    stored_calibration = data.get("mic_calibration")
+                    self.mic_calibration = stored_calibration if isinstance(stored_calibration, dict) else {}
                     self.mic_denoise = bool(data.get("mic_denoise", True))
                     self.speaker_volume = data.get("speaker_volume", 100)
                     self.input_device_index = data.get("input_device_index", None)

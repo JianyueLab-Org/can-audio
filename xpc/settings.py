@@ -144,9 +144,8 @@ class Settings:
             log.info("the FSD server was renamed, using %s instead of %s",
                      FSD_HOST, self.fsd_host)
             self.fsd_host = FSD_HOST
-        # 音量存坏了会让整条音频链路失灵，夹一下
-        # `or 100` 会把用户特意拉到 0 的静音在重启后悄悄变回 100（麦克风
-        # 开着而用户不知道）；0 是滑条上真实可取的值，只有 None/坏值才回默认
+        # mic_volume 是叠在校准基准上的会话内乘数，从不落盘：不读旧配置，
+        # 每次启动都是 100%（save() 也会把这个键从要写的字典里去掉）。
         self.mic_volume = 100
         if not isinstance(self.mic_calibration, dict):
             self.mic_calibration = {}
