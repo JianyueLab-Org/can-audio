@@ -18,6 +18,8 @@ import json
 import logging
 import os
 
+import denoise
+import micgain
 import ptt
 
 log = logging.getLogger("settings")
@@ -62,6 +64,10 @@ DEFAULTS = {
     "input_device_index": None,
     "output_device_index": None,
     "mic_volume": 100,
+    # 设备名 → 校准记录（micgain.calibration_entry）。mic_volume 是乘在基准上
+    # 的本次会话乘数，load() 不读、save() 不写。
+    "mic_calibration": {},
+    "mic_denoise": True,
     "speaker_volume": 100,
     # 收到管制消息时响一声。默认开：飞行员盯着的是窗外，消息区多一行没人看得见。
     # message_sound_all 打开的话频率上每条消息都响；默认只有私聊、以及正文里
@@ -105,6 +111,8 @@ class Settings:
         self.password_migrated = False
         for key, value in DEFAULTS.items():
             setattr(self, key, value)
+        # DEFAULTS 里的 {} 是模块级的同一个对象，直接 setattr 会让所有实例共享它
+        self.mic_calibration = {}
         self.load()
         if self.ptt_bindings is None:
             # 全新安装，连配置文件都还没有：用默认的 PTT 键起一条绑定
@@ -134,7 +142,10 @@ class Settings:
         # 音量存坏了会让整条音频链路失灵，夹一下
         # `or 100` 会把用户特意拉到 0 的静音在重启后悄悄变回 100（麦克风
         # 开着而用户不知道）；0 是滑条上真实可取的值，只有 None/坏值才回默认
-        self.mic_volume = _clamp_volume(self.mic_volume)
+        self.mic_volume = 100
+        if not isinstance(self.mic_calibration, dict):
+            self.mic_calibration = {}
+        self.mic_denoise = bool(self.mic_denoise)
         self.speaker_volume = _clamp_volume(self.speaker_volume)
         self.message_sound_volume = _clamp_volume(self.message_sound_volume)
         if not isinstance(self.package_roots, list):
@@ -181,8 +192,16 @@ class Settings:
         # 加起来也表达不了鼠标侧键这一种。
         data.pop("ptt_key", None)
         data.pop("joystick_ptt", None)
+        data.pop("mic_volume", None)
         try:
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except OSError as e:
             log.warning("could not save the settings: %s", e)
+
+    def denoise_active(self):
+        return denoise.effective(self.mic_denoise)
+
+    def baseline_for(self, device_name):
+        return micgain.baseline_db(self.mic_calibration, device_name,
+                                   self.denoise_active())

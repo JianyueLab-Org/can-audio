@@ -17,7 +17,9 @@ from qfluentwidgets import (BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentI
                             TransparentToolButton)
 
 import applog
+import denoise
 import i18n
+import micgain
 import ptt
 import theme
 import version
@@ -35,7 +37,12 @@ class Settings:
         # PTT 现在是一串绑定（键盘 / 鼠标侧键 / 摇杆），任意一个按住即发话。
         # 原来的 ptt_key 单字段读得进来，见 load_settings()。
         self.ptt_bindings = [ptt.keyboard_binding(DEFAULT_PTT_KEY)]
+        # 麦克风音量是乘在校准基准上的本次会话乘数：每次启动都是 100%，不落盘。
         self.mic_volume = 100
+        # 设备名 → 校准记录，见 micgain.calibration_entry()。按名字存是因为
+        # PyAudio 的设备序号跨启动不稳定。
+        self.mic_calibration = {}
+        self.mic_denoise = True
         self.speaker_volume = 100
         self.input_device_index = None
         self.output_device_index = None
@@ -67,7 +74,9 @@ class Settings:
                     self.ptt_bindings = ptt.load(
                         data.get("ptt_bindings"),
                         legacy_key=data.get("ptt_key", DEFAULT_PTT_KEY))
-                    self.mic_volume = data.get("mic_volume", 100)
+                    calibration = data.get("mic_calibration")
+                    self.mic_calibration = calibration if isinstance(calibration, dict) else {}
+                    self.mic_denoise = bool(data.get("mic_denoise", True))
                     self.speaker_volume = data.get("speaker_volume", 100)
                     self.input_device_index = data.get("input_device_index", None)
                     self.output_device_index = data.get("output_device_index", None)
@@ -88,7 +97,8 @@ class Settings:
                 # ptt_key 不再写回去。留着它就有两个说了算的地方，而且它只能表达
                 # 三种绑定里的一种，回头必然和实际用的那条对不上。
                 "ptt_bindings": ptt.dump(self.ptt_bindings),
-                "mic_volume": self.mic_volume,
+                "mic_calibration": self.mic_calibration,
+                "mic_denoise": self.mic_denoise,
                 "speaker_volume": self.speaker_volume,
                 "input_device_index": self.input_device_index,
                 "output_device_index": self.output_device_index,
@@ -102,6 +112,13 @@ class Settings:
                 json.dump(data, f, ensure_ascii=False)
         except Exception as e:
             log.warning(f"could not save the settings: {e}")
+
+    def denoise_active(self):
+        return denoise.effective(self.mic_denoise)
+
+    def baseline_for(self, device_name):
+        return micgain.baseline_db(self.mic_calibration, device_name,
+                                   self.denoise_active())
 
 
 class PttBindingList(QWidget):
