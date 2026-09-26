@@ -1211,10 +1211,14 @@ class SharedCopyTest(unittest.TestCase):
     `ptt.py` 和 `theme.py` 是后加的共享件，同样一处都不能自己改。`chime.py`
     也一样：提示音的判定和播放只在 xpc/test_xpc.py 里测，两份不一致的话
     这边就成了没人测过的代码。
+
+    `micgain.py`、`denoise.py` 和它们的测试也是共享件：降噪、增益和限幅两边
+    必须一致，否则两个客户端发出去的响度和底噪不一样，校准就白做了。
     """
 
     SHARED = ("voice.py", "traffic.py", "mumblecompat.py", "ptt.py",
-              "theme.py", "update.py", "chime.py", "observer.py")
+              "theme.py", "update.py", "chime.py", "observer.py",
+              "micgain.py", "test_micgain.py", "denoise.py", "test_denoise.py")
 
     def test_shared_files_are_byte_identical_to_xpc(self):
         here = os.path.dirname(os.path.abspath(__file__))
