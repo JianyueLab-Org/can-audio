@@ -642,7 +642,16 @@ class XpcWindow(QMainWindow):
         self._sync_frequency()
 
     def traffic_tick(self):
-        """每 0.1 秒：把他机插值到当下推给插件。和 tick() 分开是为了帧率。"""
+        """每 0.1 秒：把他机插值到当下推给插件，并把最新的本机位置交给 FSD。
+
+        位置也在这里喂而不是在 tick() 里：FSD 每 0.2 秒发一个位置包，0.5 秒
+        才喂一次的话，连着两三个包是同一份数据，别人那边飞机一走一停。
+        """
+        snapshot = self.sim.snapshot()
+        if snapshot:
+            self.snapshot = snapshot
+            if self.fsd:
+                self.fsd.update_position(snapshot)
         snapshot = self.snapshot
         if snapshot:
             self._push_traffic(snapshot)
@@ -736,15 +745,15 @@ class XpcWindow(QMainWindow):
         if state == 'reconnecting':
             return
 
-        # 重连次数用尽：整个下线。FSD 自己已经收摊了，这里连语音一起收。
+        # 重连窗口用完：FSD 自己已经收摊了。只收这一条，语音不动——两条链路
+        # 互不依赖，语音那头的人照样听得见、叫得到。
         if state == 'offline':
             self.fsd = None
-            self.disconnect_all()
+            self._link_gone("msg.fsd_gone_voice_stays")
             return
 
         if state == 'error':
-            # 首次登录失败这类不重试的错误。语音不受影响——两条链路互不依赖，
-            # 只有"重连到底也没成功"才一起下线。
+            # 首次登录失败这类不重试的错误。语音不受影响——两条链路互不依赖。
             self.fsd = None
             self.connect_button.setText(
                 t("connect.disconnect") if self.voice else t("connect.connect"))
@@ -765,11 +774,19 @@ class XpcWindow(QMainWindow):
         if state == 'reconnecting':
             return
 
-        # 重连次数用尽：整个下线。语音自己已经收摊了（Voice._give_up 走的是
-        # stop()），这里把引用清掉再统一走断开，FSD 也一起收。
+        # 语音彻底下线（重连次数用尽，或被服务端踢了）：只收语音，FSD 不动。
+        # 以前这里走 disconnect_all()，语音服务器一抖，飞机就从网络上消失。
+        # 被踢的那条路径 Voice 自己不会 stop()，所以这里要收；重连用尽那条
+        # 已经 stop() 过，再来一次是空操作。
         if state == 'offline':
+            voice = self.voice
             self.voice = None
-            self.disconnect_all()
+            if voice:
+                threading.Thread(target=voice.stop, daemon=True).start()
+            self.tx_light.set_lit(False)
+            self.rx_light.set_lit(False)
+            self.channel_label.setText("")
+            self._link_gone("msg.voice_gone_fsd_stays")
             return
 
         if state == 'error':
@@ -781,6 +798,14 @@ class XpcWindow(QMainWindow):
                 threading.Thread(target=voice.stop, daemon=True).start()
             self.connect_button.setText(
                 t("connect.disconnect") if self.fsd else t("connect.connect"))
+
+    def _link_gone(self, key):
+        """一条链路彻底下线之后：另一条还在就说一句、留着它；都没了才整个断开。"""
+        if self.fsd or self.voice:
+            self.add_message(t(key), theme.ACTIVE_COLOR)
+            self.connect_button.setText(t("connect.disconnect"))
+        else:
+            self.disconnect_all()
 
     def on_text_message(self, sender, recipient, body):
         if recipient.startswith("@"):

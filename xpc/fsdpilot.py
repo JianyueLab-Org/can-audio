@@ -6,6 +6,8 @@
     登录   $ID{呼号}:SERVER:{客户端ID}:{客户端名}:{主}:{次}:{CID}:{机器码}
            #AP{呼号}:SERVER:{CID}:{密码}:{等级}:{协议版本}:{模拟器}:{真实姓名}
     位置   @{应答机模式}:{呼号}:{squawk}:{等级}:{纬度}:{经度}:{高度}:{地速}:{PBH}:{气压差}
+    快速   ^{呼号}:{纬度}:{经度}:{真高}:{离地高}:{PBH}:{东}:{上}:{北}:{俯仰率}:{航向率}
+           :{坡度率}:{前轮角}      —— 只收不发。#SL 字段相同，#ST 没有六个速度段
     计划   $FP{呼号}:SERVER:{规则}:{机型}:{真空速}:{起飞地}:{预计起飞}:{实际起飞}
            :{巡航高度}:{目的地}:{航路小时}:{航路分钟}:{燃油小时}:{燃油分钟}
            :{备降场}:{备注}:{航路}          —— 一共 17 段，少一段整包被拒
@@ -22,6 +24,7 @@ $ID 的第 9 个字段（challenge）留空，服务端就不会发起 VATSIM �
 
 import json
 import logging
+import math
 import socket
 import threading
 import time
@@ -33,16 +36,36 @@ from i18n import t
 log = logging.getLogger("fsd")
 
 DEFAULT_PORT = 6809
-PROTO_REVISION = 100          # ProtoRevisionClassic
+# ProtoRevisionVelocity。can-fsd 只把 ^ / #SL / #ST 转给 101 的客户端
+# （broadcast.go 的 broadcastRangedVelocity），报 100 的话 vPilot / xPilot
+# 这类客户端的飞机在我们这里五秒才动一下。101 在服务端另外只多一件事：
+# 附近有别的 101 飞行员时发来 $SF 叫我们发快速位置。我们本来就 5 Hz 发 `@`，
+# 所以 $SF 只记一行日志。
+PROTO_REVISION = 101
 RATING_OBSERVER = 1
 POSITION_INTERVAL = 0.2       # 每秒 5 次，和 VATSIM 客户端一致
 SLOW_POSITION_INTERVAL = 5.0  # 停在地面上没动时降频
 LOGIN_TIMEOUT = 10.0
-# 已经登录过之后掉线，最多再试这么多次；都失败就整个下线。和语音那边同一条
-# 策略（voice.RECONNECT_LIMIT），两条链路的行为要一致，不然"整个下线"就没有
-# 统一的含义。
-RECONNECT_LIMIT = 3
-RECONNECT_DELAY = 3.0         # 每次重连之间等一下，别贴着服务器猛敲
+# 掉线后重连按时间算，不按次数算。服务端要等旧连接死透才放出呼号
+# （postoffice.go 的 register 回 `$ER … 1 … Callsign already in use`）：
+# 读超时 90 秒（conn.go 的 readTimeout），空闲清理 60 秒、每 30 秒扫一次
+# （reaper.go）。三次 × 3 秒的老预算在这之前就用完了，飞机直接下线。
+RECONNECT_WINDOW = 150.0
+# 每次重试前等多久，逐次拉长，最后一档一直用到窗口用完
+RECONNECT_DELAYS = (3.0, 5.0, 10.0, 15.0, 20.0, 30.0)
+
+# 服务端拒绝登录的错误码（can-fsd internal/fsd/errors.go）。只有这两个值得
+# 再试：呼号被旧连接占着、服务器满了。其余（密码错、账号停用、等级太高、
+# 被督导踢过……）重试只会得到同一个答案，而认证失败按 CID 限流。
+ERR_CALLSIGN_IN_USE = "1"
+ERR_SERVER_FULL = "12"
+
+# 一次失败属于哪一类，决定 _run 要不要再试
+FAILURE_FATAL = "fatal"            # 服务端说这个人/这次登录不行，停
+FAILURE_IN_USE = "callsign-in-use"  # 呼号还被上一条连接占着，等它释放
+FAILURE_TRANSIENT = "transient"    # 网络断了、超时、服务器满——登录过就再试
+
+KNOTS_PER_MPS = 1.943844492
 # can-fsd 的 IsValidCallsign 上限（packet.go 的 MaxCallsignLength）
 MAX_CALLSIGN_LENGTH = 12
 
@@ -172,14 +195,15 @@ class FSDPilot:
         on_text(sender, recipient, message)
         on_controllers(list)          附近的管制席位
 
-    掉线相关的两条状态和语音那边一个意思：`reconnecting` 是暂时的，还在试；
-    `offline` 是 RECONNECT_LIMIT 次都失败、这条链路彻底完了，界面应当整个下线。
+    `reconnecting` 是暂时的，还在试；`offline` 是 RECONNECT_WINDOW 秒内都没
+    连回来，这条链路彻底完了；`error` 是不重试的失败（首连连不上、密码错）。
+    界面对后两者只收掉 FSD 这一条，语音不动。
     """
 
     def __init__(self, host, callsign, cid, password, real_name="",
                  port=DEFAULT_PORT, rating=RATING_OBSERVER, aircraft="",
                  on_status=None, on_text=None, on_controllers=None,
-                 traffic=None, reconnect_limit=RECONNECT_LIMIT):
+                 traffic=None, reconnect_window=RECONNECT_WINDOW):
         self.host = host
         self.port = int(port or DEFAULT_PORT)
         self.callsign = (callsign or "").strip().upper()
@@ -214,9 +238,14 @@ class FSDPilot:
         self._sock = None
         self._buffer = b""
         self._logged_in = False
-        # 掉线后最多重连几次，用尽就整个下线
-        self.reconnect_limit = int(reconnect_limit)
+        # 掉线后最多重试多少秒，用完就下线
+        self.reconnect_window = float(reconnect_window)
         self.gave_up = False
+        # 最近一次失败的类别（FAILURE_*），_run 据此决定要不要再试
+        self._failure = FAILURE_TRANSIENT
+        # 发送失败的那个异常。非 None 表示这条 socket 已经坏了、已经被关掉，
+        # 收包那边应当当作掉线处理。
+        self._broken = None
         # 登录成功过之后，失败就先当"可以重连"。这个标记让 _status 把中途的
         # error 翻成 reconnecting——否则界面收到一次 error 就把整条连接当没了，
         # 而我们其实马上就要再试。
@@ -350,36 +379,61 @@ class FSDPilot:
         return ":".join(fields)
 
     def _send(self, packet):
-        if not self._sock:
+        sock = self._sock
+        if not sock:
             return False
         try:
-            self._sock.sendall((packet + "\r\n").encode("utf-8", errors="replace"))
+            sock.sendall((packet + "\r\n").encode("utf-8", errors="replace"))
             log.debug("→ %s", self._redact(packet))
             return True
         except Exception as e:
-            self._status('error', t("fsd.send_failed", error=e))
+            self._send_failed(sock, e)
             return False
 
-    def _run(self):
-        """连接 → 收发 → 掉线重连，最多 reconnect_limit 次。
+    def _send_failed(self, sock, error):
+        """发不出去说明连接已经坏了：把 socket 关掉，让收包那边走正常的掉线重连。
 
-        **首次连不上不重试。** 那多半是呼号被占、密码不对或者地址填错——重试三
-        次只会把同一条错误刷三遍，还可能触发服务端对认证失败的限流。只有"登录
-        成功过之后掉的线"才重连：那种是服务器重启或者网络抖动，重连是对的。
-
-        次数用尽后报 offline 并结束，界面据此整个下线，而不是留一条谁也说不清
-        状态的连接。
+        以前这里只报一条 error（重连期间被翻成 reconnecting），socket 原样留着，
+        什么都不会去重连——界面停在"重连中"，飞机在网上一动不动。shutdown 会
+        叫醒正卡在 recv() 里的连接线程（它读到 EOF 或报错），不管 _send 是从
+        哪条线程调的。
         """
-        attempts = 0
+        if self._broken is None:
+            self._broken = error
+            log.warning("FSD send failed (%s, errno %s): %s; closing the socket",
+                        type(error).__name__, getattr(error, "errno", None), error)
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+
+    def _run(self):
+        """连接 → 收发 → 掉线重连，最多重试 reconnect_window 秒。
+
+        失败按类别处理（_failure）：
+
+        - **FAILURE_FATAL**：密码错、账号停用、被督导踢过……重试只会得到同一个
+          答案，还会撞上服务端按 CID 的认证失败限流。立即停。
+        - **FAILURE_IN_USE**：呼号还被上一条连接占着。服务端要等旧连接超时
+          （最长约 90 秒）才放出来，所以**首连也等**——客户端崩了或断网后重开，
+          头一次登录撞上的正是自己的旧连接。
+        - **FAILURE_TRANSIENT**：连不上、超时、连接断了。首连就这样多半是地址
+          填错，不重试；登录过之后才重试（服务器重启、网络抖动）。
+
+        重试的间隔逐次拉长（RECONNECT_DELAYS），从第一次失败算起超过
+        reconnect_window 秒还没连回来就报 offline 并结束。
+        """
         established_once = False
+        attempt = 0
+        retry_since = None
 
         while self.running and not self.stop_event.is_set():
-            connected = False
+            self._failure = FAILURE_TRANSIENT
             try:
-                connected = self._connect()
-                if connected:
-                    attempts = 0
+                if self._connect():
                     established_once = True
+                    attempt = 0
+                    retry_since = None
                     # 从这一刻起，掉线是可以重连的
                     self._retryable = True
                     self._loop()
@@ -388,28 +442,52 @@ class FSDPilot:
             finally:
                 self._close()
 
-            if not established_once:
-                return                  # 首次就没连上，原因已经报过了
             if not self.running or self.stop_event.is_set():
                 return                  # 用户自己断的
+            failure = self._failure
+            if failure == FAILURE_FATAL:
+                return                  # 原因已经报过了，而且是终态
+            if failure == FAILURE_TRANSIENT and not established_once:
+                return                  # 首次就没连上，原因已经报过了
 
-            attempts += 1
-            if attempts > self.reconnect_limit:
+            now = time.monotonic()
+            if retry_since is None:
+                retry_since = now
+            waited = now - retry_since
+            if waited >= self.reconnect_window:
                 self.gave_up = True
                 self._retryable = False
+                log.warning("could not get back onto FSD within %.0f s "
+                            "(last failure: %s), giving up",
+                            self.reconnect_window, failure)
                 self._status('offline',
-                             t("fsd.give_up", limit=self.reconnect_limit))
+                             t("fsd.give_up", seconds=int(self.reconnect_window)))
                 return
 
-            self._status('reconnecting',
-                         t("fsd.reconnecting", attempt=attempts,
-                           limit=self.reconnect_limit))
-            if self.stop_event.wait(RECONNECT_DELAY):
+            delay = RECONNECT_DELAYS[min(attempt, len(RECONNECT_DELAYS) - 1)]
+            delay = min(delay, self.reconnect_window - waited)
+            attempt += 1
+            log.info("FSD retry %d in %.0f s (%s, %.0f of %.0f s used)",
+                     attempt, delay, failure, waited, self.reconnect_window)
+            # 已经登录过的话 _retryable 本来就是真；首连撞上呼号被占时
+            # $ER 那里已经置真。两种情况下这条都是 reconnecting。
+            self._retryable = True
+            if failure == FAILURE_IN_USE:
+                message = t("fsd.callsign_busy", callsign=self.callsign,
+                            delay=int(round(delay)))
+            else:
+                message = t("fsd.reconnecting", attempt=attempt,
+                            delay=int(round(delay)))
+            self._status('reconnecting', message)
+            if self.stop_event.wait(delay):
                 return
 
     def _connect(self):
+        self._broken = None
         problem = callsign_problem(self.callsign)
         if problem:
+            self._failure = FAILURE_FATAL
+            self._retryable = False
             self._status('error', problem)
             return False
 
@@ -461,9 +539,11 @@ class FSDPilot:
     def _loop(self):
         next_position = 0.0
         while self.running and not self.stop_event.is_set():
-            packet = self._read_packet(timeout=0.2)
+            packet = self._read_packet(timeout=0.2) if self._broken is None else ""
             if packet == "":
-                self._status('error', t("fsd.dropped"))
+                broken = self._broken
+                self._status('error', t("fsd.send_failed", error=broken)
+                             if broken is not None else t("fsd.dropped"))
                 return
             if packet and self._handle_packet(packet) is False:
                 return
@@ -511,9 +591,14 @@ class FSDPilot:
                     chunk = self._sock.recv(4096)
                 except socket.timeout:
                     return None
-                except Exception:
+                except Exception as e:
+                    # 类型和 errno 要进日志：EOF、对端重置、内核放弃重传是三种
+                    # 完全不同的掉线，原来这里一声不吭，日志里只剩一句"断开了"。
+                    log.info("FSD receive failed: %s (errno %s): %s",
+                             type(e).__name__, getattr(e, "errno", None), e)
                     return ""
                 if not chunk:
+                    log.info("FSD receive: the server closed the connection (EOF)")
                     return ""
                 self._buffer += chunk
 
@@ -532,6 +617,17 @@ class FSDPilot:
             code = fields[2] if len(fields) > 2 else "?"
             message = fields[4] if len(fields) > 4 else packet
             if not self._logged_in:
+                if code == ERR_CALLSIGN_IN_USE:
+                    # 首连也要等：撞上的多半是自己上一条还没死透的连接
+                    self._failure = FAILURE_IN_USE
+                    self._retryable = True
+                elif code == ERR_SERVER_FULL:
+                    self._failure = FAILURE_TRANSIENT
+                else:
+                    # 终态：不能被翻成 reconnecting，界面要知道这条连接没了
+                    self._failure = FAILURE_FATAL
+                    self._retryable = False
+                log.info("login refused with code %s (%s)", code, self._failure)
                 self._status('error', t("fsd.rejected", code=code, message=message))
                 return False
             log.warning("the server returned an error (%s): %s", code, message)
@@ -562,6 +658,24 @@ class FSDPilot:
 
         if head.startswith("@") and len(fields) >= 9:
             self._note_traffic(fields)
+            return True
+
+        # 快速位置。字段个数下限和 can-fsd 的 minFields 一致（^ / #SL 13 段，
+        # #ST 7 段），它不够数的包服务端本来就不会转。
+        if head.startswith("^") and len(fields) >= 13:
+            self._note_fast_traffic(head[1:], fields, stopped=False)
+            return True
+        if head.startswith("#SL") and len(fields) >= 13:
+            self._note_fast_traffic(head[3:], fields, stopped=False)
+            return True
+        if head.startswith("#ST") and len(fields) >= 7:
+            self._note_fast_traffic(head[3:], fields, stopped=True)
+            return True
+
+        if head.startswith("$SF"):
+            # 服务端叫我们发快速位置（附近有别的 101 飞行员）。`@` 本来就是
+            # 5 Hz，不另发 ^。
+            log.debug("send-fast request from the server: %s", fields[2:3])
             return True
 
         if head.startswith("#SB") and len(fields) >= 3:
@@ -640,6 +754,41 @@ class FSDPilot:
                 squawk=int(fields[2]), mode=fields[0][1:] or "S")
         except (IndexError, ValueError) as e:
             log.debug("could not parse the position packet %s: %s", fields[:2], e)
+
+    def _note_fast_traffic(self, callsign, fields, stopped):
+        """别人的快速位置包（`^` / `#SL` / `#ST`）。
+
+        字段（can-fsd docs/protocol.md "Fast Pilot Position"）：
+
+            0 呼号  1 纬度  2 经度  3 真高（英尺，带小数）  4 离地高  5 PBH
+            6/7/8 位置速度 X/Y/Z（米每秒）  9/10/11 角速度  12 前轮角
+
+        X 是向东、Y 是向上、Z 是向北——xPilot 发的是 local_vx、local_vy、
+        -local_vz（X-Plane 的 +Z 朝南），vPilot 取 MSFS 的 VELOCITY WORLD
+        X/Y/Z，同一个方向。`#ST` 是停着的飞机，没有六个速度段，速度就是零。
+        包里没有应答机和地速：地速由水平速度算，应答机沿用 `@` 包带来的。
+        """
+        if self.traffic is None:
+            return
+        if callsign == self.callsign:
+            return
+        try:
+            attitude = unpack_pbh(int(fields[5]) & 0xFFFFFFFF)
+            if stopped:
+                north = east = up = 0.0
+            else:
+                east, up, north = float(fields[6]), float(fields[7]), float(fields[8])
+            self.traffic.update_position(
+                callsign,
+                latitude=float(fields[1]), longitude=float(fields[2]),
+                altitude=float(fields[3]),
+                groundspeed=int(round(math.hypot(north, east) * KNOTS_PER_MPS)),
+                pitch=attitude["pitch"], bank=attitude["bank"],
+                heading=attitude["heading"], on_ground=attitude["on_ground"],
+                velocity=(north, east, up))
+        except (IndexError, ValueError) as e:
+            log.debug("could not parse the fast position packet %s: %s",
+                      fields[:1], e)
 
     def request_plane_info(self, callsign):
         """问对方的机型，用于模型匹配。"""

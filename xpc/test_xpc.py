@@ -1567,24 +1567,52 @@ class KickedTest(unittest.TestCase):
         self.assertEqual(self.states[-1][0], 'offline')
 
 
-class FsdReconnectLimitTest(unittest.TestCase):
-    """FSD 链路同一条策略：掉线重连三次，用尽就整个下线。
+CAN_FSD = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "can-fsd", "internal", "fsd")
 
-    两条链路必须一致，否则"整个下线"没有统一含义：语音给三次、FSD 一掉就放弃的
-    话，一次服务器重启会让飞机从网络上消失而语音还连着，别人看不见你却听得见。
+
+class _FakeClock:
+    """假的单调钟和假的 stop_event：wait(delay) 直接把钟拨过去。"""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.waits = []
+
+    def monotonic(self):
+        return self.now
+
+    def wait(self, delay):
+        self.waits.append(delay)
+        self.now += delay
+        return False
+
+    def is_set(self):
+        return False
+
+    def set(self):
+        pass
+
+
+class FsdRetryPolicyTest(unittest.TestCase):
+    """重连要熬过服务端的"幽灵连接"，认证失败则立刻停。和 msfs 同一条策略。
+
+    can-fsd 在旧连接死透之前拒绝同一个呼号（postoffice.go 的 register），
+    读超时 90 秒、空闲清理最长约 90 秒。老策略三次 × 3 秒就放弃，还连语音
+    一起下线。
     """
 
-    def make_client(self, connect_results, limit=3):
-        """_connect / _loop / _close 换成替身，只测重连那一层的控制流。"""
+    def make_client(self, outcomes):
+        """outcomes 里每一项是一次 _connect 的结果：True，或一个 FAILURE_*。"""
         client = fsdpilot.FSDPilot.__new__(fsdpilot.FSDPilot)
         client.callsign = "CCA1501"
         client.running = True
-        client.stop_event = threading.Event()
-        client.reconnect_limit = limit
+        client.clock = _FakeClock()
+        client.stop_event = client.clock
+        client.reconnect_window = fsdpilot.RECONNECT_WINDOW
         client.gave_up = False
         client._retryable = False
+        client._failure = fsdpilot.FAILURE_TRANSIENT
         client.states = []
-        # 照抄 _status 里那次翻译：重连期间的 error/stopped 不是终态
         client._status = lambda state, message: client.states.append(
             ('reconnecting' if client._retryable and state in ('error', 'stopped')
              else state, message))
@@ -1593,53 +1621,96 @@ class FsdReconnectLimitTest(unittest.TestCase):
         def fake_connect():
             index = client.connect_calls
             client.connect_calls += 1
-            return (connect_results[index] if index < len(connect_results)
-                    else False)
+            outcome = outcomes[index] if index < len(outcomes) else outcomes[-1]
+            if outcome is True:
+                return True
+            client._failure = outcome
+            if outcome == fsdpilot.FAILURE_FATAL:
+                client._retryable = False
+            return False
 
         client._connect = fake_connect
         client._loop = lambda: None
         client._close = lambda: None
         return client
 
-    def setUp(self):
-        self._delay = fsdpilot.RECONNECT_DELAY
-        fsdpilot.RECONNECT_DELAY = 0          # 别真的等 3 秒 × 3
+    def run_client(self, client):
+        with mock.patch.object(fsdpilot.time, "monotonic", client.clock.monotonic):
+            client._run()
 
-    def tearDown(self):
-        fsdpilot.RECONNECT_DELAY = self._delay
+    def test_the_window_outlasts_the_server_holding_the_callsign(self):
+        # can-fsd：readTimeout 90 s；空闲 60 s、每 30 s 扫一次
+        self.assertGreaterEqual(fsdpilot.RECONNECT_WINDOW, 120)
 
-    def test_three_attempts_then_offline(self):
-        client = self.make_client([True] + [False] * 10)
-        client._run()
-        self.assertTrue(client.gave_up)
-        self.assertEqual(client.connect_calls, 4, "一次首连 + 三次重连")
-        self.assertEqual(client.states[-1][0], 'offline', client.states)
-
-    def test_a_reconnect_that_works_resets_the_count(self):
-        client = self.make_client([True, False, True] + [False] * 10)
-        client._run()
-        self.assertEqual(client.connect_calls, 6,
-                         "首连 + 失败一次 + 重连成功，之后第二轮再给满三次")
-
-    def test_the_first_connection_is_not_retried(self):
-        """首连失败多半是呼号被占或密码不对，重试只会把同一条错误刷三遍。"""
-        client = self.make_client([False] * 10)
-        client._run()
+    def test_a_callsign_held_by_the_ghost_is_waited_out(self):
+        in_use = fsdpilot.FAILURE_IN_USE
+        # 掉线后一分半左右都被旧连接占着（3+5+10+15+20+30 秒），然后放出来了
+        client = self.make_client([True] + [in_use] * 6 + [True, fsdpilot.FAILURE_FATAL])
+        self.run_client(client)
+        self.assertEqual(client.connect_calls, 9)
+        self.assertGreaterEqual(sum(client.clock.waits), 90)
         self.assertFalse(client.gave_up)
+        self.assertGreater(client.connect_calls, 4, "老预算只有三次重试")
+        self.assertNotIn('offline', [state for state, _ in client.states])
+
+    def test_gives_up_only_after_the_whole_window(self):
+        client = self.make_client([True] + [fsdpilot.FAILURE_IN_USE] * 100)
+        self.run_client(client)
+        self.assertTrue(client.gave_up)
+        self.assertEqual(client.states[-1][0], 'offline')
+        self.assertGreaterEqual(sum(client.clock.waits), fsdpilot.RECONNECT_WINDOW)
+        self.assertLessEqual(max(client.clock.waits), max(fsdpilot.RECONNECT_DELAYS))
+
+    def test_a_dropped_link_that_cannot_reconnect_also_keeps_trying(self):
+        client = self.make_client([True] + [fsdpilot.FAILURE_TRANSIENT] * 100)
+        self.run_client(client)
+        self.assertTrue(client.gave_up)
+        self.assertGreater(client.connect_calls, 4)
+
+    def test_the_backoff_grows(self):
+        client = self.make_client([True] + [fsdpilot.FAILURE_TRANSIENT] * 100)
+        self.run_client(client)
+        waits = client.clock.waits
+        self.assertEqual(waits[0], fsdpilot.RECONNECT_DELAYS[0])
+        self.assertGreater(waits[3], waits[0])
+
+    def test_an_auth_failure_while_reconnecting_stops_at_once(self):
+        client = self.make_client([True, fsdpilot.FAILURE_IN_USE, fsdpilot.FAILURE_FATAL])
+        self.run_client(client)
+        self.assertEqual(client.connect_calls, 3)
+        self.assertFalse(client.gave_up)
+        # 掉线后一次、呼号被占后一次；认证失败之后不再等
+        self.assertEqual(len(client.clock.waits), 2)
+
+    def test_first_connection_in_use_is_waited_out(self):
+        """客户端崩了或断网后重开：头一次登录撞上的就是自己的旧连接。"""
+        client = self.make_client([fsdpilot.FAILURE_IN_USE] * 3 + [True, fsdpilot.FAILURE_FATAL])
+        self.run_client(client)
+        self.assertEqual(client.connect_calls, 5)
+
+    def test_first_connection_that_cannot_reach_the_server_is_not_retried(self):
+        client = self.make_client([fsdpilot.FAILURE_TRANSIENT])
+        self.run_client(client)
         self.assertEqual(client.connect_calls, 1)
-        self.assertEqual(client.states, [], "首连失败的原因由 _connect 自己报")
+        self.assertEqual(client.states, [])
+
+    def test_first_connection_with_a_bad_password_is_not_retried(self):
+        client = self.make_client([fsdpilot.FAILURE_FATAL])
+        self.run_client(client)
+        self.assertEqual(client.connect_calls, 1)
 
     def test_a_drop_while_retrying_is_not_reported_as_terminal(self):
         """重连期间 _loop / _connect 报的 error 必须翻成 reconnecting。
 
         界面收到 error 会把整条连接当没了——而我们其实马上就要再试。
         """
-        client = self.make_client([True, False, True] + [False] * 10)
+        client = self.make_client([True, fsdpilot.FAILURE_TRANSIENT, True]
+                                  + [fsdpilot.FAILURE_TRANSIENT] * 100)
 
         def loop_that_drops():
             client._status('error', "与 FSD 服务器的连接已断开")
         client._loop = loop_that_drops
-        client._run()
+        self.run_client(client)
         kinds = [state for state, _ in client.states]
         self.assertNotIn('error', kinds, kinds)
         self.assertIn('reconnecting', kinds)
@@ -2415,12 +2486,14 @@ class InterpolationTest(unittest.TestCase):
         early = self.table.get("CES2345").position_at(50.0)["latitude"]
         self.assertAlmostEqual(early, 30.0, places=6)
 
-    def test_duplicate_timestamp_is_dropped(self):
-        # 同一时刻的重复包会让插值除零
+    def test_duplicate_timestamp_replaces_latest(self):
+        # 同一时刻的两个包（同一次 recv 读出来的）：新的替换 latest，
+        # 不当新的一段——两点间隔是零，插值会除零
         self._add(100.0, 30.0, 120.0)
         self._add(100.0, 40.0, 130.0)
-        self.assertAlmostEqual(
-            self.table.get("CES2345").position_at(100.0)["latitude"], 30.0)
+        aircraft = self.table.get("CES2345")
+        self.assertIsNone(aircraft.previous)
+        self.assertAlmostEqual(aircraft.position_at(100.0)["latitude"], 40.0)
 
     def test_vertical_speed(self):
         self._add(100.0, 30.0, 120.0, altitude=10000)
@@ -3655,6 +3728,390 @@ class MicCalibrationSettingsTest(unittest.TestCase):
         with open(self.path, "w", encoding="utf-8") as f:
             json.dump({"mic_calibration": "x"}, f)
         self.assertEqual(self.settings_module.Settings(self.path).mic_calibration, {})
+
+# ---------------------------------------------------------------------------
+# FSD 连接和他机：发送失败、登录被拒、快速位置包、重复样本、时间戳。
+# 和 msfs/test_msfs.py 里同名的那几组一样；fsdpilot.py 两边各一份，traffic.py
+# 是共享文件。
+# ---------------------------------------------------------------------------
+
+import logging
+import re
+import socket
+
+
+class FsdLoginRefusalTest(unittest.TestCase):
+    """登录被拒时按 can-fsd 的错误码分类（internal/fsd/errors.go）。"""
+
+    def make_pilot(self):
+        states = []
+        pilot = fsdpilot.FSDPilot("fsd.example", "CCA1501", "1000", "pw",
+                                  on_status=lambda state, message: states.append(state))
+        return pilot, states
+
+    def test_callsign_in_use_is_retryable(self):
+        pilot, states = self.make_pilot()
+        self.assertFalse(pilot._handle_packet(
+            "$ERserver:CCA1501:1::Callsign already in use"))
+        self.assertEqual(pilot._failure, fsdpilot.FAILURE_IN_USE)
+        self.assertEqual(states, ['reconnecting'], "首连撞上呼号被占也不是终态")
+
+    def test_bad_password_is_terminal_even_mid_reconnect(self):
+        pilot, states = self.make_pilot()
+        pilot._retryable = True       # 已经登录过、正在重连
+        pilot._handle_packet("$ERserver:CCA1501:6::Invalid CID/password")
+        self.assertEqual(pilot._failure, fsdpilot.FAILURE_FATAL)
+        self.assertEqual(states, ['error'], "终态不能被翻成 reconnecting")
+
+    def test_rate_limited_and_kicked_are_terminal(self):
+        for packet in ("$ERserver:CCA1501:6::Too many failed attempts; try again later",
+                       "$ERserver:CCA1501:13::Recently disconnected by a supervisor"):
+            pilot, _ = self.make_pilot()
+            pilot._handle_packet(packet)
+            self.assertEqual(pilot._failure, fsdpilot.FAILURE_FATAL, packet)
+
+    def test_server_full_is_transient(self):
+        pilot, _ = self.make_pilot()
+        pilot._handle_packet("$ERserver:CCA1501:12::Server full")
+        self.assertEqual(pilot._failure, fsdpilot.FAILURE_TRANSIENT)
+
+    def test_codes_match_can_fsd(self):
+        path = os.path.join(CAN_FSD, "errors.go")
+        if not os.path.exists(path):
+            self.skipTest("边上没有 can-fsd")
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+        codes = dict(re.findall(r"(ErrCode\w+)\s*=\s*(\d+)", source))
+        self.assertEqual(codes["ErrCodeCallsignInUse"], fsdpilot.ERR_CALLSIGN_IN_USE)
+        self.assertEqual(codes["ErrCodeServerFull"], fsdpilot.ERR_SERVER_FULL)
+
+
+class _BrokenSocket:
+    """sendall 一律失败；shutdown 之后 recv 读到 EOF，之前一直超时。"""
+
+    def __init__(self):
+        self.shut = threading.Event()
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def sendall(self, data):
+        raise ConnectionResetError(10054, "connection reset by peer")
+
+    def recv(self, size):
+        if self.shut.wait(self.timeout or 0.01):
+            return b""
+        raise socket.timeout()
+
+    def shutdown(self, how):
+        self.shut.set()
+
+    def close(self):
+        self.shut.set()
+
+
+class FsdSendFailureTest(unittest.TestCase):
+    """发不出去必须真的触发重连，不能停在"重连中"什么也不做。"""
+
+    def test_a_failed_send_closes_the_socket(self):
+        pilot = fsdpilot.FSDPilot("fsd.example", "CCA1501", "1000", "pw")
+        sock = _BrokenSocket()
+        pilot._sock = sock
+        with self.assertLogs("fsd", logging.WARNING) as logs:
+            self.assertFalse(pilot._send("#TMCCA1501:@21800:hello"))
+        self.assertTrue(sock.shut.is_set(), "socket 该被 shutdown")
+        self.assertIsInstance(pilot._broken, ConnectionResetError)
+        self.assertIn("ConnectionResetError", "\n".join(logs.output))
+
+    def test_a_failed_position_send_leads_to_a_reconnect(self):
+        states = []
+        pilot = fsdpilot.FSDPilot("fsd.example", "CCA1501", "1000", "pw",
+                                  on_status=lambda state, message: states.append((state, message)))
+        pilot.update_position({"latitude": 31.0, "longitude": 121.0, "altitude": 3000,
+                               "groundspeed": 200, "pitch": 0.0, "bank": 0.0,
+                               "heading": 90.0})
+        calls = []
+
+        def fake_connect():
+            calls.append(1)
+            pilot._broken = None
+            if len(calls) > 1:
+                return False
+            pilot._sock = _BrokenSocket()
+            pilot._logged_in = True
+            return True
+
+        pilot._connect = fake_connect
+        waits = []
+        pilot.stop_event = mock.MagicMock()
+        pilot.stop_event.is_set.return_value = False
+        # 第一次等待之前就说明已经走到"安排重连"了；返回 True 让 _run 结束
+        pilot.stop_event.wait.side_effect = lambda delay: waits.append(delay) or True
+        pilot.running = True
+        worker = threading.Thread(target=pilot._run, daemon=True)
+        worker.start()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive(), "_loop 卡在一条坏掉的 socket 上了")
+        self.assertEqual(waits, [fsdpilot.RECONNECT_DELAYS[0]], "没有安排重连")
+        self.assertIn('reconnecting', [state for state, _ in states])
+
+    def test_a_receive_error_is_logged_with_its_type(self):
+        pilot = fsdpilot.FSDPilot("fsd.example", "CCA1501", "1000", "pw")
+
+        class Resetting:
+            def settimeout(self, timeout):
+                pass
+
+            def recv(self, size):
+                raise ConnectionResetError(10054, "reset")
+
+        pilot._sock = Resetting()
+        with self.assertLogs("fsd", logging.INFO) as logs:
+            self.assertEqual(pilot._read_packet(timeout=0.1), "")
+        self.assertIn("ConnectionResetError", "\n".join(logs.output))
+        self.assertIn("10054", "\n".join(logs.output))
+
+    def test_eof_is_logged_as_eof(self):
+        pilot = fsdpilot.FSDPilot("fsd.example", "CCA1501", "1000", "pw")
+
+        class Closed:
+            def settimeout(self, timeout):
+                pass
+
+            def recv(self, size):
+                return b""
+
+        pilot._sock = Closed()
+        with self.assertLogs("fsd", logging.INFO) as logs:
+            self.assertEqual(pilot._read_packet(timeout=0.1), "")
+        self.assertIn("EOF", "\n".join(logs.output))
+
+
+class FastPositionTest(unittest.TestCase):
+    """协议版本 101：收 ^ / #SL / #ST，别人的 Velocity 客户端才是 5 Hz。
+
+    报文取自 can-fsd docs/protocol.md 的示例，原样。
+    """
+
+    FAST = ("^DAL1151:40.6354992:-73.7795597:16.81:8.10:12582828:"
+            "0.0015:0.0001:0.0005:0.0001:0.0000:-0.0029:-0.40")
+    SLOW = ("#SLPRM4211:41.0844150:-73.1060790:26684.57:26961.66:4269806144:"
+            "196.8918:-1.4936:174.1947:-0.0000:-0.0000:-0.0001:-2.11")
+    STOPPED = "#STDAL2119:40.6453400:-73.7743400:13.56:-0.03:29360076:0.00"
+
+    def setUp(self):
+        self.table = traffic_module.TrafficTable()
+        self.pilot = fsdpilot.FSDPilot("fsd.example", "CCA1501", "1000", "pw",
+                                       traffic=self.table)
+        self.pilot._send = lambda packet: True
+
+    def test_logs_in_at_the_velocity_revision(self):
+        self.assertEqual(fsdpilot.PROTO_REVISION, 101)
+
+    def test_the_revision_is_the_one_can_fsd_forwards_fast_positions_to(self):
+        path = os.path.join(CAN_FSD, "client.go")
+        if not os.path.exists(path):
+            self.skipTest("边上没有 can-fsd")
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+        match = re.search(r"ProtoRevisionVelocity\s*=\s*(\d+)", source)
+        self.assertEqual(int(match.group(1)), fsdpilot.PROTO_REVISION)
+
+    def test_field_counts_match_can_fsd(self):
+        """我们的解析下限和 can-fsd 的 minFields 一致，示例报文也够数。"""
+        path = os.path.join(CAN_FSD, "packet.go")
+        if not os.path.exists(path):
+            self.skipTest("边上没有 can-fsd")
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+        fast = re.search(r"case PacketFastPilotPosition, PacketFastPilotPositionSlow:"
+                         r"\s*return (\d+)", source)
+        stopped = re.search(r"case PacketFastPilotPositionStopped:\s*return (\d+)", source)
+        self.assertEqual(int(fast.group(1)), len(self.FAST.split(":")))
+        self.assertEqual(int(fast.group(1)), len(self.SLOW.split(":")))
+        self.assertEqual(int(stopped.group(1)), len(self.STOPPED.split(":")))
+
+    def test_fast_position(self):
+        self.assertTrue(self.pilot._handle_packet(self.FAST))
+        aircraft = self.table.get("DAL1151")
+        self.assertIsNotNone(aircraft)
+        sample = aircraft.latest
+        self.assertAlmostEqual(sample.latitude, 40.6354992)
+        self.assertAlmostEqual(sample.longitude, -73.7795597)
+        self.assertAlmostEqual(sample.altitude, 16.81)
+        # X 向东、Y 向上、Z 向北；存的是 (北, 东, 上)
+        self.assertEqual(sample.velocity, (0.0005, 0.0015, 0.0001))
+        attitude = fsdpilot.unpack_pbh(12582828)
+        self.assertAlmostEqual(sample.heading, attitude["heading"])
+
+    def test_slow_variant_and_groundspeed(self):
+        self.pilot._handle_packet(self.SLOW)
+        sample = self.table.get("PRM4211").latest
+        self.assertEqual(sample.velocity, (174.1947, 196.8918, -1.4936))
+        expected = round(((174.1947 ** 2 + 196.8918 ** 2) ** 0.5) * 1.943844492)
+        self.assertEqual(sample.groundspeed, expected)
+
+    def test_stopped_variant_has_zero_velocity(self):
+        self.pilot._handle_packet(self.STOPPED)
+        sample = self.table.get("DAL2119").latest
+        self.assertEqual(sample.velocity, (0.0, 0.0, 0.0))
+        self.assertEqual(sample.groundspeed, 0)
+
+    def test_our_own_fast_position_is_ignored(self):
+        self.pilot._handle_packet(self.FAST.replace("DAL1151", "CCA1501"))
+        self.assertNotIn("CCA1501", self.table)
+
+    def test_a_short_packet_is_ignored(self):
+        self.assertTrue(self.pilot._handle_packet("^DAL1151:40.0:-73.0"))
+        self.assertNotIn("DAL1151", self.table)
+
+    def test_send_fast_is_harmless(self):
+        self.assertTrue(self.pilot._handle_packet("$SFSERVER:CCA1501:1"))
+
+    def test_fast_position_first_sight_asks_for_the_type(self):
+        sent = []
+        self.pilot._send = lambda packet: sent.append(packet) or True
+        self.pilot._handle_packet(self.FAST)
+        self.assertIn("#SBCCA1501:DAL1151:PIR", sent)
+
+
+class VelocityTrafficTest(unittest.TestCase):
+    """带速度的样本按速度外推；有它的时候 `@` 不再当位置样本。"""
+
+    def setUp(self):
+        self.table = traffic_module.TrafficTable()
+
+    def fast(self, at, lat=30.0, lon=120.0, velocity=(100.0, 0.0, 5.0)):
+        self.table.update_position("DAL1", latitude=lat, longitude=lon,
+                                   altitude=10000.0, pitch=0.0, bank=0.0,
+                                   heading=0.0, velocity=velocity, now=at)
+
+    def slow(self, at, lat, lon=120.0, squawk=1234):
+        self.table.update_position("DAL1", latitude=lat, longitude=lon,
+                                   altitude=10000, pitch=0.0, bank=0.0,
+                                   heading=0.0, squawk=squawk, now=at)
+
+    def test_dead_reckons_along_the_velocity(self):
+        self.fast(100.0)
+        position = self.table.get("DAL1").position_at(101.0)
+        self.assertAlmostEqual(position["latitude"],
+                               30.0 + 100.0 / traffic_module.METRES_PER_DEGREE)
+        self.assertAlmostEqual(position["altitude"],
+                               10000.0 + 5.0 * traffic_module.FEET_PER_METRE)
+
+    def test_dead_reckoning_is_capped(self):
+        self.fast(100.0)
+        far = self.table.get("DAL1").position_at(1000.0)["latitude"]
+        cap = 30.0 + 100.0 * traffic_module.MAX_VELOCITY_EXTRAPOLATE / \
+            traffic_module.METRES_PER_DEGREE
+        self.assertAlmostEqual(far, cap)
+
+    def test_slow_position_does_not_fight_fast_ones(self):
+        self.fast(100.0, lat=30.0)
+        self.slow(100.1, lat=30.5, squawk=4321)
+        aircraft = self.table.get("DAL1")
+        self.assertEqual(aircraft.latest.latitude, 30.0, "`@` 不该替换带速度的样本")
+        self.assertEqual(aircraft.squawk, 4321, "应答机还是要跟 `@` 走")
+
+    def test_slow_positions_count_again_once_fast_ones_stop(self):
+        self.fast(100.0, lat=30.0)
+        self.slow(100.0 + traffic_module.VELOCITY_FRESH + 1, lat=30.5)
+        self.assertEqual(self.table.get("DAL1").latest.latitude, 30.5)
+
+    def test_vertical_speed_comes_from_the_velocity(self):
+        self.fast(100.0, velocity=(0.0, 0.0, 5.08))
+        self.assertAlmostEqual(self.table.get("DAL1").vertical_speed,
+                               5.08 * traffic_module.FEET_PER_METRE * 60.0)
+
+
+class DuplicateSampleTest(unittest.TestCase):
+    """发送方把同一份快照重复发几次，不能被当成"停下来了"。"""
+
+    def setUp(self):
+        self.table = traffic_module.TrafficTable()
+
+    def add(self, at, lat, altitude=10000):
+        self.table.update_position("CES1", latitude=lat, longitude=120.0,
+                                   altitude=altitude, pitch=0.0, bank=0.0,
+                                   heading=0.0, groundspeed=250, now=at)
+
+    def test_a_repeated_snapshot_is_not_a_new_sample(self):
+        self.add(100.0, 30.0)
+        self.add(101.0, 30.01)
+        self.add(101.2, 30.01)          # 同一份快照又来了
+        self.add(101.4, 30.01)
+        aircraft = self.table.get("CES1")
+        self.assertEqual(aircraft.previous.time, 100.0)
+        self.assertEqual(aircraft.latest.time, 101.0)
+        # 两点之间的速度还在，飞机继续往前走，而不是停在 30.01
+        self.assertGreater(aircraft.position_at(101.4)["latitude"], 30.01)
+
+    def test_the_next_real_update_follows_on(self):
+        self.add(100.0, 30.0)
+        self.add(101.0, 30.01)
+        self.add(101.2, 30.01)
+        self.add(102.0, 30.02)
+        aircraft = self.table.get("CES1")
+        self.assertEqual(aircraft.previous.time, 101.0)
+        self.assertEqual(aircraft.latest.time, 102.0)
+
+    def test_an_aircraft_that_really_stopped_does_stop(self):
+        self.add(100.0, 30.0)
+        self.add(101.0, 30.01)
+        later = 101.0 + traffic_module.DUPLICATE_WINDOW + 0.1
+        self.add(later, 30.01)
+        aircraft = self.table.get("CES1")
+        self.assertEqual(aircraft.latest.time, later)
+        self.assertAlmostEqual(aircraft.position_at(later + 1)["latitude"], 30.01)
+
+    def test_an_altitude_change_is_not_a_duplicate(self):
+        self.add(100.0, 30.0, altitude=10000)
+        self.add(100.2, 30.0, altitude=10010)
+        self.assertEqual(self.table.get("CES1").latest.altitude, 10010)
+
+    def test_repeats_keep_the_aircraft_alive(self):
+        """重复样本不进 latest，但对方还在线，prune 不能把它清掉。"""
+        self.add(100.0, 30.0)
+        for i in range(1, 100):
+            self.add(100.0 + i * 0.2, 30.0)
+        now = 100.0 + 99 * 0.2 + 1.0
+        self.assertEqual(self.table.prune(now=now), [])
+
+
+class TrafficClockTest(unittest.TestCase):
+    """时间戳用高分辨率单调钟，打平的时候新的样本胜出。"""
+
+    def setUp(self):
+        self.table = traffic_module.TrafficTable()
+
+    def add(self, at, lat):
+        self.table.update_position("CES1", latitude=lat, longitude=120.0,
+                                   altitude=10000, pitch=0.0, bank=0.0,
+                                   heading=0.0, now=at)
+
+    def test_the_default_clock_is_perf_counter(self):
+        before = time.perf_counter()
+        self.table.update_position("CES1", latitude=30.0, longitude=120.0,
+                                   altitude=10000, pitch=0.0, bank=0.0, heading=0.0)
+        after = time.perf_counter()
+        self.assertTrue(before <= self.table.get("CES1").latest.time <= after)
+
+    def test_a_tied_timestamp_keeps_the_newer_sample(self):
+        self.add(100.0, 30.0)
+        self.add(100.2, 30.1)
+        self.add(100.2, 30.2)           # 同一次 recv 读出来的下一个包
+        aircraft = self.table.get("CES1")
+        self.assertEqual(aircraft.latest.latitude, 30.2)
+        self.assertEqual(aircraft.previous.latitude, 30.0)
+        self.assertGreater(aircraft.latest.time, aircraft.previous.time)
+
+    def test_the_first_type_request_is_not_skipped_early_in_uptime(self):
+        """单调钟的零点不固定，info_requested 不能从 0 起算。"""
+        asked = []
+        table = traffic_module.TrafficTable(on_request_info=asked.append)
+        table.update_position("CES1", latitude=30.0, longitude=120.0, altitude=0,
+                              pitch=0.0, bank=0.0, heading=0.0, now=5.0)
+        self.assertEqual(asked, ["CES1"])
 
 
 if __name__ == "__main__":

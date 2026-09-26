@@ -8,6 +8,14 @@
 
     fsdpilot  --on_traffic-->  TrafficTable  --snapshot-->  插件（画 + TCAS）
 
+位置从两种包来：`@`（所有客户端）和协议版本 101 的快速位置 `^` / `#SL` /
+`#ST`（VATSIM Velocity 客户端，带速度矢量）。带速度的样本按速度外推，不靠
+前后两点猜；有新鲜的带速度样本时，`@` 只更新应答机和地速，不再当位置样本，
+免得两种精度的包交替进来让飞机来回抖。
+
+时间一律用 `clock()`（perf_counter）。time.time() 在 Windows 上只有 15.6 ms
+的分辨率，同一次 recv 里读出来的两个包常常拿到同一个时间戳。
+
 机型从哪来：`@` 包里没有。要靠 `#SB … PIR` 问对方，对方回
 `PI:GEN:EQUIPMENT=B738:AIRLINE=CCA`。在拿到之前先按通用模型画，拿到之后再换
 ——所以 `Aircraft.model_dirty` 存在，让渲染端知道该重新匹配了。
@@ -29,19 +37,35 @@ PLANE_INFO_RETRY = 30.0
 # 隔这么久重新要一次对方的配置（灯光/襟翼/起落架）。协议里没有"变了推一条"，
 # 只能轮询；不问的话所有他机永远全程关灯、光杆落地。
 CONFIG_REFRESH = 10.0
+# 发送方会把同一份模拟器快照重复发几次（快照刷新比 5 Hz 慢）。和上一个样本
+# 完全一样、又在这么久以内到的，不算新样本——算的话速度被拉成零，飞机一走
+# 一停。超过这个间隔还一样，才是真的停住了。
+DUPLICATE_WINDOW = 2.0
+# 带速度的样本最多外推这么久。#SL 五秒一个，外推要能盖住这个间隔。
+MAX_VELOCITY_EXTRAPOLATE = 6.0
+# 这么久以内收到过带速度的样本，`@` 就不再当位置样本用。
+VELOCITY_FRESH = 7.0
 
 FEET_PER_METRE = 3.280839895
 NM_PER_DEGREE = 60.0
+METRES_PER_DEGREE = 1852.0 * NM_PER_DEGREE
+KNOTS_PER_MPS = 1.943844492
+
+
+def clock():
+    """单调、高分辨率的秒数。这个模块里所有时刻都从这里取。"""
+    return time.perf_counter()
 
 
 class Sample:
     """一个时刻的位置和姿态。"""
 
     __slots__ = ("time", "latitude", "longitude", "altitude",
-                 "pitch", "bank", "heading", "on_ground", "groundspeed")
+                 "pitch", "bank", "heading", "on_ground", "groundspeed",
+                 "velocity")
 
     def __init__(self, time, latitude, longitude, altitude,
-                 pitch, bank, heading, on_ground, groundspeed):
+                 pitch, bank, heading, on_ground, groundspeed, velocity=None):
         self.time = time
         self.latitude = latitude
         self.longitude = longitude
@@ -51,6 +75,17 @@ class Sample:
         self.heading = heading
         self.on_ground = on_ground
         self.groundspeed = groundspeed    # 节
+        # (北, 东, 上)，米每秒。只有快速位置包带；`@` 包是 None。
+        self.velocity = velocity
+
+    def same_place(self, other):
+        """位置和姿态完全一样——发送方重复发了同一份快照。"""
+        return (self.latitude == other.latitude
+                and self.longitude == other.longitude
+                and self.altitude == other.altitude
+                and self.pitch == other.pitch
+                and self.bank == other.bank
+                and self.heading == other.heading)
 
 
 def _interpolate_angle(a, b, ratio):
@@ -70,7 +105,11 @@ class Aircraft:
         self.latest = None
         # 建表时刻。机型先于位置到达的那些 latest 是 None，prune 按这个给
         # 它们留一段宽限，不然半秒后就被当成"太久没消息"清掉了。
-        self.created = time.time()
+        self.created = clock()
+        # 最近一次收到它任何位置包的时刻。重复样本不进 latest，但对方显然还
+        # 在线，prune 看的是这个。还没收到过位置时是 None。
+        self.last_seen = None
+        self.last_velocity = None    # 最近一次带速度样本的时刻
 
         # 机型匹配信息，来自 #SB PI:GEN
         self.equipment = ""          # ICAO 机型码，如 B738
@@ -78,8 +117,10 @@ class Aircraft:
         self.livery = ""
         self.csl = ""                # 对方直接指定的 CSL 名
         self.model_dirty = True      # 渲染端该（重新）匹配模型了
-        self.info_requested = 0.0    # 上次发 PIR 的时刻
-        self.config_requested = 0.0  # 上次要 ACC 配置的时刻
+        # 上次发 PIR / 要 ACC 配置的时刻。起点是负无穷：单调钟的零点不固定，
+        # 写 0.0 的话开机不到 30 秒时第一次询问会被跳过。
+        self.info_requested = float("-inf")
+        self.config_requested = float("-inf")
 
         # 来自 $CQ … ACC 的配置，用来驱动动画
         self.gear_down = None
@@ -93,11 +134,35 @@ class Aircraft:
         return bool(self.equipment or self.csl)
 
     def update(self, sample, squawk=None, mode=None):
-        # 同一个时刻的重复包会让插值除零，直接丢掉
-        if self.latest and sample.time <= self.latest.time:
-            return
-        self.previous = self.latest
-        self.latest = sample
+        self.last_seen = (sample.time if self.last_seen is None
+                          else max(self.last_seen, sample.time))
+        latest = self.latest
+        if sample.velocity is not None:
+            self.last_velocity = sample.time
+        elif (latest is not None and self.last_velocity is not None
+                and sample.time - self.last_velocity < VELOCITY_FRESH):
+            # 有新鲜的快速位置包时，`@` 只带来应答机和地速
+            latest.groundspeed = sample.groundspeed
+            sample = None
+
+        if sample is None:
+            pass
+        elif latest is None:
+            self.latest = sample
+        elif sample.time <= latest.time:
+            # 时间戳打平（同一次 recv 读出的两个包）：新的那个替换 latest，
+            # previous 不动。丢掉新的就是丢掉更新的位置；拿它当新一段的话
+            # 两点间隔是零，插值除零。
+            sample.time = latest.time
+            self.latest = sample
+        elif (sample.velocity is None and sample.same_place(latest)
+                and sample.time - latest.time < DUPLICATE_WINDOW):
+            # 同一份快照又发了一遍。当新样本的话前后两点一样，速度被拉成
+            # 零，飞机在两次真正的更新之间停下来。
+            pass
+        else:
+            self.previous = latest
+            self.latest = sample
         if squawk is not None:
             self.squawk = squawk
         if mode is not None:
@@ -120,7 +185,9 @@ class Aircraft:
 
     @property
     def vertical_speed(self):
-        """英尺每分钟。只有两个采样才算得出来。"""
+        """英尺每分钟。带速度的样本直接用；否则要两个采样才算得出来。"""
+        if self.latest and self.latest.velocity is not None:
+            return self.latest.velocity[2] * FEET_PER_METRE * 60.0
         if not (self.previous and self.latest):
             return 0.0
         span = self.latest.time - self.previous.time
@@ -139,7 +206,7 @@ class Aircraft:
             return None
         previous = self.previous
         if not previous or latest.time <= previous.time:
-            return self._as_dict(latest)
+            return self._dead_reckon(self._as_dict(latest), latest, now)
 
         span = latest.time - previous.time
         ratio = (now - previous.time) / span
@@ -156,7 +223,7 @@ class Aircraft:
         elif longitude < -180.0:
             longitude += 360.0
 
-        return {
+        return self._dead_reckon({
             "latitude": previous.latitude + (latest.latitude - previous.latitude) * ratio,
             "longitude": longitude,
             "altitude": previous.altitude + (latest.altitude - previous.altitude) * ratio,
@@ -165,7 +232,29 @@ class Aircraft:
             "heading": _interpolate_angle(previous.heading, latest.heading, ratio),
             "on_ground": latest.on_ground,
             "groundspeed": latest.groundspeed,
-        }
+        }, latest, now)
+
+    @staticmethod
+    def _dead_reckon(position, latest, now):
+        """latest 带速度的话，位置按速度从 latest 往前推；姿态照旧。
+
+        对方报的速度比两点连线准：两点之间还夹着发送方快照的刷新抖动。
+        """
+        if latest.velocity is None:
+            return position
+        north, east, up = latest.velocity
+        elapsed = max(0.0, min(MAX_VELOCITY_EXTRAPOLATE, now - latest.time))
+        latitude = latest.latitude + north * elapsed / METRES_PER_DEGREE
+        cos_lat = max(1e-6, math.cos(math.radians(latest.latitude)))
+        longitude = latest.longitude + east * elapsed / (METRES_PER_DEGREE * cos_lat)
+        if longitude > 180.0:
+            longitude -= 360.0
+        elif longitude < -180.0:
+            longitude += 360.0
+        position["latitude"] = latitude
+        position["longitude"] = longitude
+        position["altitude"] = latest.altitude + up * elapsed * FEET_PER_METRE
+        return position
 
     @staticmethod
     def _as_dict(sample):
@@ -202,9 +291,14 @@ class TrafficTable:
 
     def update_position(self, callsign, latitude, longitude, altitude,
                         pitch, bank, heading, on_ground=False,
-                        groundspeed=0, squawk=None, mode=None, now=None):
-        """收到一个 `@` 位置包。"""
-        now = now if now is not None else time.time()
+                        groundspeed=0, squawk=None, mode=None, now=None,
+                        velocity=None):
+        """收到一个位置包。
+
+        `velocity` 是 (北, 东, 上) 米每秒，只有快速位置包（`^` / `#SL` /
+        `#ST`）才有；`@` 包不传。
+        """
+        now = now if now is not None else clock()
         with self._lock:
             aircraft = self.aircraft.get(callsign)
             if aircraft is None:
@@ -214,7 +308,8 @@ class TrafficTable:
                 # 留在 INFO——飞机什么时候消失的，是查问题要看的
                 log.debug("new aircraft %s", callsign)
             aircraft.update(Sample(now, latitude, longitude, altitude, pitch,
-                                   bank, heading, on_ground, groundspeed),
+                                   bank, heading, on_ground, groundspeed,
+                                   velocity=velocity),
                             squawk=squawk, mode=mode)
             needs_info = (not aircraft.has_plane_info
                           and now - aircraft.info_requested > PLANE_INFO_RETRY)
@@ -285,15 +380,18 @@ class TrafficTable:
     def prune(self, now=None):
         """清掉太久没消息的。返回被清掉的呼号。
 
-        latest 还是 None 的是"机型先到、位置未到"的（set_plane_info 特意留住
+        看的是最近一次收到位置包的时刻（last_seen），不是 latest 的时刻：
+        重复的快照不进 latest，但说明对方还在。
+
+        还没收到过位置的是"机型先到、位置未到"的（set_plane_info 特意留住
         它们），按建表时刻给同样的宽限——立刻清掉的话，PI:GEN 白收了，等位置
         到达时机型又得重新问一轮。
         """
-        now = now if now is not None else time.time()
+        now = now if now is not None else clock()
         with self._lock:
             gone = [callsign for callsign, aircraft in self.aircraft.items()
-                    if now - ((aircraft.latest.time if aircraft.latest
-                               else aircraft.created)) > STALE_AFTER]
+                    if now - (aircraft.created if aircraft.last_seen is None
+                              else aircraft.last_seen) > STALE_AFTER]
             for callsign in gone:
                 del self.aircraft[callsign]
         for callsign in gone:
@@ -306,7 +404,7 @@ class TrafficTable:
         origin 是本机 (纬度, 经度)。给了就按距离排序并可以截断——TCAS 只有 64
         个位置，飞机比这多的时候必须先扔远的，不能随便扔。
         """
-        now = now if now is not None else time.time()
+        now = now if now is not None else clock()
         # 整个快照都在锁里做：全是字典和算术，没有 IO。原来只锁着取列表，
         # 后面读 lights 时 FSD 线程一条 set_config 更新进来就是
         # RuntimeError: dictionary changed size during iteration，丢一帧。

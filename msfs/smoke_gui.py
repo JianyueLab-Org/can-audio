@@ -8,6 +8,7 @@
 
 import os
 import sys
+import threading
 import time
 from unittest import mock
 
@@ -238,6 +239,56 @@ def main():
         assert window.connect_button.text() == t("connect.disconnect"), \
             window.connect_button.text()
     check("网络失败时语音继续", fsd_error_keeps_voice)
+
+    class FakeLink:
+        """FSD / 语音的替身：只记下有没有被 stop()。"""
+
+        def __init__(self):
+            self.stopped = threading.Event()
+
+        def stop(self, *args, **kwargs):
+            self.stopped.set()
+
+        def update_position(self, snapshot):
+            pass
+
+        def set_frequency(self, value):
+            pass
+
+    def voice_offline_keeps_fsd():
+        # 语音服务器一抖，飞机不能从网络上消失
+        fsd, voice = FakeLink(), FakeLink()
+        window.fsd, window.voice = fsd, voice
+        try:
+            window.on_voice_status("offline", "被服务器踢下线")
+            assert window.fsd is fsd, "FSD 不该被收掉"
+            assert not fsd.stopped.is_set(), "FSD 不该被 stop()"
+            assert window.voice is None, "语音那条应当收掉"
+            assert voice.stopped.wait(2), "被踢那条路径 Voice 不会自己 stop()，界面要收"
+            assert window.connect_button.text() == t("connect.disconnect"), \
+                window.connect_button.text()
+        finally:
+            window.fsd = window.voice = None
+    check("语音下线时网络继续", voice_offline_keeps_fsd)
+
+    def fsd_offline_keeps_voice():
+        voice = FakeLink()
+        window.fsd, window.voice = None, voice
+        try:
+            window.on_fsd_status("offline", "重连超时")
+            assert window.voice is voice, "语音不该被收掉"
+            assert not voice.stopped.is_set(), "语音不该被 stop()"
+        finally:
+            window.voice = None
+    check("网络下线时语音继续", fsd_offline_keeps_voice)
+
+    def last_link_gone_disconnects():
+        window.fsd, window.voice = None, FakeLink()
+        window.on_voice_status("offline", "重连用尽")
+        assert window.voice is None and window.fsd is None
+        assert window.connect_button.text() == t("connect.connect"), \
+            window.connect_button.text()
+    check("两条都没了才整个断开", last_link_gone_disconnects)
 
     print("指示灯：")
     check("TX 点亮", lambda: window.tx_light.set_lit(True))

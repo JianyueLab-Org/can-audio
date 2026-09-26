@@ -78,6 +78,23 @@ SIMVARS = {
     "light_nav": "LIGHT_NAV",
 }
 
+# 每一轮都读的那几个：位置包里会动的量。其余的（无线电、应答机、灯光、襟翼……）
+# 轮流读，每轮读 SLOW_PER_POLL 个。
+#
+# 原因在 Python-SimConnect 的读法：AircraftRequests.get() 每个 SimVar 都是
+# 一次独立的 RequestDataOnSimObjectType，然后 `time.sleep(.01)` 轮询到结果
+# 回来（SimConnect.py 的 get_data）。Windows 上 sleep 的粒度是 15.6 ms，所以
+# 一个 SimVar 至少一两个 tick；二十五个串着读，一轮要 0.4～0.8 秒，模拟器
+# 一卡更久。位置包 5 Hz，于是连着好几个包是同一份快照。只把会动的九个放进
+# 每一轮，一轮的读数从 25 个降到 9 + 4 个。
+#
+# indicated_altitude 也在这里：pressure_delta() 拿它和真高相减，两个不是同一
+# 时刻读的话，爬升中每落后一秒就差出一截垂直速度。
+FAST_SIMVARS = ("latitude", "longitude", "altitude", "indicated_altitude",
+                "groundspeed", "pitch", "bank", "heading", "on_ground")
+SLOW_SIMVARS = tuple(name for name in SIMVARS if name not in FAST_SIMVARS)
+SLOW_PER_POLL = 4
+
 
 # 标准大气压，高度表拨到这个值时"指示高度"就是气压高度。
 STANDARD_PRESSURE_INHG = 29.92
@@ -179,6 +196,7 @@ class SimLink:
         self._thread = None
         self._lock = threading.Lock()
         self._connected = False
+        self._slow_cursor = 0       # 轮流读的那一组读到哪了
 
     # ---------- 状态 ----------
     def _state(self, connected, message):
@@ -302,7 +320,9 @@ class SimLink:
         """
         values = {}
         failures = 0
-        for name, simvar in SIMVARS.items():
+        names = self._names_this_round()
+        for name in names:
+            simvar = SIMVARS[name]
             # 逐个兜底：个别机模上某个 SimVar 会抛（包对不认识的名字也抛），
             # 让它把整轮拖垮的话，连接每 3 秒推倒重来一次，位置包一停一停
             try:
@@ -313,7 +333,7 @@ class SimLink:
                 continue
             if value is not None:
                 values[name] = value
-        if failures and failures >= len(SIMVARS):
+        if failures and failures >= len(names):
             # 全军覆没才是连接真的没了
             return FAILED
 
@@ -328,6 +348,22 @@ class SimLink:
             self.values.update(values)
             self.last_update = time.time()
         return OK
+
+    def _names_this_round(self):
+        """这一轮要读哪些 SimVar。
+
+        还没有任何数据时（启动后第一次读到之前）整份读一遍，第一个快照就是完整的；
+        之后每轮读 FAST_SIMVARS 加上轮到的 SLOW_PER_POLL 个慢变量。
+        """
+        with self._lock:
+            have_values = bool(self.values)
+        if not have_values:
+            return tuple(SIMVARS)
+        start = self._slow_cursor
+        chunk = tuple(SLOW_SIMVARS[(start + i) % len(SLOW_SIMVARS)]
+                      for i in range(min(SLOW_PER_POLL, len(SLOW_SIMVARS))))
+        self._slow_cursor = (start + SLOW_PER_POLL) % len(SLOW_SIMVARS)
+        return FAST_SIMVARS + chunk
 
     # ---------- 取值 ----------
     def snapshot(self):

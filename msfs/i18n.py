@@ -152,6 +152,13 @@ TEXT = {
     "msg.sim":              {"zh": "[MSFS] {message}", "en": "[MSFS] {message}"},
     "msg.net":              {"zh": "[网络] {message}", "en": "[Network] {message}"},
     "msg.voice":            {"zh": "[语音] {message}", "en": "[Voice] {message}"},
+    # 一条链路下线不带走另一条。说一句，免得人以为整个客户端都断了
+    "msg.voice_gone_fsd_stays": {"zh": "语音已下线，网络连接保持；要恢复语音请断开后重新连接",
+                                 "en": "Voice went offline; the network connection stays up. "
+                                       "Disconnect and reconnect to get voice back"},
+    "msg.fsd_gone_voice_stays": {"zh": "网络已下线，语音保持连接；要重新上网络请断开后重新连接",
+                                 "en": "The network connection went offline; voice stays up. "
+                                       "Disconnect and reconnect to get back on the network"},
     "msg.text":             {"zh": "{sender}: {body}", "en": "{sender}: {body}"},
     "msg.text_private":     {"zh": "{sender} → {recipient}: {body}",
                              "en": "{sender} → {recipient}: {body}"},
@@ -449,11 +456,17 @@ TEXT = {
     "fsd.send_failed":      {"zh": "发送失败: {error}", "en": "Could not send: {error}"},
     "fsd.rejected":         {"zh": "FSD 拒绝登录（{code}）: {message}",
                              "en": "The FSD server refused the login ({code}): {message}"},
-    "fsd.reconnecting":     {"zh": "与 FSD 的连接断开，正在重连（{attempt}/{limit}）",
-                             "en": "Lost the FSD connection — reconnecting "
-                                   "({attempt}/{limit})"},
-    "fsd.give_up":          {"zh": "与 FSD 断开后重连 {limit} 次都没成功，已下线",
-                             "en": "Reconnected to FSD {limit} times without success — "
+    "fsd.reconnecting":     {"zh": "与 FSD 的连接断开，{delay} 秒后重连（第 {attempt} 次）",
+                             "en": "Lost the FSD connection — reconnecting in {delay} s "
+                                   "(attempt {attempt})"},
+    # 呼号还被上一条连接占着：服务端要等旧连接超时才放出来，最长一分半左右
+    "fsd.callsign_busy":    {"zh": "呼号 {callsign} 还被上一次的连接占着，"
+                                   "等服务器释放，{delay} 秒后再试",
+                             "en": "The callsign {callsign} is still held by the previous "
+                                   "connection — waiting for the server to release it, "
+                                   "retrying in {delay} s"},
+    "fsd.give_up":          {"zh": "与 FSD 断开后 {seconds} 秒内都没能重连，已下线",
+                             "en": "Could not get back onto FSD within {seconds} s — "
                                    "went offline"},
     "fsd.stopped":          {"zh": "已从 FSD 下线", "en": "Signed off from FSD"},
 
