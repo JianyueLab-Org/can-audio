@@ -404,6 +404,38 @@ def main():
     check("建立设置对话框", lambda: settings_dialog)
     check("设置可应用", lambda: settings_dialog.apply())
 
+    def settings_without_rnnoise():
+        import denoise
+        original = denoise.available
+        denoise.available = lambda: False
+        try:
+            dialog = gui.SettingsDialog(window.settings, window)
+            assert not dialog.denoise_check.isEnabled()
+            dialog.reject()
+        finally:
+            denoise.available = original
+
+    check("设置对话框（降噪不可用）", settings_without_rnnoise)
+
+    def calibration_prompt_only_when_device_or_denoise_changed():
+        """保存设置之后，只有真的换了输入设备或切了降噪才该再问一次校准——
+        单纯换个语言之类的保存不该每次都弹一次校准框。"""
+        cases = [
+            # (old_device, old_denoise, new_device, new_denoise, expected)
+            (None, True, None, True, False),      # 什么都没变
+            (None, True, 3, True, True),           # 换了设备
+            (None, True, None, False, True),       # 切了降噪
+            (None, False, 3, True, True),          # 两个都变了
+        ]
+        for old_device, old_denoise, new_device, new_denoise, expected in cases:
+            got = gui.calibration_state_changed(old_device, old_denoise,
+                                                new_device, new_denoise)
+            assert got == expected, (
+                f"calibration_state_changed({old_device!r}, {old_denoise!r}, "
+                f"{new_device!r}, {new_denoise!r}) = {got}, expected {expected}")
+    check("保存设置后只在设备或降噪变了才提示校准",
+          calibration_prompt_only_when_device_or_denoise_changed)
+
     def preview_button_plays_one():
         _chimes.clear()
         settings_dialog._preview_chime()
