@@ -1303,10 +1303,13 @@ class ControllerWindow(QMainWindow):
         if hasattr(self, 'ptt_watcher'):
             self.ptt_watcher.set_bindings(self.settings.ptt_bindings)
             self.ptt_watcher.start()
+        # 对话框里的"校准"按钮会立即把新基准存进 settings 并落盘，哪怕这次
+        # 设置整体被取消——不管 accepted 与否都要重新套用一次，否则要等凑巧
+        # 换了设备或降噪状态才会生效。
+        _, baseline = self.apply_mic_baseline()
         if accepted:
             self.retranslate()
             if self.settings.mic_volume != old_mic:
-                _, baseline = self.apply_mic_baseline()
                 log.info(micgain.describe_multiplier(
                     old_mic, self.settings.mic_volume, baseline or 0.0))
             if self.voice:

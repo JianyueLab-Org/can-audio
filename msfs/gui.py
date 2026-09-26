@@ -997,10 +997,6 @@ class MsfsWindow(QMainWindow):
             previous_roots = list(self.settings.package_roots or [])
             dialog.apply()
             self.settings.save()
-            if self.settings.mic_volume != old_mic:
-                _, baseline = self.apply_mic_baseline()
-                log.info(micgain.describe_multiplier(
-                    old_mic, self.settings.mic_volume, baseline or 0.0))
             if list(self.settings.package_roots or []) != previous_roots:
                 self._load_models()
             if self.voice:
@@ -1009,6 +1005,13 @@ class MsfsWindow(QMainWindow):
                 except Exception as e:
                     QMessageBox.warning(self, t("dialog.audio"),
                                         t("dialog.audio_failed", error=e))
+        # 对话框里的"校准"按钮会立即把新基准存进 settings 并落盘，哪怕这次
+        # 设置整体被取消——不管 accepted 与否都要重新套用一次，否则要等凑巧
+        # 换了设备或降噪状态才会生效。
+        _, baseline = self.apply_mic_baseline()
+        if accepted and self.settings.mic_volume != old_mic:
+            log.info(micgain.describe_multiplier(
+                old_mic, self.settings.mic_volume, baseline or 0.0))
         self.ptt_watcher.set_bindings(self.settings.ptt_bindings)
         if was_running:
             self.ptt_watcher.start()

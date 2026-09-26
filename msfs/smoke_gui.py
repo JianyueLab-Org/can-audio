@@ -514,6 +514,37 @@ def main():
     check("保存设置后只在设备或降噪变了才提示校准",
           calibration_prompt_only_when_device_or_denoise_changed)
 
+    def recalibrating_reaches_the_live_baseline_even_if_cancelled():
+        """SettingsDialog.calibrate() 一点就把新校准落盘，哪怕这次设置整体
+        被取消，也不能等凑巧换了设备或降噪才把新基准套到发送链路上。"""
+        class RejectedDialog:
+            def __init__(self, settings, parent=None):
+                pass
+
+            def exec(self):
+                return 0    # QDialog.DialogCode.Rejected
+
+        original_dialog = gui.SettingsDialog
+        original_lookup = calibration.input_device_name
+        gui.SettingsDialog = RejectedDialog
+        calibration.input_device_name = lambda index: "Fake Calibration Mic"
+        try:
+            denoise_on = window.settings.denoise_active()
+            window.settings.mic_calibration["Fake Calibration Mic"] = {
+                "gain_db": -6.0, "speech_dbfs": -20.0, "noise_dbfs": -50.0,
+                "denoise": denoise_on,
+            }
+            window.settings.mic_baseline_db = 0.0
+            window.open_settings()
+            assert window.settings.mic_baseline_db == -6.0, (
+                f"取消设置之后基准没有套用: {window.settings.mic_baseline_db}")
+        finally:
+            gui.SettingsDialog = original_dialog
+            calibration.input_device_name = original_lookup
+            window.settings.mic_calibration.pop("Fake Calibration Mic", None)
+    check("取消设置也套用新校准的基准",
+          recalibrating_reaches_the_live_baseline_even_if_cancelled)
+
     def preview_button_plays_one():
         _chimes.clear()
         settings_dialog._preview_chime()
