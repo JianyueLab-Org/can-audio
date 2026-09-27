@@ -551,9 +551,11 @@ class XpcWindow(QMainWindow):
             com1 = snapshot.get("com1")
             self.com1_label.setText(t("radio.com1", frequency=f"{com1:.3f}") if com1
                                     else t("radio.com1_none"))
+            # 显示气压高度（真高加修正量，即 ATC 看到的高度），不是真高
             self.position_label.setText(
                 f"{snapshot['latitude']:.4f} {snapshot['longitude']:.4f}  "
-                f"{snapshot['altitude']} ft  {snapshot['groundspeed']} kt  "
+                f"{snapshot['altitude'] + snapshot.get('pressure_delta', 0)} ft  "
+                f"{snapshot['groundspeed']} kt  "
                 f"{snapshot['heading']:03.0f}°  A{snapshot['squawk']:04d}")
 
             if self.fsd:
