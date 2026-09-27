@@ -169,6 +169,12 @@ class SnapshotTest(unittest.TestCase):
         self.assertTrue(lights["strobe_on"])
         self.assertFalse(lights["beacon_on"])
 
+    def test_logo_light_reported(self):
+        """以前没读 LIGHT LOGO，别人看我们的 Logo 灯永远是关的。"""
+        self.assertFalse(self.link.snapshot()["lights"]["logo_on"])
+        self.link.values["light_logo"] = 1
+        self.assertTrue(self.link.snapshot()["lights"]["logo_on"])
+
     def test_no_values_means_no_snapshot(self):
         self.assertIsNone(simlink.SimLink().snapshot())
 
@@ -2093,6 +2099,21 @@ class SurfaceWriteTest(unittest.TestCase):
         self.assertEqual(self._writes(calls, flaps), [0.25])
         injector.sync([_traffic_entry(gear_down=False, flaps=0.25)])
         self.assertEqual(self._writes(calls, gear), [1.0, 0.0])
+
+    def test_engines_follow_the_senders_config(self):
+        """AI 飞机建出来引擎就在转；对方关着车就把燃烧标志写 0，引擎声才停。"""
+        injector, sim, calls, types = self._claimed()
+        engines = [self._definition(injector, f"engine_{i}") for i in range(1, 5)]
+        injector.sync([_traffic_entry()])
+        self.assertEqual([self._writes(calls, d) for d in engines], [[1.0]] * 4,
+                         "没收到配置时按开车处理")
+        mark = len(calls)
+        injector.sync([_traffic_entry(engines_on=False)])
+        injector.sync([_traffic_entry(engines_on=False)])
+        self.assertEqual([self._writes(calls, d, mark) for d in engines], [[0.0]] * 4)
+        mark = len(calls)
+        injector.sync([_traffic_entry(engines_on=True)])
+        self.assertEqual([self._writes(calls, d, mark) for d in engines], [[1.0]] * 4)
 
     def test_unknown_gear_on_the_ground_is_down(self):
         injector, sim, calls, types = self._claimed()

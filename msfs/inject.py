@@ -13,7 +13,7 @@ X-Plane 还要单独去填 sim/cockpit2/tcas/targets/*。
     地面   RequestDataOnSimObject(objectID, GROUND ALTITUDE / STATIC CG TO GROUND)
     移动   SetDataOnSimObject(objectID, 位置定义)，InjectionLoop 跟着模拟器的
            Frame 事件（没有 Frame 时 30 Hz）
-    装饰   SetDataOnSimObject(objectID, 起落架/襟翼/前轮，各一个定义)，变了才写
+    装饰   SetDataOnSimObject(objectID, 起落架/襟翼/前轮/发动机，各一个定义)，变了才写
     灯光   TransmitClientEvent(objectID, *_LIGHTS_SET / STROBES_SET)，变了才发
     删除   AIRemoveObject(objectID, requestID)
 
@@ -59,7 +59,7 @@ FRAME_EVENT_ID = 90100
 # 地面数据用的数据定义号，接在位置定义（definition_id）后面
 GROUND_DEFINITION_OFFSET = 1         # GROUND ALTITUDE，每 GROUND_INTERVAL 个模拟帧一次
 HEIGHT_DEFINITION_OFFSET = 2         # STATIC CG TO GROUND，只要一次
-SURFACE_DEFINITION_OFFSET = 3        # 起落架/襟翼/前轮，每个字段一个定义
+SURFACE_DEFINITION_OFFSET = 3        # 起落架/襟翼/前轮/发动机，每个字段一个定义
 # SimConnect.h 的 SIMCONNECT_PERIOD_*
 PERIOD_NEVER = 0
 PERIOD_ONCE = 1
@@ -91,7 +91,7 @@ MAX_MODEL_HEIGHT = 40.0
 # 超时后照样用通用模型建出来。
 MODEL_WAIT = 3.0
 
-# 起落架/襟翼/前轮。都是装饰，每个字段单独一个数据定义：SetDataOnSimObject
+# 起落架/襟翼/前轮/发动机。都是装饰，每个字段单独一个数据定义：SetDataOnSimObject
 # 里有一个字段不可写，**整条**写入都会失败，混进位置定义的话飞机就冻住了
 # （见 _Definition 里 SIM ON GROUND 那段）。被模拟器拒过的字段记一次日志、
 # 以后不再写。
@@ -100,6 +100,13 @@ SURFACE_FIELDS = (
     ("flaps_left", b"TRAILING EDGE FLAPS LEFT PERCENT", b"percent over 100"),
     ("flaps_right", b"TRAILING EDGE FLAPS RIGHT PERCENT", b"percent over 100"),
     ("nose_wheel", b"GEAR CENTER STEER ANGLE", b"percent over 100"),
+    # 发动机。AICreateNonATCAircraft 建出来的飞机引擎都在转，对方关着车也
+    # 听得到引擎声。写 0 同时把转速清零（SDK 文档）。没有第三、四台发动机
+    # 的机型写了也不出错。
+    ("engine_1", b"GENERAL ENG COMBUSTION:1", b"bool"),
+    ("engine_2", b"GENERAL ENG COMBUSTION:2", b"bool"),
+    ("engine_3", b"GENERAL ENG COMBUSTION:3", b"bool"),
+    ("engine_4", b"GENERAL ENG COMBUSTION:4", b"bool"),
 )
 # 前轮角度（度）换成满舵的比例时假定的满舵角。只是个近似，装饰用。
 NOSE_WHEEL_FULL_DEFLECTION = 60.0
@@ -918,7 +925,7 @@ class TrafficInjector:
         return adjusted
 
     def _write_surfaces(self, callsign, record, object_id, entry):
-        """起落架/襟翼/前轮：值变了才写，每个字段一次 SetDataOnSimObject。"""
+        """起落架/襟翼/前轮/发动机：值变了才写，每个字段一次 SetDataOnSimObject。"""
         on_ground = bool(entry.get("on_ground"))
         gear = entry.get("gear_down")
         if gear is None and on_ground:
@@ -932,6 +939,9 @@ class TrafficInjector:
             "flaps_right": flaps,
             "nose_wheel": wheel if on_ground else 0.0,
         }
+        engines = 1.0 if entry.get("engines_on", True) else 0.0
+        for index in range(1, 5):
+            wanted[f"engine_{index}"] = engines
         written = record.get("surfaces")
         if written is None:
             written = record["surfaces"] = {}
