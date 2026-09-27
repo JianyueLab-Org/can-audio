@@ -1417,6 +1417,35 @@ class TakeControlTest(unittest.TestCase):
         return [c for c in calls
                 if c[0] in ("transmit", "release") and c[1] == object_id]
 
+    def test_lights_are_switched_on_change_only(self):
+        """他机的灯走 *_SET 事件发给那一架；第一次全发，之后变了才发。"""
+        injector, sim, calls = self._fake()
+        injector._map_light_events()
+        events = {key: event_id for key, event_id, _ in injector._light_events}
+        self.assertEqual(set(events), {key for key, _ in self.inject.LIGHT_EVENTS})
+
+        entry = self._entry("738")
+        entry["lights"] = {"landing_on": True, "beacon_on": True}
+        injector.sync([entry])
+        self._assign(injector, sim, calls, 4242)
+        del calls[:]
+        injector.sync([entry])
+        lights = {c[2]: c[3] for c in calls
+                  if c[0] == "transmit" and c[2] in events.values()}
+        self.assertEqual(len(lights), len(events), "第一次每盏灯都要发")
+        self.assertEqual(lights[events["landing_on"]], 1)
+        self.assertEqual(lights[events["taxi_on"]], 0)
+
+        del calls[:]
+        injector.sync([entry])
+        self.assertEqual([c for c in calls if c[0] == "transmit"], [])
+
+        entry["lights"] = {"landing_on": False, "beacon_on": True}
+        injector.sync([entry])
+        switched = [c for c in calls if c[0] == "transmit"]
+        self.assertEqual([(c[1], c[2], c[3]) for c in switched],
+                         [(4242, events["landing_on"], 0)])
+
     def test_the_freeze_events_are_mapped_once_at_setup(self):
         injector, sim, calls = self._fake()
         maps = [c for c in calls if c[0] == "map"]

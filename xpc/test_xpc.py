@@ -407,6 +407,99 @@ class PacketHandlingTest(unittest.TestCase):
         self.assertAlmostEqual(aircraft.flaps, 0.4)
         self.assertTrue(aircraft.lights["strobe_on"])
 
+    def test_capabilities_advertise_aircraft_config(self):
+        """xPilot/vPilot 只向 CAPS 里报了 ACCONFIG=1 的客户端要 ACC。"""
+        sent = []
+        self.pilot._send = sent.append
+        self.pilot._handle_packet("$CQCES2345:CCA1501:CAPS")
+        self.assertIn(":ACCONFIG=1", sent[0])
+
+    def test_config_request_carries_the_standard_body(self):
+        sent = []
+        self.pilot._send = sent.append
+        self.pilot.request_config("CES2345")
+        self.assertEqual(sent, ['$CQCCA1501:CES2345:ACC:{"request":"full"}'])
+
+    def test_standard_config_request_is_answered_in_kind(self):
+        """{"request":"full"} 的回答走 $CQ，配置包在 "config" 里（protocol.md 的 ACC）。"""
+        sent = []
+        self.pilot.update_position({
+            "gear_down": False, "flaps": 0.25, "spoilers": False,
+            "lights": {"landing_on": True, "taxi_on": False},
+            "engines_on": True, "on_ground": False,
+        })
+        self.pilot._send = sent.append
+        self.pilot._handle_packet('$CQCES2345:CCA1501:ACC:{"request":"full"}')
+        self.assertTrue(sent[0].startswith("$CQCCA1501:CES2345:ACC:"))
+        config = json.loads(sent[0].split(":ACC:", 1)[1])["config"]
+        self.assertTrue(config["is_full_data"])
+        self.assertTrue(config["lights"]["landing_on"])
+        self.assertEqual(config["flaps_pct"], 25)
+        self.assertFalse(config["gear_down"])
+
+    def test_standard_config_reply_reaches_the_traffic_table(self):
+        """xPilot 的回答是 $CQ…:ACC:{"config":{...}}，以前被当成请求丢掉了。"""
+        table = traffic_module.TrafficTable()
+        table.update_position("CES2345", latitude=31, longitude=121,
+                              altitude=1000, pitch=0, bank=0, heading=0)
+        self.pilot.traffic = table
+        payload = json.dumps({"config": {"is_full_data": True, "gear_down": True,
+                                         "flaps_pct": 40,
+                                         "lights": {"landing_on": True}}})
+        self.pilot._handle_packet(f"$CQCES2345:CCA1501:ACC:{payload}")
+        aircraft = table.get("CES2345")
+        self.assertTrue(aircraft.lights["landing_on"])
+        self.assertAlmostEqual(aircraft.flaps, 0.4)
+
+    def test_broadcast_config_update_reaches_the_traffic_table(self):
+        """开灯是广播给 @94836 的增量，只带变了的键。"""
+        table = traffic_module.TrafficTable()
+        table.update_position("CES2345", latitude=31, longitude=121,
+                              altitude=1000, pitch=0, bank=0, heading=0)
+        self.pilot.traffic = table
+        table.set_config("CES2345", {"lights": {"taxi_on": True}})
+        self.pilot._handle_packet(
+            '$CQCES2345:@94836:ACC:{"config":{"lights":{"landing_on":true}}}')
+        aircraft = table.get("CES2345")
+        self.assertTrue(aircraft.lights["landing_on"])
+        self.assertTrue(aircraft.lights["taxi_on"])
+
+    def test_broadcast_request_is_not_answered(self):
+        sent = []
+        self.pilot.update_position({"lights": {}})
+        self.pilot._send = sent.append
+        self.pilot._handle_packet('$CQCES2345:@94836:ACC:{"request":"full"}')
+        self.assertEqual(sent, [])
+
+    def test_own_config_is_broadcast_on_change_only(self):
+        """第一次全量，之后只发变了的键，没变不发。"""
+        sent = []
+        self.pilot._send = sent.append
+        state = {"gear_down": True, "flaps": 0.0, "on_ground": True,
+                 "lights": {"landing_on": False, "taxi_on": True}}
+        self.pilot.update_position(dict(state))
+        self.pilot._broadcast_config()
+        first = json.loads(sent[-1].split(":ACC:", 1)[1])["config"]
+        self.assertTrue(sent[-1].startswith("$CQCCA1501:@94836:ACC:"))
+        self.assertTrue(first["is_full_data"])
+
+        self.pilot._broadcast_config()
+        self.assertEqual(len(sent), 1)
+
+        state["lights"] = {"landing_on": True, "taxi_on": True}
+        self.pilot.update_position(dict(state))
+        self.pilot._broadcast_config()
+        update = json.loads(sent[-1].split(":ACC:", 1)[1])["config"]
+        self.assertFalse(update["is_full_data"])
+        self.assertTrue(update["lights"]["landing_on"])
+        self.assertNotIn("gear_down", update)
+
+    def test_no_broadcast_before_the_simulator_reports(self):
+        sent = []
+        self.pilot._send = sent.append
+        self.pilot._broadcast_config()
+        self.assertEqual(sent, [])
+
     def test_query_for_someone_else_is_ignored(self):
         sent = []
         self.pilot._send = sent.append
@@ -2270,6 +2363,21 @@ class SnapshotTest(unittest.TestCase):
 
     def test_no_values_means_no_snapshot(self):
         self.assertIsNone(xplane.XPlaneLink().snapshot())
+
+    def test_lights_and_surfaces_are_reported(self):
+        """以前一个灯都没订，ACC 回的 lights 永远是空的，别人看我们全程关灯。"""
+        self.link.values.update({
+            "light_landing": 1.0, "light_taxi": 0.0, "light_beacon": 1.0,
+            "light_strobe": 1.0, "light_nav": 1.0,
+            "gear": 0.0, "flaps": 0.5, "speedbrake": 0.6, "engine_on": 1.0,
+        })
+        snapshot = self.link.snapshot()
+        self.assertTrue(snapshot["lights"]["landing_on"])
+        self.assertFalse(snapshot["lights"]["taxi_on"])
+        self.assertFalse(snapshot["gear_down"])
+        self.assertAlmostEqual(snapshot["flaps"], 0.5)
+        self.assertTrue(snapshot["spoilers"])
+        self.assertTrue(snapshot["engines_on"])
 
     def test_stale_data_is_not_connected(self):
         self.link._connected = True

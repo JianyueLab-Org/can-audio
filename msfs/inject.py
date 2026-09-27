@@ -14,6 +14,7 @@ X-Plane 还要单独去填 sim/cockpit2/tcas/targets/*。
     移动   SetDataOnSimObject(objectID, 位置定义)，InjectionLoop 跟着模拟器的
            Frame 事件（没有 Frame 时 30 Hz）
     装饰   SetDataOnSimObject(objectID, 起落架/襟翼/前轮，各一个定义)，变了才写
+    灯光   TransmitClientEvent(objectID, *_LIGHTS_SET / STROBES_SET)，变了才发
     删除   AIRemoveObject(objectID, requestID)
 
 **objectID 是异步回来的，而且必须自己关联。** 创建函数只是把请求发出去，真正的
@@ -206,6 +207,18 @@ EVENT_FLAG_GROUPID_IS_PRIORITY = 0x00000010
 # 记多少个"接管请求的包号 -> 哪架飞机"，给 EXCEPTION 认领用
 CONTROL_PACKETS_KEPT = 512
 
+# 灯光：ACC 里的键 -> 模拟器事件。*_SET 带 0/1 参数，发给对象号就是开关那一架
+# 的灯。变了才发；建出来后第一次全部发一遍，关着的也发，不留 AI 的默认状态。
+LIGHT_EVENTS = (
+    ("beacon_on", b"BEACON_LIGHTS_SET"),
+    ("landing_on", b"LANDING_LIGHTS_SET"),
+    ("taxi_on", b"TAXI_LIGHTS_SET"),
+    ("nav_on", b"NAV_LIGHTS_SET"),
+    ("strobe_on", b"STROBES_SET"),
+    ("logo_on", b"LOGO_LIGHTS_SET"),
+)
+LIGHT_EVENT_BASE = FREEZE_EVENT_BASE + 100
+
 
 class _Definition:
     """SetDataOnSimObject 用的数据定义。
@@ -255,6 +268,8 @@ class TrafficInjector:
         # 映射成功的冻结事件号。映射失败时是空的，飞机照样建、照样动，只是
         # 不冻结（日志里有一条警告）。
         self._freeze_events = ()
+        # 映射成功的灯光事件：(ACC 键, 事件号, 事件名)
+        self._light_events = ()
         # SimConnect 包号 -> (呼号, 对象号, 哪个请求)。EXCEPTION 只带包号，
         # 靠这张表才说得出是哪架飞机的冻结/释放被拒了。
         self._control_packets = {}
@@ -296,7 +311,8 @@ class TrafficInjector:
         self._install_dispatch()
         self._define_position()
         self._map_freeze_events()
-        # 下面三样都不影响位置写入：失败只记日志，飞机照样建、照样动
+        # 下面几样都不影响位置写入：失败只记日志，飞机照样建、照样动
+        self._map_light_events()
         self._define_ground()
         self._define_surfaces()
         self._subscribe_frames()
@@ -510,6 +526,20 @@ class TrafficInjector:
                 return
             mapped.append((event_id, name.decode()))
         self._freeze_events = tuple(mapped)
+
+    def _map_light_events(self):
+        """把 LIGHT_EVENTS 映射成客户端事件号。只需要做一次；映射不上的那盏灯不开关。"""
+        mapped = []
+        for offset, (key, name) in enumerate(LIGHT_EVENTS):
+            event_id = LIGHT_EVENT_BASE + offset
+            error = self._call("MapClientEventToSimEvent",
+                               self.sim.hSimConnect, event_id, name)
+            if error:
+                log.warning("could not map %s, that light will not be switched "
+                            "on injected traffic: %s", name.decode(), error)
+                continue
+            mapped.append((key, event_id, name.decode()))
+        self._light_events = tuple(mapped)
 
     def _define_ground(self):
         """地面标高和模型离地高度的数据定义。只需要做一次。
@@ -834,6 +864,29 @@ class TrafficInjector:
                                                            object_id, entry, now))
         if self._surface_definitions:
             self._write_surfaces(callsign, record, object_id, entry)
+        if self._light_events:
+            self._write_lights(callsign, record, object_id, entry)
+
+    def _write_lights(self, callsign, record, object_id, entry):
+        """灯光：和上次发的不一样才发 *_SET 事件。"""
+        lights = entry.get("lights") or {}
+        written = record.get("lights")
+        if written is None:
+            written = record["lights"] = {}
+        for key, event_id, name in self._light_events:
+            wanted = bool(lights.get(key))
+            if written.get(key) is wanted:
+                continue
+            written[key] = wanted
+            error = self._call("TransmitClientEvent", self.sim.hSimConnect,
+                               object_id, event_id, 1 if wanted else 0,
+                               GROUP_PRIORITY_HIGHEST,
+                               EVENT_FLAG_GROUPID_IS_PRIORITY)
+            if error:
+                log.warning("could not switch %s on %s (object %d): %s",
+                            name, callsign, object_id, error)
+            else:
+                self._remember_packet(callsign, object_id, name)
 
     def _type_known_or_waited(self, callsign, entry, now):
         """机型问到了，或者已经等够 MODEL_WAIT 了。"""
