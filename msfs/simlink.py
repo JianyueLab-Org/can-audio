@@ -76,6 +76,26 @@ SIMVARS = {
     "light_taxi": "LIGHT_TAXI",
     "light_strobe": "LIGHT_STROBE",
     "light_nav": "LIGHT_NAV",
+    # 快速位置包（`^` / `#SL`）要的速度。VELOCITY WORLD X/Y/Z 是东/上/北，
+    # RequestList.py 按 Feet per second 要。
+    "velocity_east": "VELOCITY_WORLD_X",
+    "velocity_up": "VELOCITY_WORLD_Y",
+    "velocity_north": "VELOCITY_WORLD_Z",
+    # 机体角速度，X 俯仰、Y 偏航、Z 滚转，方向和 PLANE PITCH/BANK DEGREES
+    # 一样（低头、左坡为正），右转为正。RequestList.py 给这三个写的单位是
+    # Feet per second，不对，见 UNIT_OVERRIDES。
+    "pitch_rate": "ROTATION_VELOCITY_BODY_X",
+    "heading_rate": "ROTATION_VELOCITY_BODY_Y",
+    "bank_rate": "ROTATION_VELOCITY_BODY_Z",
+}
+
+# RequestList.py 写错了单位的 SimVar，在第一次读之前换掉。Request 是第一次
+# 取值时才向 SimConnect 登记数据定义的（_deff_test），所以改 definitions[0]
+# 就够了。
+UNIT_OVERRIDES = {
+    "ROTATION_VELOCITY_BODY_X": b"Radians per second",
+    "ROTATION_VELOCITY_BODY_Y": b"Radians per second",
+    "ROTATION_VELOCITY_BODY_Z": b"Radians per second",
 }
 
 # 每一轮都读的那几个：位置包里会动的量。其余的（无线电、应答机、灯光、襟翼……）
@@ -90,11 +110,18 @@ SIMVARS = {
 #
 # indicated_altitude 也在这里：pressure_delta() 拿它和真高相减，两个不是同一
 # 时刻读的话，爬升中每落后一秒就差出一截垂直速度。
+#
+# 速度和角速度也在这里：快速位置包 5 Hz，和位置不是同一轮读的话，别人按这个
+# 速度往前推的起点就是错的。代价是每轮多六次读。
 FAST_SIMVARS = ("latitude", "longitude", "altitude", "indicated_altitude",
-                "groundspeed", "pitch", "bank", "heading", "on_ground")
+                "groundspeed", "pitch", "bank", "heading", "on_ground",
+                "velocity_east", "velocity_up", "velocity_north",
+                "pitch_rate", "heading_rate", "bank_rate")
 SLOW_SIMVARS = tuple(name for name in SIMVARS if name not in FAST_SIMVARS)
 SLOW_PER_POLL = 4
 
+
+METRES_PER_FOOT = 0.3048
 
 # 标准大气压，高度表拨到这个值时"指示高度"就是气压高度。
 STANDARD_PRESSURE_INHG = 29.92
@@ -179,6 +206,17 @@ def xpdr_mode(state, on_ground, groundspeed_kt):
     return XPDR_ONLINE
 
 
+def override_units(requests):
+    """按 UNIT_OVERRIDES 改掉 RequestList.py 里写错的请求单位。"""
+    for name, unit in UNIT_OVERRIDES.items():
+        request = requests.find(name)
+        if request is None:
+            log.warning("SimConnect has no request named %s", name)
+            continue
+        datum, _ = request.definitions[0]
+        request.definitions[0] = (datum, unit)
+
+
 class SimLink:
     """和 MSFS 的连接。
 
@@ -251,6 +289,7 @@ class SimLink:
         # _time 是这个包的缓存窗口（毫秒）。位置一秒要读 5 次，缓存久了会发出
         # 过期的位置；设小一点让它每次都真的去问。
         self._requests = AircraftRequests(self._sim, _time=100)
+        override_units(self._requests)
 
     def _run(self):
         while self.running:
@@ -397,6 +436,17 @@ class SimLink:
             "com2": self._frequency(raw.get("com2")),
             "com1_power": True,
             "on_ground": on_ground,
+            # 快速位置包用：世界速度（东/上/北）米每秒，机体角速度度每秒，
+            # 抬头、右转、右坡为正——和上面的 pitch/bank 一样把 SimVar 的
+            # 符号翻过来。前轮角 SimConnect 只给"最大转角的百分比"，换不成度，
+            # 报 0。
+            "velocity_east": raw.get("velocity_east", 0.0) * METRES_PER_FOOT,
+            "velocity_up": raw.get("velocity_up", 0.0) * METRES_PER_FOOT,
+            "velocity_north": raw.get("velocity_north", 0.0) * METRES_PER_FOOT,
+            "pitch_rate": -math.degrees(raw.get("pitch_rate", 0.0)),
+            "heading_rate": math.degrees(raw.get("heading_rate", 0.0)),
+            "bank_rate": -math.degrees(raw.get("bank_rate", 0.0)),
+            "nose_wheel": 0.0,
             # 下面这些是报给别人做动画用的
             "gear_down": bool(raw.get("gear", 1)),
             "flaps": max(0.0, min(1.0, raw.get("flaps", 0.0) / 100.0)),

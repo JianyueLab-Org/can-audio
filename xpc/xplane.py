@@ -76,6 +76,18 @@ DATAREFS = {
     "com2_legacy":  "sim/cockpit/radios/com2_freq_hz",
     "com1_power":   "sim/cockpit2/radios/actuators/com1_power",
     "on_ground":    "sim/flightmodel/failures/onground_any",
+    # 快速位置包（`^` / `#SL`）要的速度，米每秒。OpenGL 局部坐标：+x 东、
+    # +y 上、+z **南**，所以向北是 -local_vz（xPilot 也是这么发的）。
+    "local_vx":     "sim/flightmodel/position/local_vx",
+    "local_vy":     "sim/flightmodel/position/local_vy",
+    "local_vz":     "sim/flightmodel/position/local_vz",
+    # 机体角速度，度每秒：Q 俯仰（抬头为正）、R 偏航（右转为正）、P 滚转
+    # （右坡为正）
+    "pitch_rate":   "sim/flightmodel/position/Q",
+    "heading_rate": "sim/flightmodel/position/R",
+    "bank_rate":    "sim/flightmodel/position/P",
+    # 前轮转角，度（xPilot 用的同一个）
+    "nose_wheel":   "sim/flightmodel2/gear/tire_steer_actual_deg[0]",
 }
 
 INDEX_TO_NAME = {index: name for index, name in enumerate(DATAREFS)}
@@ -403,6 +415,14 @@ class XPlaneLink:
             "com2": self._frequency(raw.get("com2"), raw.get("com2_legacy")),
             "com1_power": bool(raw.get("com1_power", 1)),
             "on_ground": on_ground,
+            # 快速位置包用：世界速度（东/上/北）米每秒，机体角速度度每秒
+            "velocity_east": raw.get("local_vx", 0.0),
+            "velocity_up": raw.get("local_vy", 0.0),
+            "velocity_north": -raw.get("local_vz", 0.0),
+            "pitch_rate": raw.get("pitch_rate", 0.0),
+            "heading_rate": raw.get("heading_rate", 0.0),
+            "bank_rate": raw.get("bank_rate", 0.0),
+            "nose_wheel": raw.get("nose_wheel", 0.0),
         }
 
     @staticmethod

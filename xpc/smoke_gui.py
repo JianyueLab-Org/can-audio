@@ -349,7 +349,8 @@ def main():
         window.tick()
         window.traffic_tick()
         window.settings.render_traffic = True
-        assert not sent, "关掉之后不该再推"
+        # 关掉时推一帧空的让插件清场（插件自己积分，不清就一直飞），之后不再推
+        assert not any(sent), "关掉之后不该再推飞机"
     check("可以关掉他机渲染", render_can_be_turned_off)
 
     def survives_without_models():

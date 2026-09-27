@@ -156,11 +156,9 @@ class MsfsWindow(QMainWindow):
         self.voice = None
         self.snapshot = None
 
-        # 他机：FSD 线程往表里写，注入循环读出来插值好放进模拟器。
-        # 渲染延迟见 traffic.RENDER_DELAY：每帧直接写进模拟器，要在两个真实
-        # 样本之间插值，不能追着最新样本外推。
-        self.traffic = traffic_module.TrafficTable(
-            render_delay=traffic_module.RENDER_DELAY)
+        # 他机：FSD 线程往表里写，注入循环每一帧把它积分到此刻、写进模拟器
+        # （运动模型见 traffic.Motion）。
+        self.traffic = traffic_module.TrafficTable()
         self.injector = None            # 要等 SimConnect 连上才能建
         # traffic_tick 每 200 ms 更新一次：(本机经纬度, 呼号 -> 模型名)。
         # 注入循环只读这个引用，不碰 _model_cache。
@@ -192,7 +190,8 @@ class MsfsWindow(QMainWindow):
         self.timer.timeout.connect(self.tick)
         self.timer.start(500)
         # 200 ms：把本机位置喂给 FSD（位置包 5 Hz），并给注入循环挑模型。
-        # 写进模拟器的那一步不在这里，在 injection_loop 上（30 Hz）。
+        # 写进模拟器的那一步不在这里，在 injection_loop 上（跟着模拟器的帧，
+        # 没有 Frame 事件时 30 Hz）。
         self.traffic_timer = QTimer(self)
         self.traffic_timer.timeout.connect(self.traffic_tick)
         self.traffic_timer.start(200)
@@ -730,7 +729,9 @@ class MsfsWindow(QMainWindow):
             self._model_cache.clear()
         # 注入器要等 SimConnect 真的连上才能建
         if self.injector is None and self.sim.sim is not None:
-            self.injector = inject.TrafficInjector(self.sim.sim)
+            # 模拟器每画一帧，注入循环醒一次（在 dispatch 线程上只置个事件）
+            self.injector = inject.TrafficInjector(
+                self.sim.sim, on_frame=self.injection_loop.frame)
             if not self.injector.available:
                 self.add_message(t("msg.inject_unavailable"), theme.ACTIVE_COLOR)
 
@@ -745,7 +746,7 @@ class MsfsWindow(QMainWindow):
         self._traffic_plan = (origin, models)
 
     def _inject_frame(self):
-        """注入循环的一帧（不在 Qt 线程上）：插值到此刻，写进模拟器。
+        """注入循环的一帧（不在 Qt 线程上）：积分到此刻，写进模拟器。
 
         sync() 里每架飞机一次 SimConnect 调用；放在 Qt 线程上窗口会"未响应"。
         """

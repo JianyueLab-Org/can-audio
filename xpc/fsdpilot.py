@@ -7,7 +7,8 @@
            #AP{呼号}:SERVER:{CID}:{密码}:{等级}:{协议版本}:{模拟器}:{真实姓名}
     位置   @{应答机模式}:{呼号}:{squawk}:{等级}:{纬度}:{经度}:{高度}:{地速}:{PBH}:{气压差}
     快速   ^{呼号}:{纬度}:{经度}:{真高}:{离地高}:{PBH}:{东}:{上}:{北}:{俯仰率}:{航向率}
-           :{坡度率}:{前轮角}      —— 只收不发。#SL 字段相同，#ST 没有六个速度段
+           :{坡度率}:{前轮角}      —— $SF 打开时 5 Hz。#SL 字段相同，5 秒一个；
+           #ST 没有六个速度段，停着的时候发
     计划   $FP{呼号}:SERVER:{规则}:{机型}:{真空速}:{起飞地}:{预计起飞}:{实际起飞}
            :{巡航高度}:{目的地}:{航路小时}:{航路分钟}:{燃油小时}:{燃油分钟}
            :{备降场}:{备注}:{航路}          —— 一共 17 段，少一段整包被拒
@@ -39,12 +40,21 @@ DEFAULT_PORT = 6809
 # ProtoRevisionVelocity。can-fsd 只把 ^ / #SL / #ST 转给 101 的客户端
 # （broadcast.go 的 broadcastRangedVelocity），报 100 的话 vPilot / xPilot
 # 这类客户端的飞机在我们这里五秒才动一下。101 在服务端另外只多一件事：
-# 附近有别的 101 飞行员时发来 $SF 叫我们发快速位置。我们本来就 5 Hz 发 `@`，
-# 所以 $SF 只记一行日志。
+# 5 海里内有别的 101 飞行员时发来 `$SF…:1` 叫我们发快速位置，6 海里外发
+# `$SF…:0` 叫停（handler.go 的 updateSendFast）。
 PROTO_REVISION = 101
 RATING_OBSERVER = 1
 POSITION_INTERVAL = 0.2       # 每秒 5 次，和 VATSIM 客户端一致
 SLOW_POSITION_INTERVAL = 5.0  # 停在地面上没动时降频
+# 快速位置的节奏，照 xPilot（networkmanager.cpp）：$SF 打开时每 200 ms 一个
+# `^`（停着就是 `#ST`）；不管开没开，每 5 秒一个 `#SL`（在动的时候）。
+# `@` 照旧按上面的节奏发：服务端只按 `@` 更新我们在邮局里的位置和 $SF 判定
+# （handlePilotPosition），快速位置只刷新空闲计时（handleFastPilotPosition）。
+FAST_POSITION_INTERVAL = 0.2
+SLOW_FAST_INTERVAL = 5.0
+# 速度和角速度都小于这个值就算停着（xPilot 的
+# POSITIONAL_VELOCITY_ZERO_TOLERANCE，米每秒 / 弧度每秒）
+STOPPED_TOLERANCE = 0.005
 LOGIN_TIMEOUT = 10.0
 # 掉线后重连按时间算，不按次数算。服务端要等旧连接死透才放出呼号
 # （postoffice.go 的 register 回 `$ER … 1 … Callsign already in use`）：
@@ -128,6 +138,51 @@ def unpack_pbh(packed):
         "heading": (packed >> 2 & mask) * ratio,
         "on_ground": bool(packed & 0x2),
     }
+
+
+def wire_rotation(snapshot):
+    """快照里的机体角速度 -> 快速位置包的三个角速度字段（弧度每秒）。
+
+    快照是抬头、右转、右坡为正（X-Plane 的 Q/R/P 方向）。包里的方向照 xPilot：
+    它发 `-Qrad`、`Rrad`、`-Prad`（xplane_adapter.cpp），也就是 MSFS 的
+    ROTATION VELOCITY BODY X/Y/Z 原样的方向——低头、右转、左坡为正。
+    PBH 的符号约定和这个无关，那是 pack_pbh 的事。
+    """
+    return (-math.radians(snapshot.get("pitch_rate", 0.0)),
+            math.radians(snapshot.get("heading_rate", 0.0)),
+            -math.radians(snapshot.get("bank_rate", 0.0)))
+
+
+def is_stopped(snapshot):
+    """xPilot 的 PositionalVelocityIsZero：速度和角速度都几乎为零。"""
+    velocity = (snapshot.get("velocity_east", 0.0), snapshot.get("velocity_up", 0.0),
+                snapshot.get("velocity_north", 0.0))
+    return all(abs(v) < STOPPED_TOLERANCE
+               for v in velocity + wire_rotation(snapshot))
+
+
+def fast_position_packet(kind, callsign, snapshot):
+    """拼一个 `^` / `#SL` / `#ST`。字段和精度照 xPilot 的 PDUFastPilotPosition。
+
+        0 呼号  1 纬度  2 经度  3 真高（英尺）  4 离地高（英尺）  5 PBH
+        6/7/8 速度 东/上/北（米每秒）  9/10/11 角速度（弧度每秒）  12 前轮角（度）
+
+    `#ST` 没有 6-11 那六段，一共 7 段；另外两种 13 段——和 can-fsd 的
+    minFields 一致，少一段服务端不转。
+    """
+    pbh = pack_pbh(snapshot["pitch"], snapshot["bank"], snapshot["heading"],
+                   snapshot.get("on_ground", False))
+    fields = [f"{kind}{callsign}",
+              f"{snapshot['latitude']:.6f}", f"{snapshot['longitude']:.6f}",
+              f"{float(snapshot['altitude']):.2f}",
+              f"{float(snapshot.get('agl', 0.0)):.2f}", str(pbh)]
+    if kind != "#ST":
+        fields += [f"{snapshot.get('velocity_east', 0.0):.4f}",
+                   f"{snapshot.get('velocity_up', 0.0):.4f}",
+                   f"{snapshot.get('velocity_north', 0.0):.4f}"]
+        fields += [f"{value:.4f}" for value in wire_rotation(snapshot)]
+    fields.append(f"{snapshot.get('nose_wheel', 0.0):.2f}")
+    return ":".join(fields)
 
 
 def callsign_problem(callsign):
@@ -256,6 +311,8 @@ class FSDPilot:
         self._squawk = 2000
         self._xpdr_mode = XPDR_STANDBY
         self._ident_until = 0.0
+        # 服务端的 $SF：附近有别的 101 飞行员，要 5 Hz 的快速位置
+        self.send_fast = False
         self.controllers = {}       # 呼号 -> {frequency, ...}
 
     # ---------- 对外 ----------
@@ -484,6 +541,8 @@ class FSDPilot:
 
     def _connect(self):
         self._broken = None
+        # $SF 是按连接给的，重连之后等服务端重新判
+        self.send_fast = False
         problem = callsign_problem(self.callsign)
         if problem:
             self._failure = FAILURE_FATAL
@@ -537,9 +596,21 @@ class FSDPilot:
         return False
 
     def _loop(self):
-        next_position = 0.0
+        # 登录后先报 `@`，再报一个快速位置（停着就是 #ST），和 xPilot 一样：
+        # 服务端靠 `@` 知道我们在哪、该转给谁；别的 101 客户端从这一刻起就按
+        # 快速位置画我们，不等第一个 $SF
+        now = time.time()
+        next_position = now + self._send_position()
+        next_fast = 0.0
+        next_slow = now + SLOW_FAST_INTERVAL
+        self._send_fast_position(slow=False)
         while self.running and not self.stop_event.is_set():
-            packet = self._read_packet(timeout=0.2) if self._broken is None else ""
+            # 收包的等待不能盖过下一次该发的时刻，否则 200 ms 的节奏会被拖成
+            # 400 ms
+            due = min(next_position, next_slow,
+                      next_fast if self.send_fast else float("inf"))
+            timeout = max(0.01, min(0.2, due - time.time()))
+            packet = self._read_packet(timeout=timeout) if self._broken is None else ""
             if packet == "":
                 broken = self._broken
                 self._status('error', t("fsd.send_failed", error=broken)
@@ -552,6 +623,12 @@ class FSDPilot:
             if now >= next_position:
                 interval = self._send_position()
                 next_position = now + interval
+            if self.send_fast and now >= next_fast:
+                self._send_fast_position(slow=False)
+                next_fast = now + FAST_POSITION_INTERVAL
+            if now >= next_slow:
+                self._send_fast_position(slow=True)
+                next_slow = now + SLOW_FAST_INTERVAL
 
     def _send_position(self):
         """发一个位置包，返回下一次的间隔。"""
@@ -581,6 +658,45 @@ class FSDPilot:
         if snapshot.get("on_ground") and snapshot.get("groundspeed", 0) < 1:
             return SLOW_POSITION_INTERVAL
         return POSITION_INTERVAL
+
+    def _send_fast_position(self, slow):
+        """发一个快速位置包，返回发出的包头（`^` / `#SL` / `#ST`），没发返回 None。
+
+        slow=False 是 200 ms 那一拍：在动发 `^`，停着发 `#ST`。
+        slow=True 是 5 秒那一拍：在动才发 `#SL`，停着什么都不发（`@` 照发）。
+        """
+        with self._lock:
+            snapshot = self._position
+        if not snapshot:
+            return None
+        stopped = is_stopped(snapshot)
+        if slow:
+            if stopped:
+                return None
+            kind = "#SL"
+        else:
+            kind = "#ST" if stopped else "^"
+        self._send(fast_position_packet(kind, self.callsign, snapshot))
+        return kind
+
+    def _set_send_fast(self, enabled):
+        """服务端的 $SF。关掉时补一个包，让别人手里的速度是对的。
+
+        xPilot 关掉时总是补一个 `#ST`；在动的飞机收到零速度会停住，等下一个
+        `#SL` 再被误差速度拽走，所以在动的时候补 `#SL`。
+        """
+        if enabled == self.send_fast:
+            return
+        self.send_fast = enabled
+        log.info("fast position updates %s", "on" if enabled else "off")
+        if not enabled:
+            self._send_fast_position(slow=True) or self._send_stopped()
+
+    def _send_stopped(self):
+        with self._lock:
+            snapshot = self._position
+        if snapshot:
+            self._send(fast_position_packet("#ST", self.callsign, snapshot))
 
     def _read_packet(self, timeout=1):
         """读一个包。超时返回 None，连接关闭返回 ""，空行跳过。"""
@@ -673,9 +789,9 @@ class FSDPilot:
             return True
 
         if head.startswith("$SF"):
-            # 服务端叫我们发快速位置（附近有别的 101 飞行员）。`@` 本来就是
-            # 5 Hz，不另发 ^。
-            log.debug("send-fast request from the server: %s", fields[2:3])
+            # $SFSERVER:{呼号}:{1|0}（handler.go 的 sendSendFast）
+            if len(fields) >= 3 and fields[1].upper() == self.callsign:
+                self._set_send_fast(fields[2].strip() == "1")
             return True
 
         if head.startswith("#SB") and len(fields) >= 3:
@@ -760,13 +876,16 @@ class FSDPilot:
 
         字段（can-fsd docs/protocol.md "Fast Pilot Position"）：
 
-            0 呼号  1 纬度  2 经度  3 真高（英尺，带小数）  4 离地高  5 PBH
-            6/7/8 位置速度 X/Y/Z（米每秒）  9/10/11 角速度  12 前轮角
+            0 呼号  1 纬度  2 经度  3 真高（英尺，带小数）  4 离地高（英尺）
+            5 PBH  6/7/8 位置速度 X/Y/Z（米每秒）  9/10/11 角速度 X/Y/Z
+            （弧度每秒）  12 前轮角（度）
 
         X 是向东、Y 是向上、Z 是向北——xPilot 发的是 local_vx、local_vy、
         -local_vz（X-Plane 的 +Z 朝南），vPilot 取 MSFS 的 VELOCITY WORLD
-        X/Y/Z，同一个方向。`#ST` 是停着的飞机，没有六个速度段，速度就是零。
-        包里没有应答机和地速：地速由水平速度算，应答机沿用 `@` 包带来的。
+        X/Y/Z，同一个方向。角速度按 wire_rotation() 的方向换回抬头/右转/
+        右坡为正、度每秒。`#ST` 是停着的飞机，没有六个速度段，速度就是零，
+        前轮角在第 6 段。包里没有应答机和地速：地速由水平速度算，应答机沿用
+        `@` 包带来的。
         """
         if self.traffic is None:
             return
@@ -774,10 +893,17 @@ class FSDPilot:
             return
         try:
             attitude = unpack_pbh(int(fields[5]) & 0xFFFFFFFF)
+            agl = float(fields[4])
             if stopped:
-                north = east = up = 0.0
+                east = up = north = 0.0
+                rotation = (0.0, 0.0, 0.0)
+                nose_wheel = float(fields[6])
             else:
                 east, up, north = float(fields[6]), float(fields[7]), float(fields[8])
+                rotation = (-math.degrees(float(fields[9])),
+                            math.degrees(float(fields[10])),
+                            -math.degrees(float(fields[11])))
+                nose_wheel = float(fields[12])
             self.traffic.update_position(
                 callsign,
                 latitude=float(fields[1]), longitude=float(fields[2]),
@@ -785,7 +911,8 @@ class FSDPilot:
                 groundspeed=int(round(math.hypot(north, east) * KNOTS_PER_MPS)),
                 pitch=attitude["pitch"], bank=attitude["bank"],
                 heading=attitude["heading"], on_ground=attitude["on_ground"],
-                velocity=(north, east, up))
+                velocity=(east, up, north), rotation=rotation,
+                agl=agl, nose_wheel=nose_wheel)
         except (IndexError, ValueError) as e:
             log.debug("could not parse the fast position packet %s: %s",
                       fields[:1], e)

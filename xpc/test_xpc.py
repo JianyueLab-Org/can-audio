@@ -9,6 +9,7 @@
 import array
 import inspect
 import json
+import math
 import os
 import shutil
 import struct
@@ -2236,6 +2237,33 @@ class SnapshotTest(unittest.TestCase):
         self.link.last_update = 0        # 很久以前
         self.assertFalse(self.link.connected)
 
+    def test_velocity_is_east_up_north(self):
+        """OpenGL 局部坐标的 +z 朝南，向北是 -local_vz（xPilot 也这么发）。"""
+        self.link.values.update({"local_vx": 10.0, "local_vy": 2.0, "local_vz": -50.0})
+        snapshot = self.link.snapshot()
+        self.assertEqual((snapshot["velocity_east"], snapshot["velocity_up"],
+                          snapshot["velocity_north"]), (10.0, 2.0, 50.0))
+
+    def test_rotation_rates_are_q_r_p(self):
+        self.link.values.update({"pitch_rate": 1.5, "heading_rate": -3.0,
+                                 "bank_rate": 4.0, "nose_wheel": 12.0})
+        snapshot = self.link.snapshot()
+        self.assertEqual((snapshot["pitch_rate"], snapshot["heading_rate"],
+                          snapshot["bank_rate"]), (1.5, -3.0, 4.0))
+        self.assertEqual(snapshot["nose_wheel"], 12.0)
+
+    def test_velocity_defaults_to_zero(self):
+        snapshot = self.link.snapshot()
+        for name in ("velocity_east", "velocity_up", "velocity_north",
+                     "pitch_rate", "heading_rate", "bank_rate", "nose_wheel"):
+            self.assertEqual(snapshot[name], 0.0, name)
+
+    def test_the_rate_datarefs_are_degrees_per_second(self):
+        """P/Q/R 是度每秒；Prad/Qrad/Rrad 才是弧度。快照要度。"""
+        self.assertEqual(xplane.DATAREFS["pitch_rate"], "sim/flightmodel/position/Q")
+        self.assertEqual(xplane.DATAREFS["heading_rate"], "sim/flightmodel/position/R")
+        self.assertEqual(xplane.DATAREFS["bank_rate"], "sim/flightmodel/position/P")
+
 
 class TransponderModeTest(unittest.TestCase):
     """待机会在管制端把高度和地速一起抹掉，所以只在飞机确实停着时才当真。
@@ -2328,7 +2356,7 @@ class TrafficReceptionTest(unittest.TestCase):
 
     def test_attitude_is_decoded(self):
         self.pilot._handle_packet(self._position())
-        position = self.table.get("CES2345").position_at(time.time())
+        position = self.table.get("CES2345").state_at(time.perf_counter())
         self.assertAlmostEqual(position["heading"], 271.0, delta=0.4)
         self.assertAlmostEqual(position["bank"], -5.0, delta=0.4)
 
@@ -2431,83 +2459,7 @@ class PlaneInfoExchangeTest(unittest.TestCase):
         self.assertNotIn("CES2345", self.table)
 
 
-class InterpolationTest(unittest.TestCase):
-    """FSD 一秒才 5 个包，不插值飞机会一跳一跳。"""
-
-    def setUp(self):
-        self.table = traffic_module.TrafficTable()
-
-    def _add(self, at, lat, lon, altitude=10000, heading=90.0):
-        self.table.update_position("CES2345", latitude=lat, longitude=lon,
-                                   altitude=altitude, pitch=0.0, bank=0.0,
-                                   heading=heading, groundspeed=250, now=at)
-
-    def test_midpoint(self):
-        self._add(100.0, 30.0, 120.0)
-        self._add(101.0, 30.1, 120.2)
-        position = self.table.get("CES2345").position_at(100.5)
-        self.assertAlmostEqual(position["latitude"], 30.05, places=6)
-        self.assertAlmostEqual(position["longitude"], 120.1, places=6)
-
-    def test_altitude_interpolates(self):
-        self._add(100.0, 30.0, 120.0, altitude=10000)
-        self._add(101.0, 30.0, 120.0, altitude=11000)
-        self.assertAlmostEqual(
-            self.table.get("CES2345").position_at(100.5)["altitude"], 10500, places=3)
-
-    def test_heading_takes_the_short_way(self):
-        # 359° 到 1° 应当往前走 2°，不是倒着走 358°
-        self._add(100.0, 30.0, 120.0, heading=359.0)
-        self._add(101.0, 30.0, 120.0, heading=1.0)
-        self.assertAlmostEqual(
-            self.table.get("CES2345").position_at(100.5)["heading"], 0.0, places=6)
-
-    def test_heading_short_way_downwards(self):
-        self._add(100.0, 30.0, 120.0, heading=10.0)
-        self._add(101.0, 30.0, 120.0, heading=350.0)
-        self.assertAlmostEqual(
-            self.table.get("CES2345").position_at(100.5)["heading"], 0.0, places=6)
-
-    def test_single_sample_is_held(self):
-        self._add(100.0, 30.0, 120.0)
-        self.assertAlmostEqual(
-            self.table.get("CES2345").position_at(105.0)["latitude"], 30.0)
-
-    def test_extrapolation_is_bounded(self):
-        # 对方掉线时飞机该停在原地，不是一直飞出天际
-        self._add(100.0, 30.0, 120.0)
-        self._add(101.0, 30.1, 120.0)
-        far = self.table.get("CES2345").position_at(200.0)["latitude"]
-        self.assertLess(far, 30.5, "外推没有封顶")
-
-    def test_no_backward_extrapolation(self):
-        self._add(100.0, 30.0, 120.0)
-        self._add(101.0, 30.1, 120.0)
-        early = self.table.get("CES2345").position_at(50.0)["latitude"]
-        self.assertAlmostEqual(early, 30.0, places=6)
-
-    def test_duplicate_timestamp_replaces_latest(self):
-        # 同一时刻的两个包（同一次 recv 读出来的）：新的替换 latest，
-        # 不当新的一段——两点间隔是零，插值会除零
-        self._add(100.0, 30.0, 120.0)
-        self._add(100.0, 40.0, 130.0)
-        aircraft = self.table.get("CES2345")
-        self.assertIsNone(aircraft.previous)
-        self.assertAlmostEqual(aircraft.position_at(100.0)["latitude"], 40.0)
-
-    def test_vertical_speed(self):
-        self._add(100.0, 30.0, 120.0, altitude=10000)
-        self._add(101.0, 30.0, 120.0, altitude=10010)
-        self.assertAlmostEqual(self.table.get("CES2345").vertical_speed, 600.0, places=3)
-
-    def test_longitude_takes_the_short_way_across_the_antimeridian(self):
-        # 179.98°E 到 -179.98° 是往前 0.04°，线性差值会横穿整个地球
-        self._add(100.0, 30.0, 179.98)
-        self._add(101.0, 30.0, -179.98)
-        longitude = self.table.get("CES2345").position_at(100.5)["longitude"]
-        self.assertTrue(abs(longitude) > 179.9,
-                        f"中点应当贴着 180° 经线，算出来是 {longitude}")
-
+class DistanceTest(unittest.TestCase):
     def test_range_across_the_antimeridian_is_short(self):
         distance = traffic_module.distance_nm(30.0, 179.9, 30.0, -179.9)
         self.assertLess(distance, 30, "跨 180° 经线的距离算成绕地球一圈了")
@@ -3919,17 +3871,10 @@ class FastPositionTest(unittest.TestCase):
 
     def test_field_counts_match_can_fsd(self):
         """我们的解析下限和 can-fsd 的 minFields 一致，示例报文也够数。"""
-        path = os.path.join(CAN_FSD, "packet.go")
-        if not os.path.exists(path):
-            self.skipTest("边上没有 can-fsd")
-        with open(path, encoding="utf-8") as f:
-            source = f.read()
-        fast = re.search(r"case PacketFastPilotPosition, PacketFastPilotPositionSlow:"
-                         r"\s*return (\d+)", source)
-        stopped = re.search(r"case PacketFastPilotPositionStopped:\s*return (\d+)", source)
-        self.assertEqual(int(fast.group(1)), len(self.FAST.split(":")))
-        self.assertEqual(int(fast.group(1)), len(self.SLOW.split(":")))
-        self.assertEqual(int(stopped.group(1)), len(self.STOPPED.split(":")))
+        fast, stopped = can_fsd_fast_min_fields(self)
+        self.assertEqual(fast, len(self.FAST.split(":")))
+        self.assertEqual(fast, len(self.SLOW.split(":")))
+        self.assertEqual(stopped, len(self.STOPPED.split(":")))
 
     def test_fast_position(self):
         self.assertTrue(self.pilot._handle_packet(self.FAST))
@@ -3939,23 +3884,38 @@ class FastPositionTest(unittest.TestCase):
         self.assertAlmostEqual(sample.latitude, 40.6354992)
         self.assertAlmostEqual(sample.longitude, -73.7795597)
         self.assertAlmostEqual(sample.altitude, 16.81)
-        # X 向东、Y 向上、Z 向北；存的是 (北, 东, 上)
-        self.assertEqual(sample.velocity, (0.0005, 0.0015, 0.0001))
+        # X 向东、Y 向上、Z 向北；存的也是 (东, 上, 北)
+        self.assertEqual(sample.velocity, (0.0015, 0.0001, 0.0005))
         attitude = fsdpilot.unpack_pbh(12582828)
         self.assertAlmostEqual(sample.heading, attitude["heading"])
+
+    def test_rotation_agl_and_nose_wheel_are_kept(self):
+        """角速度是弧度每秒，X/Z 按 xPilot 的方向（低头、左坡为正）取反。"""
+        self.pilot._handle_packet(self.FAST)
+        sample = self.table.get("DAL1151").latest
+        pitch_rate, heading_rate, bank_rate = sample.rotation
+        self.assertAlmostEqual(pitch_rate, -math.degrees(0.0001))
+        self.assertAlmostEqual(heading_rate, 0.0)
+        self.assertAlmostEqual(bank_rate, math.degrees(0.0029))
+        self.assertAlmostEqual(sample.agl, 8.10)
+        self.assertAlmostEqual(sample.nose_wheel, -0.40)
 
     def test_slow_variant_and_groundspeed(self):
         self.pilot._handle_packet(self.SLOW)
         sample = self.table.get("PRM4211").latest
-        self.assertEqual(sample.velocity, (174.1947, 196.8918, -1.4936))
+        self.assertEqual(sample.velocity, (196.8918, -1.4936, 174.1947))
         expected = round(((174.1947 ** 2 + 196.8918 ** 2) ** 0.5) * 1.943844492)
         self.assertEqual(sample.groundspeed, expected)
+        self.assertAlmostEqual(sample.nose_wheel, -2.11)
 
     def test_stopped_variant_has_zero_velocity(self):
         self.pilot._handle_packet(self.STOPPED)
         sample = self.table.get("DAL2119").latest
         self.assertEqual(sample.velocity, (0.0, 0.0, 0.0))
+        self.assertEqual(sample.rotation, (0.0, 0.0, 0.0))
         self.assertEqual(sample.groundspeed, 0)
+        self.assertAlmostEqual(sample.agl, -0.03)
+        self.assertAlmostEqual(sample.nose_wheel, 0.0)
 
     def test_our_own_fast_position_is_ignored(self):
         self.pilot._handle_packet(self.FAST.replace("DAL1151", "CCA1501"))
@@ -3965,9 +3925,6 @@ class FastPositionTest(unittest.TestCase):
         self.assertTrue(self.pilot._handle_packet("^DAL1151:40.0:-73.0"))
         self.assertNotIn("DAL1151", self.table)
 
-    def test_send_fast_is_harmless(self):
-        self.assertTrue(self.pilot._handle_packet("$SFSERVER:CCA1501:1"))
-
     def test_fast_position_first_sight_asks_for_the_type(self):
         sent = []
         self.pilot._send = lambda packet: sent.append(packet) or True
@@ -3975,173 +3932,465 @@ class FastPositionTest(unittest.TestCase):
         self.assertIn("#SBCCA1501:DAL1151:PIR", sent)
 
 
+def can_fsd_fast_min_fields(test):
+    """can-fsd 的 minFields：(^ / #SL 的段数, #ST 的段数)。"""
+    path = os.path.join(CAN_FSD, "packet.go")
+    if not os.path.exists(path):
+        test.skipTest("边上没有 can-fsd")
+    with open(path, encoding="utf-8") as f:
+        source = f.read()
+    fast = re.search(r"case PacketFastPilotPosition, PacketFastPilotPositionSlow:"
+                     r"\s*return (\d+)", source)
+    stopped = re.search(r"case PacketFastPilotPositionStopped:\s*return (\d+)", source)
+    return int(fast.group(1)), int(stopped.group(1))
+
+
+def moving_snapshot(**changes):
+    snapshot = {
+        "latitude": 31.143400, "longitude": 121.805000,
+        "altitude": 35000, "agl": 34000, "groundspeed": 450,
+        "pitch": 2.0, "bank": -5.0, "heading": 271.0,
+        "squawk": 2000, "xpdr_mode": 2, "on_ground": False,
+        "velocity_east": -231.2, "velocity_up": 2.5, "velocity_north": 4.1,
+        "pitch_rate": 0.5, "heading_rate": -3.0, "bank_rate": 1.5,
+        "nose_wheel": 0.0,
+    }
+    snapshot.update(changes)
+    return snapshot
+
+
+def parked_snapshot():
+    return moving_snapshot(
+        altitude=13, agl=0, groundspeed=0, on_ground=True,
+        velocity_east=0.0, velocity_up=0.0, velocity_north=0.0,
+        pitch_rate=0.0, heading_rate=0.0, bank_rate=0.0, nose_wheel=12.5)
+
+
+class FastPositionSendTest(unittest.TestCase):
+    """发 ^ / #SL / #ST。节奏和内容照 xPilot 的 networkmanager.cpp。"""
+
+    def setUp(self):
+        self.sent = []
+        self.pilot = fsdpilot.FSDPilot("fsd.example", "CCA1501", "1000", "pw")
+        self.pilot._send = lambda packet: self.sent.append(packet) or True
+        self.pilot.update_position(moving_snapshot())
+
+    def test_send_fast_is_off_until_the_server_says_so(self):
+        self.assertFalse(self.pilot.send_fast)
+
+    def test_send_fast_on_and_off(self):
+        self.assertTrue(self.pilot._handle_packet("$SFSERVER:CCA1501:1"))
+        self.assertTrue(self.pilot.send_fast)
+        self.assertTrue(self.pilot._handle_packet("$SFSERVER:CCA1501:0"))
+        self.assertFalse(self.pilot.send_fast)
+
+    def test_send_fast_for_someone_else_is_ignored(self):
+        self.pilot._handle_packet("$SFSERVER:CES2345:1")
+        self.assertFalse(self.pilot.send_fast)
+
+    def test_the_fast_tick_sends_a_fast_position(self):
+        self.assertEqual(self.pilot._send_fast_position(slow=False), "^")
+        self.assertTrue(self.sent[0].startswith("^CCA1501:"))
+
+    def test_fast_field_layout_matches_can_fsd(self):
+        fast, _ = can_fsd_fast_min_fields(self)
+        self.pilot._send_fast_position(slow=False)
+        fields = self.sent[0].split(":")
+        self.assertEqual(len(fields), fast)
+        self.assertEqual(float(fields[1]), 31.1434)          # 纬度
+        self.assertEqual(float(fields[2]), 121.805)          # 经度
+        self.assertEqual(fields[3], "35000.00")              # 真高，英尺
+        self.assertEqual(fields[4], "34000.00")              # 离地高，英尺
+        attitude = fsdpilot.unpack_pbh(int(fields[5]))       # 和 `@` 同一个 PBH
+        self.assertAlmostEqual(attitude["pitch"], 2.0, delta=0.4)
+        self.assertAlmostEqual(attitude["bank"], -5.0, delta=0.4)
+        self.assertAlmostEqual(attitude["heading"], 271.0, delta=0.4)
+        # 速度：东、上、北，米每秒
+        self.assertEqual([float(v) for v in fields[6:9]], [-231.2, 2.5, 4.1])
+        # 角速度：弧度每秒，低头/右转/左坡为正（xPilot 发 -Q、R、-P）
+        self.assertAlmostEqual(float(fields[9]), -math.radians(0.5), places=4)
+        self.assertAlmostEqual(float(fields[10]), math.radians(-3.0), places=4)
+        self.assertAlmostEqual(float(fields[11]), -math.radians(1.5), places=4)
+        self.assertEqual(fields[12], "0.00")                 # 前轮角，度
+
+    def test_a_parked_aircraft_sends_stopped(self):
+        _, stopped = can_fsd_fast_min_fields(self)
+        self.pilot.update_position(parked_snapshot())
+        self.assertEqual(self.pilot._send_fast_position(slow=False), "#ST")
+        fields = self.sent[0].split(":")
+        self.assertTrue(fields[0].startswith("#STCCA1501"))
+        self.assertEqual(len(fields), stopped)
+        self.assertEqual(fields[6], "12.50")                 # 前轮角
+
+    def test_the_slow_tick_sends_slow_only_when_moving(self):
+        _ = self.pilot._send_fast_position(slow=True)
+        self.assertTrue(self.sent[0].startswith("#SLCCA1501:"))
+        self.assertEqual(len(self.sent[0].split(":")), 13)
+        self.pilot.update_position(parked_snapshot())
+        self.assertIsNone(self.pilot._send_fast_position(slow=True))
+        self.assertEqual(len(self.sent), 1)
+
+    def test_turning_fast_off_hands_over_to_slow(self):
+        """关掉时补一个包：在动补 #SL（别人手里的速度不能被清零）。"""
+        self.pilot._handle_packet("$SFSERVER:CCA1501:1")
+        self.pilot._handle_packet("$SFSERVER:CCA1501:0")
+        self.assertTrue(self.sent[-1].startswith("#SLCCA1501:"))
+
+    def test_turning_fast_off_while_parked_sends_stopped(self):
+        self.pilot.update_position(parked_snapshot())
+        self.pilot._handle_packet("$SFSERVER:CCA1501:1")
+        self.pilot._handle_packet("$SFSERVER:CCA1501:0")
+        self.assertTrue(self.sent[-1].startswith("#STCCA1501:"))
+
+    def test_a_repeated_flag_sends_nothing(self):
+        self.pilot._handle_packet("$SFSERVER:CCA1501:0")
+        self.assertEqual(self.sent, [])
+
+    def test_nothing_without_a_snapshot(self):
+        pilot = fsdpilot.FSDPilot("fsd.example", "CCA1501", "1000", "pw")
+        pilot._send = self.sent.append
+        self.assertIsNone(pilot._send_fast_position(slow=False))
+        self.assertEqual(self.sent, [])
+
+    def test_small_rates_count_as_stopped(self):
+        self.assertTrue(fsdpilot.is_stopped(parked_snapshot()))
+        self.assertTrue(fsdpilot.is_stopped(moving_snapshot(
+            velocity_east=0.001, velocity_up=0.0, velocity_north=0.0,
+            pitch_rate=0.0, heading_rate=0.1, bank_rate=0.0)))
+        self.assertFalse(fsdpilot.is_stopped(moving_snapshot()))
+
+    def test_what_we_send_is_what_we_receive(self):
+        """我们发出去的 ^，另一个我们收进来，速度和角速度原样还原。"""
+        self.pilot._send_fast_position(slow=False)
+        table = traffic_module.TrafficTable()
+        other = fsdpilot.FSDPilot("fsd.example", "CES2345", "1001", "pw",
+                                  traffic=table)
+        other._send = lambda packet: True
+        other._handle_packet(self.sent[0])
+        sample = table.get("CCA1501").latest
+        self.assertEqual(sample.velocity, (-231.2, 2.5, 4.1))
+        for got, want in zip(sample.rotation, (0.5, -3.0, 1.5)):
+            self.assertAlmostEqual(got, want, delta=0.01)
+        self.assertAlmostEqual(sample.agl, 34000.0)
+
+    def test_the_login_sequence_sends_at_then_a_fast_position(self):
+        """_loop 一开头：先 `@`，再一个快速位置（停着就是 #ST）。"""
+        self.pilot.update_position(parked_snapshot())
+        self.pilot.running = False          # 循环体一次都不跑
+        self.pilot._loop()
+        self.assertTrue(self.sent[0].startswith("@"))
+        self.assertTrue(self.sent[1].startswith("#STCCA1501:"))
+
+
 class VelocityTrafficTest(unittest.TestCase):
-    """带速度的样本按速度外推；有它的时候 `@` 不再当位置样本。"""
+    """发过快速位置的飞机按上报的速度走；`@` 从此只是心跳。"""
 
     def setUp(self):
         self.table = traffic_module.TrafficTable()
 
-    def fast(self, at, lat=30.0, lon=120.0, velocity=(100.0, 0.0, 5.0)):
+    def fast(self, at, lat=30.0, lon=120.0, velocity=(0.0, 5.0, 100.0)):
         self.table.update_position("DAL1", latitude=lat, longitude=lon,
                                    altitude=10000.0, pitch=0.0, bank=0.0,
                                    heading=0.0, velocity=velocity, now=at)
 
-    def slow(self, at, lat, lon=120.0, squawk=1234):
+    def slow(self, at, lat, lon=120.0, squawk=1234, groundspeed=250):
         self.table.update_position("DAL1", latitude=lat, longitude=lon,
                                    altitude=10000, pitch=0.0, bank=0.0,
-                                   heading=0.0, squawk=squawk, now=at)
+                                   heading=0.0, squawk=squawk,
+                                   groundspeed=groundspeed, now=at)
 
-    def test_dead_reckons_along_the_velocity(self):
+    def test_moves_along_the_velocity(self):
         self.fast(100.0)
-        position = self.table.get("DAL1").position_at(101.0)
+        position = self.table.get("DAL1").state_at(101.0)
         self.assertAlmostEqual(position["latitude"],
                                30.0 + 100.0 / traffic_module.METRES_PER_DEGREE)
         self.assertAlmostEqual(position["altitude"],
                                10000.0 + 5.0 * traffic_module.FEET_PER_METRE)
 
-    def test_dead_reckoning_is_capped(self):
-        self.fast(100.0)
-        far = self.table.get("DAL1").position_at(1000.0)["latitude"]
-        cap = 30.0 + 100.0 * traffic_module.MAX_VELOCITY_EXTRAPOLATE / \
-            traffic_module.METRES_PER_DEGREE
-        self.assertAlmostEqual(far, cap)
-
-    def test_slow_position_does_not_fight_fast_ones(self):
+    def test_slow_position_does_not_move_it(self):
         self.fast(100.0, lat=30.0)
-        self.slow(100.1, lat=30.5, squawk=4321)
+        self.slow(100.1, lat=30.5, squawk=4321, groundspeed=260)
         aircraft = self.table.get("DAL1")
         self.assertEqual(aircraft.latest.latitude, 30.0, "`@` 不该替换带速度的样本")
+        self.assertEqual(aircraft.motion.target[0], 30.0)
         self.assertEqual(aircraft.squawk, 4321, "应答机还是要跟 `@` 走")
+        self.assertEqual(aircraft.latest.groundspeed, 260)
 
-    def test_slow_positions_count_again_once_fast_ones_stop(self):
-        self.fast(100.0, lat=30.0)
-        self.slow(100.0 + traffic_module.VELOCITY_FRESH + 1, lat=30.5)
-        self.assertEqual(self.table.get("DAL1").latest.latitude, 30.5)
+    def test_slow_positions_never_count_again(self):
+        """xPilot 的 HaveVelocities：发过一次快速位置，`@` 就永远只是心跳。"""
+        self.fast(100.0, lat=30.0, velocity=(0.0, 0.0, 0.0))
+        self.slow(130.0, lat=30.5)
+        aircraft = self.table.get("DAL1")
+        self.assertEqual(aircraft.latest.latitude, 30.0)
+        self.assertAlmostEqual(aircraft.state_at(131.0)["latitude"], 30.0)
+
+    def test_slow_positions_keep_it_alive(self):
+        self.fast(100.0)
+        self.slow(110.0, lat=30.0)
+        self.assertEqual(self.table.prune(now=100.0 + traffic_module.STALE_AFTER + 1), [])
 
     def test_vertical_speed_comes_from_the_velocity(self):
-        self.fast(100.0, velocity=(0.0, 0.0, 5.08))
+        self.fast(100.0, velocity=(0.0, 5.08, 0.0))
         self.assertAlmostEqual(self.table.get("DAL1").vertical_speed,
                                5.08 * traffic_module.FEET_PER_METRE * 60.0)
 
+    def test_a_repeated_fast_snapshot_does_not_pull_it_back(self):
+        """发送方快照没刷新、同一个位置又发了一遍：只换速度，不往回拽。"""
+        self.fast(100.0)
+        before = self.table.get("DAL1").state_at(100.2)["latitude"]
+        self.fast(100.2)                      # 同一份快照
+        aircraft = self.table.get("DAL1")
+        self.assertEqual(aircraft.motion.error_remaining, 0.0)
+        later = aircraft.state_at(100.4)["latitude"]
+        self.assertAlmostEqual(later - before,
+                               0.2 * 100.0 / traffic_module.METRES_PER_DEGREE)
 
-class RenderDelayTest(unittest.TestCase):
-    """render_delay > 0（msfs 的用法）：取稍早的时刻，在两个真实样本之间插值。
 
-    msfs 每帧直接把 position_at(now) 写进模拟器。追着最新样本外推的话，每个
-    新样本到达都把外推误差在一帧里纠正过来，30 Hz 下就是一抽一抽的。
-    """
+class MotionTest(unittest.TestCase):
+    """xPilot 的运动模型（network_aircraft.cpp），纯的积分器。"""
 
-    DELAY = 0.3
+    def motion(self, heading=90.0, velocity=(0.0, 0.0, 0.0),
+               rotation=(0.0, 0.0, 0.0), lat=30.0, lon=120.0, altitude=10000.0):
+        motion = traffic_module.Motion()
+        motion.receive(lat, lon, altitude, 0.0, 0.0, heading,
+                       velocity=velocity, rotation=rotation)
+        return motion
 
-    def setUp(self):
-        self.table = traffic_module.TrafficTable(render_delay=self.DELAY)
+    def test_nothing_to_draw_before_the_first_sample(self):
+        motion = traffic_module.Motion()
+        motion.advance(1.0)
+        self.assertIsNone(motion.state())
 
-    def add(self, at, lat, lon=120.0, heading=90.0, altitude=10000.0,
-            velocity=None):
-        self.table.update_position("CES1", latitude=lat, longitude=lon,
-                                   altitude=altitude, pitch=0.0, bank=0.0,
-                                   heading=heading, groundspeed=250, now=at,
-                                   velocity=velocity)
+    def test_the_first_sample_is_drawn_where_it_is(self):
+        state = self.motion(heading=271.0).state()
+        self.assertEqual((state["latitude"], state["longitude"], state["altitude"]),
+                         (30.0, 120.0, 10000.0))
+        self.assertAlmostEqual(state["heading"], 271.0)
 
-    def at(self, now):
-        return self.table.get("CES1").position_at(now)
+    def test_constant_velocity_is_a_straight_line(self):
+        motion = self.motion(velocity=(0.0, 5.0, 100.0))
+        for _ in range(60):
+            motion.advance(1.0 / 30.0)
+        state = motion.state()
+        self.assertAlmostEqual(state["latitude"],
+                               30.0 + 200.0 / traffic_module.METRES_PER_DEGREE, places=12)
+        self.assertEqual(state["longitude"], 120.0)
+        self.assertAlmostEqual(state["altitude"],
+                               10000.0 + 10.0 * traffic_module.FEET_PER_METRE, places=9)
 
-    def test_renders_between_the_samples_that_bracket_render_time(self):
-        self.add(100.0, 30.00)
-        self.add(100.2, 30.01)
-        self.add(100.4, 30.02)
-        # 渲染时刻 100.3，夹在 100.2 和 100.4 之间
-        self.assertAlmostEqual(self.at(100.6)["latitude"], 30.015, places=9)
-        # 渲染时刻 100.1，更早的那一段也还留着
-        self.assertAlmostEqual(self.at(100.4)["latitude"], 30.005, places=9)
+    def test_the_result_does_not_depend_on_the_frame_rate(self):
+        """30 Hz 注入、10 Hz 推送、插件每帧：同样的时长，同样的结果。"""
+        def run(frames):
+            motion = self.motion(velocity=(80.0, 3.0, 60.0), rotation=(1.0, 3.0, -2.0))
+            motion.advance(0.3)
+            motion.receive(30.0002, 120.001, 10020.0, 1.0, 5.0, 92.0,
+                           velocity=(82.0, 3.0, 58.0), rotation=(1.0, 3.0, -2.0))
+            for _ in range(frames):
+                motion.advance(3.0 / frames)
+            return motion.state()
+        coarse, fine = run(3), run(300)
+        for key in ("latitude", "longitude", "altitude", "pitch", "bank", "heading"):
+            self.assertAlmostEqual(coarse[key], fine[key], places=6, msg=key)
 
-    def test_a_new_sample_does_not_move_the_rendered_position(self):
-        """样本按 5 Hz 带抖动到达，到达那一刻前后渲染出来的位置一样。"""
-        arrivals = [100.0, 100.21, 100.38, 100.62, 100.8, 101.05, 101.2, 101.43]
-        for index, when in enumerate(arrivals):
-            if index:
-                before = self.at(when)
-            self.add(when, 30.0 + 0.001 * index * index)   # 在加速
-            if index:
-                after = self.at(when)
-                for key in ("latitude", "longitude", "altitude", "heading"):
-                    self.assertAlmostEqual(before[key], after[key], places=9,
-                                           msg=f"{key} 在 {when} 跳了")
+    def test_a_new_sample_does_not_move_the_drawn_aircraft(self):
+        motion = self.motion(velocity=(100.0, 0.0, 0.0))
+        motion.advance(0.2)
+        before = motion.state()
+        motion.receive(30.001, 120.003, 10050.0, 3.0, 10.0, 95.0,
+                       velocity=(100.0, 0.0, 0.0))
+        after = motion.state()
+        for key in before:
+            self.assertEqual(before[key], after[key], key)
 
-    def test_an_extrapolation_error_is_blended_not_snapped(self):
-        """样本间隔比延迟长（外推到了最新样本之后），修正要在 BLEND_TIME 里走完。"""
-        self.add(100.0, 30.000)
-        self.add(101.0, 30.010)
-        # 渲染时刻 101.7 已经过了最新样本，按 0.01°/s 外推到 30.017
-        before = self.at(102.0)
-        self.assertAlmostEqual(before["latitude"], 30.017, places=9)
-        # 实际上减速了
-        self.add(102.0, 30.012)
-        self.assertAlmostEqual(self.at(102.0)["latitude"], before["latitude"],
-                               places=9, msg="新样本让飞机跳了一下")
-        # 中途还带着一半的修正（时间只往前走，所以先看中途）
-        middle = self.at(102.0 + traffic_module.BLEND_TIME / 2)["latitude"]
-        raw_middle = self.table.get("CES1")._raw_position(
-            102.0 + traffic_module.BLEND_TIME / 2 - self.DELAY)["latitude"]
-        self.assertGreater(middle, raw_middle)
-        # 抹平完之后就是真实数据
-        later = 102.0 + traffic_module.BLEND_TIME + 0.01
-        settled = self.at(later)
-        raw = self.table.get("CES1")._raw_position(later - self.DELAY)
-        self.assertAlmostEqual(settled["latitude"], raw["latitude"], places=9)
+    def test_an_error_converges_over_two_seconds(self):
+        """误差 =（上报 − 画出）/ 2 秒，2 秒后正好落在上报位置的延长线上。"""
+        velocity = (100.0, 2.0, 50.0)
+        motion = self.motion(velocity=velocity)
+        motion.advance(0.2)
+        target = (30.0003, 120.0021, 10010.0)
+        motion.receive(*target, 0.0, 0.0, 90.0, velocity=velocity)
+        for _ in range(10):
+            motion.advance(traffic_module.ERROR_TIME / 10)
+        state = motion.state()
+        cos_lat = math.cos(math.radians(30.0003))
+        expected_lat = target[0] + 2.0 * 50.0 / traffic_module.METRES_PER_DEGREE
+        expected_lon = target[1] + 2.0 * 100.0 / (traffic_module.METRES_PER_DEGREE * cos_lat)
+        self.assertAlmostEqual(state["latitude"], expected_lat, places=8)
+        self.assertAlmostEqual(state["longitude"], expected_lon, places=7)
+        self.assertAlmostEqual(state["altitude"],
+                               target[2] + 2.0 * 2.0 * traffic_module.FEET_PER_METRE,
+                               places=6)
 
-    def test_a_teleport_is_not_blended(self):
-        # 差出几公里就不是外推误差了，是换了位置，直接过去
-        self.add(100.0, 30.0)
-        self.add(101.0, 30.01)
-        self.add(102.0, 31.0)
-        raw = self.table.get("CES1")._raw_position(102.0 - self.DELAY)
-        self.assertAlmostEqual(self.at(102.0)["latitude"], raw["latitude"], places=9)
+    def test_the_correction_is_continuous(self):
+        """修正是速度，不是跳变：每一帧走的距离都差不多。"""
+        motion = self.motion(velocity=(0.0, 0.0, 100.0))
+        motion.advance(0.2)
+        motion.receive(30.0005, 120.0, 10000.0, 0.0, 0.0, 90.0,
+                       velocity=(0.0, 0.0, 100.0))
+        previous = motion.state()["latitude"]
+        steps = []
+        for _ in range(90):
+            motion.advance(1.0 / 30.0)
+            latitude = motion.state()["latitude"]
+            steps.append(latitude - previous)
+            previous = latitude
+        largest = max(steps) * traffic_module.METRES_PER_DEGREE
+        self.assertLess(largest, (100.0 + 30.0) / 30.0,
+                        "一帧走得比速度加误差速度还多，是跳过去的")
 
-    def test_heading_wraps_across_north(self):
-        self.add(100.0, 30.0, heading=359.0)
-        self.add(100.2, 30.0, heading=1.0)
-        self.add(100.4, 30.0, heading=3.0)
-        heading = self.at(100.4)["heading"]         # 渲染时刻 100.1
-        self.assertAlmostEqual(heading, 0.0, places=6)
+    def test_the_error_stops_after_two_seconds(self):
+        motion = self.motion(velocity=(0.0, 0.0, 0.0))
+        motion.receive(30.001, 120.0, 10000.0, 0.0, 0.0, 90.0)
+        motion.advance(traffic_module.ERROR_TIME + 5.0)
+        self.assertAlmostEqual(motion.state()["latitude"], 30.001, places=9)
 
-    def test_a_blended_heading_stays_on_the_short_arc(self):
-        self.add(100.0, 30.0, heading=356.0)
-        self.add(101.0, 30.0, heading=358.0)
-        before = self.at(102.0)["heading"]          # 外推到 359.4
-        self.add(102.0, 30.0, heading=2.0)
-        after = self.at(102.0)["heading"]
-        self.assertAlmostEqual(before, after, places=6)
-        for step in range(1, 10):
-            heading = self.at(102.0 + step * 0.05)["heading"]
-            self.assertTrue(0.0 <= heading < 360.0, heading)
-            distance = abs((heading - 0.0 + 180.0) % 360.0 - 180.0)
-            self.assertLess(distance, 5.0, f"航向绕了远路：{heading}")
+    def test_rotation_rates_integrate(self):
+        motion = self.motion(heading=90.0, rotation=(0.0, 3.0, 0.0))
+        motion.advance(0.4)
+        self.assertAlmostEqual(motion.state()["heading"], 91.2, places=6)
 
-    def test_a_single_velocity_sample_is_dead_reckoned(self):
-        # 带速度的样本（#SL 五秒一个）：没有夹得住的两点，按速度推
-        self.add(100.0, 30.0, velocity=(100.0, 0.0, 0.0))
-        position = self.at(101.3)                   # 渲染时刻 101.0
-        self.assertAlmostEqual(position["latitude"],
+    def test_rotation_rates_are_cleared_after_half_a_second(self):
+        """0.5 秒没有新样本：角速度清零，姿态落到最后上报的那个。"""
+        motion = self.motion(heading=90.0, rotation=(0.0, 3.0, 0.0))
+        motion.advance(0.6)
+        self.assertEqual(motion.rotation, (0.0, 0.0, 0.0))
+        self.assertAlmostEqual(motion.state()["heading"], 90.0, places=6)
+        motion.advance(5.0)
+        self.assertAlmostEqual(motion.state()["heading"], 90.0, places=6)
+
+    def test_positional_velocity_survives_the_rotation_timeout(self):
+        motion = self.motion(velocity=(0.0, 0.0, 100.0), rotation=(0.0, 3.0, 0.0))
+        motion.advance(1.0)
+        self.assertAlmostEqual(motion.state()["latitude"],
                                30.0 + 100.0 / traffic_module.METRES_PER_DEGREE)
 
-    def test_slow_senders_fall_back_to_bounded_extrapolation(self):
-        # 只发 `@`、五秒一个（VATSIM 老客户端）：外推，但有上限
-        self.add(100.0, 30.0)
-        self.add(105.0, 30.05)
-        self.assertAlmostEqual(self.at(105.5)["latitude"], 30.052, places=9)
-        far = self.at(1000.0)["latitude"]
-        self.assertAlmostEqual(far, 30.05 + 0.01 * traffic_module.MAX_EXTRAPOLATE,
-                               places=9)
+    def test_a_late_sample_brings_no_rotation(self):
+        """xPilot 在 UpdateVelocityVectors 里先清角速度：隔太久的样本的角速度不算。"""
+        motion = self.motion(heading=90.0)
+        motion.advance(1.0)
+        motion.receive(30.0, 120.0, 10000.0, 0.0, 0.0, 100.0, rotation=(0.0, 3.0, 0.0))
+        self.assertEqual(motion.rotation, (0.0, 0.0, 0.0))
+        self.assertAlmostEqual(motion.state()["heading"], 100.0, places=6)
 
-    def test_zero_delay_keeps_the_old_meaning(self):
-        # xpc 用 0：position_at(now) 就是 now 那一刻，不插延迟也不抹平
-        table = traffic_module.TrafficTable()
-        table.update_position("CES1", latitude=30.0, longitude=120.0,
-                              altitude=0, pitch=0, bank=0, heading=0, now=100.0)
-        table.update_position("CES1", latitude=30.01, longitude=120.0,
-                              altitude=0, pitch=0, bank=0, heading=0, now=101.0)
-        self.assertAlmostEqual(table.get("CES1").position_at(101.0)["latitude"], 30.01)
+    def test_an_attitude_error_is_corrected_the_short_way_across_north(self):
+        motion = self.motion(heading=359.0)
+        motion.advance(0.2)
+        motion.receive(30.0, 120.0, 10000.0, 0.0, 0.0, 1.0)
+        motion.advance(0.2)
+        heading = motion.state()["heading"]
+        self.assertTrue(heading > 359.0 or heading < 1.0, heading)
+        # 走一半（误差速度 2°/2 s，0.2 s 走 0.2°）
+        self.assertAlmostEqual(heading, 359.2, places=6)
+
+    def test_heading_rate_crosses_north(self):
+        motion = self.motion(heading=359.0, rotation=(0.0, 5.0, 0.0))
+        motion.advance(0.4)
+        self.assertAlmostEqual(motion.state()["heading"], 1.0, places=6)
+
+    def test_longitude_wraps_across_the_antimeridian(self):
+        motion = self.motion(lon=179.9999, velocity=(100.0, 0.0, 0.0))
+        motion.advance(1.0)
+        longitude = motion.state()["longitude"]
+        self.assertTrue(-180.0 <= longitude < -179.99, longitude)
+
+    def test_bank_and_pitch_come_back_out(self):
+        motion = traffic_module.Motion()
+        motion.receive(30.0, 120.0, 0.0, 4.0, -20.0, 200.0)
+        state = motion.state()
+        self.assertAlmostEqual(state["pitch"], 4.0, places=9)
+        self.assertAlmostEqual(state["bank"], -20.0, places=9)
+        self.assertAlmostEqual(state["heading"], 200.0, places=9)
+
+
+class SlowSenderTest(unittest.TestCase):
+    """只发 `@` 的客户端：用相邻两个样本算速度，走同一条误差速度的路。"""
+
+    def setUp(self):
+        self.table = traffic_module.TrafficTable()
+
+    def add(self, at, lat, lon=120.0, altitude=10000, heading=90.0):
+        self.table.update_position("CES2345", latitude=lat, longitude=lon,
+                                   altitude=altitude, pitch=0.0, bank=0.0,
+                                   heading=heading, groundspeed=250, now=at)
+
+    def at(self, now):
+        return self.table.get("CES2345").state_at(now)
+
+    def test_a_single_sample_is_held(self):
+        self.add(100.0, 30.0)
+        self.assertAlmostEqual(self.at(105.0)["latitude"], 30.0)
+
+    def test_velocity_is_derived_from_two_samples(self):
+        self.add(100.0, 30.0, altitude=10000)
+        self.add(101.0, 30.01, altitude=10010)
+        east, up, north = self.table.get("CES2345").motion.velocity
+        self.assertAlmostEqual(north, 0.01 * traffic_module.METRES_PER_DEGREE, places=6)
+        self.assertAlmostEqual(up, 10 * traffic_module.METRES_PER_FOOT, places=9)
+        self.assertAlmostEqual(east, 0.0, places=9)
+
+    def test_it_moves_smoothly_and_catches_up(self):
+        """5 Hz 的 `@`：每个样本到达时画面不跳，最后跟上真实位置。"""
+        speed = 0.001                        # 度每秒，匀速向北
+        now = 100.0
+        self.add(now, 30.0)
+        previous = self.at(now)["latitude"]
+        for tick in range(1, 51):
+            now = 100.0 + tick * 0.2
+            before = self.at(now)["latitude"]
+            self.assertLess(before - previous, 0.2 * speed * 1.8,
+                            f"{now} 之前走得太快")
+            self.add(now, 30.0 + speed * tick * 0.2)
+            self.assertEqual(before, self.at(now)["latitude"], f"{now} 跳了")
+            previous = before
+        # 起步那一下的误差按 2 秒的时间常数收敛，10 秒后剩不到 1%
+        self.assertAlmostEqual(self.at(now)["latitude"], 30.0 + speed * 10.0, places=5)
+
+    def test_heading_rate_takes_the_short_way(self):
+        # 359° 到 1° 应当往前走 2°，不是倒着走 358°
+        # 相隔要在 ROTATION_HOLD 以内，否则到达时角速度就被清掉了
+        self.add(100.0, 30.0, heading=359.0)
+        self.add(100.2, 30.0, heading=1.0)
+        _, heading_rate, _ = self.table.get("CES2345").motion.rotation
+        self.assertAlmostEqual(heading_rate, 10.0, places=6)
+        heading = self.at(100.3)["heading"]
+        self.assertTrue(heading > 359.0 or heading < 1.0, heading)
+
+    def test_heading_rate_short_way_downwards(self):
+        self.add(100.0, 30.0, heading=10.0)
+        self.add(100.2, 30.0, heading=350.0)
+        _, heading_rate, _ = self.table.get("CES2345").motion.rotation
+        self.assertAlmostEqual(heading_rate, -100.0, places=6)
+
+    def test_longitude_takes_the_short_way_across_the_antimeridian(self):
+        # 179.98°E 到 -179.98° 是往前 0.04°，线性差值会横穿整个地球
+        self.add(100.0, 30.0, lon=179.98)
+        self.add(101.0, 30.0, lon=-179.98)
+        east, _, _ = self.table.get("CES2345").motion.velocity
+        self.assertGreater(east, 0.0)
+        longitude = self.at(101.5)["longitude"]
+        self.assertTrue(abs(longitude) > 179.9,
+                        f"应当贴着 180° 经线，算出来是 {longitude}")
+
+    def test_duplicate_timestamp_replaces_latest(self):
+        # 同一时刻的两个包（同一次 recv 读出来的）：新的替换 latest，
+        # 不当新的一段——两点间隔是零，速度会除零
+        self.add(100.0, 30.0)
+        self.add(100.0, 40.0)
+        aircraft = self.table.get("CES2345")
+        self.assertIsNone(aircraft.previous)
+        self.assertEqual(aircraft.latest.latitude, 40.0)
+        self.assertEqual(aircraft.motion.velocity, (0.0, 0.0, 0.0))
+
+    def test_vertical_speed(self):
+        self.add(100.0, 30.0, altitude=10000)
+        self.add(101.0, 30.0, altitude=10010)
+        self.assertAlmostEqual(self.table.get("CES2345").vertical_speed, 600.0, places=3)
+
+    def test_state_at_an_earlier_time_does_not_rewind(self):
+        self.add(100.0, 30.0)
+        self.add(101.0, 30.01)
+        later = self.at(102.0)["latitude"]
+        self.assertEqual(self.at(50.0)["latitude"], later)
 
 
 class DuplicateSampleTest(unittest.TestCase):
@@ -4164,7 +4413,7 @@ class DuplicateSampleTest(unittest.TestCase):
         self.assertEqual(aircraft.previous.time, 100.0)
         self.assertEqual(aircraft.latest.time, 101.0)
         # 两点之间的速度还在，飞机继续往前走，而不是停在 30.01
-        self.assertGreater(aircraft.position_at(101.4)["latitude"], 30.01)
+        self.assertGreater(aircraft.motion.velocity[2], 0.0)
 
     def test_the_next_real_update_follows_on(self):
         self.add(100.0, 30.0)
@@ -4182,7 +4431,9 @@ class DuplicateSampleTest(unittest.TestCase):
         self.add(later, 30.01)
         aircraft = self.table.get("CES1")
         self.assertEqual(aircraft.latest.time, later)
-        self.assertAlmostEqual(aircraft.position_at(later + 1)["latitude"], 30.01)
+        self.assertEqual(aircraft.motion.velocity[2], 0.0)
+        settled = aircraft.state_at(later + traffic_module.ERROR_TIME + 1)
+        self.assertAlmostEqual(settled["latitude"], 30.01, places=9)
 
     def test_an_altitude_change_is_not_a_duplicate(self):
         self.add(100.0, 30.0, altitude=10000)
@@ -4224,6 +4475,9 @@ class TrafficClockTest(unittest.TestCase):
         self.assertEqual(aircraft.latest.latitude, 30.2)
         self.assertEqual(aircraft.previous.latitude, 30.0)
         self.assertGreater(aircraft.latest.time, aircraft.previous.time)
+        # 速度按 previous → 新的 latest 算
+        self.assertAlmostEqual(aircraft.motion.velocity[2],
+                               1.0 * traffic_module.METRES_PER_DEGREE, places=6)
 
     def test_the_first_type_request_is_not_skipped_early_in_uptime(self):
         """单调钟的零点不固定，info_requested 不能从 0 起算。"""
@@ -4232,6 +4486,437 @@ class TrafficClockTest(unittest.TestCase):
         table.update_position("CES1", latitude=30.0, longitude=120.0, altitude=0,
                               pitch=0.0, bank=0.0, heading=0.0, now=5.0)
         self.assertEqual(asked, ["CES1"])
+
+
+def _load_plugin(name="pi_xpc_motion"):
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "plugin", "PI_XpcTraffic.py")
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class MotionAgreementTest(unittest.TestCase):
+    """插件里的 Motion 是 traffic.Motion 抄过去的一份，同样的输入必须同样的结果。"""
+
+    FIELDS = ("latitude", "longitude", "altitude", "orientation", "target",
+              "velocity", "rotation", "error_velocity", "error_rotation",
+              "error_remaining", "since_update")
+
+    def setUp(self):
+        self.plugin = _load_plugin()
+
+    def run_both(self, script):
+        """script 是 [("receive", args, kwargs) | ("refresh", ...) | ("advance", dt)]。"""
+        ours, theirs = traffic_module.Motion(), self.plugin.Motion()
+        for step in script:
+            for motion in (ours, theirs):
+                if step[0] == "advance":
+                    motion.advance(step[1])
+                else:
+                    getattr(motion, step[0])(*step[1], **step[2])
+            for name in self.FIELDS:
+                self.assertEqual(getattr(ours, name), getattr(theirs, name),
+                                 f"{name} 在 {step} 之后不一致")
+        return ours.state(), theirs.state()
+
+    def test_error_blend(self):
+        client, plugin = self.run_both([
+            ("receive", (30.0, 120.0, 10000.0, 0.0, 0.0, 90.0),
+             {"velocity": (100.0, 2.0, 50.0), "rotation": (0.0, 1.0, 0.0)}),
+            ("advance", 0.2),
+            ("receive", (30.0003, 120.0021, 10010.0, 2.0, 5.0, 91.0),
+             {"velocity": (101.0, 2.0, 49.0), "rotation": (0.5, 1.0, 2.0)}),
+            *[("advance", 1 / 60) for _ in range(150)],
+        ])
+        self.assertEqual(client, plugin)
+
+    def test_rotation_hold_and_a_late_sample(self):
+        client, plugin = self.run_both([
+            ("receive", (30.0, 120.0, 10000.0, 0.0, 0.0, 90.0),
+             {"rotation": (0.0, 3.0, 0.0)}),
+            ("advance", 0.7),
+            ("receive", (30.0, 120.0, 10000.0, 0.0, 10.0, 100.0),
+             {"rotation": (0.0, 3.0, 0.0)}),
+            ("advance", 0.1),
+            ("refresh", ((0.0, 0.0, 10.0), (0.0, 2.0, 0.0)), {}),
+            ("advance", 1.0),
+        ])
+        self.assertEqual(client, plugin)
+
+    def test_heading_wrap(self):
+        client, plugin = self.run_both([
+            ("receive", (30.0, 120.0, 10000.0, 0.0, 0.0, 359.0),
+             {"rotation": (0.0, 5.0, 0.0)}),
+            ("advance", 0.2),
+            ("receive", (30.0, 120.0, 10000.0, 0.0, 0.0, 1.0),
+             {"rotation": (0.0, 5.0, 0.0)}),
+            ("advance", 0.3),
+        ])
+        self.assertEqual(client, plugin)
+        self.assertLess(plugin["heading"], 5.0)
+
+    def test_frame_rate_independence(self):
+        """插件每帧 advance，客户端按推送节奏 advance：结果一样。"""
+        def run(module, frames):
+            motion = module.Motion()
+            motion.receive(30.0, 120.0, 10000.0, 0.0, 0.0, 90.0,
+                           velocity=(80.0, 3.0, 60.0), rotation=(1.0, 3.0, -2.0))
+            motion.advance(0.3)
+            motion.receive(30.0002, 120.001, 10020.0, 1.0, 5.0, 92.0,
+                           velocity=(82.0, 3.0, 58.0), rotation=(1.0, 3.0, -2.0))
+            for _ in range(frames):
+                motion.advance(3.0 / frames)
+            return motion.state()
+        client, plugin = run(traffic_module, 30), run(self.plugin, 180)
+        for key in client:
+            self.assertAlmostEqual(client[key], plugin[key], places=6, msg=key)
+
+    def test_the_constants_agree(self):
+        for name in ("ERROR_TIME", "ROTATION_HOLD", "METRES_PER_DEGREE",
+                     "FEET_PER_METRE", "METRES_PER_FOOT"):
+            self.assertEqual(getattr(traffic_module, name),
+                             getattr(self.plugin, name), name)
+
+
+class SampleFeedTest(unittest.TestCase):
+    """客户端给插件的是样本和序号；插件按序号 receive / refresh。"""
+
+    def setUp(self):
+        self.table = bridge.SampleTable()
+        self.plugin = _load_plugin("pi_xpc_feed")
+
+    def fast(self, at, lat=30.0, velocity=(0.0, 0.0, 100.0), rotation=(0.0, 2.0, 0.0),
+             callsign="DAL1"):
+        self.table.update_position(callsign, latitude=lat, longitude=120.0,
+                                   altitude=10000.0, pitch=0.0, bank=0.0,
+                                   heading=90.0, velocity=velocity,
+                                   rotation=rotation, agl=500.0, now=at)
+
+    def entry(self, at):
+        return self.table.snapshot(now=at)[0]
+
+    def test_entries_carry_the_sample(self):
+        self.fast(100.0)
+        entry = self.entry(100.1)
+        self.assertEqual(entry["target"], [30.0, 120.0, 10000.0, 0.0, 0.0, 90.0])
+        self.assertEqual(entry["velocity"], [0.0, 0.0, 100.0])
+        self.assertEqual(entry["rotation"], [0.0, 2.0, 0.0])
+        self.assertEqual((entry["seq"], entry["received"]), (1, 1))
+        sent = bridge.plugin_entry(entry)
+        for key in bridge.DRAWN_KEYS:
+            self.assertNotIn(key, sent)
+
+    def test_the_sent_rotation_is_the_received_one_after_the_hold(self):
+        """客户端自己的 Motion 0.5 s 后清掉角速度；发出去的不能跟着变成零。"""
+        self.fast(100.0)
+        entry = self.entry(101.0)
+        self.assertEqual(self.table.get("DAL1").motion.rotation, (0.0, 0.0, 0.0))
+        self.assertEqual(entry["rotation"], [0.0, 2.0, 0.0])
+        self.assertEqual(entry["seq"], 1)
+
+    def test_a_repeated_snapshot_is_a_refresh(self):
+        self.fast(100.0)
+        self.fast(100.2, velocity=(0.0, 0.0, 110.0))
+        entry = self.entry(100.3)
+        self.assertEqual((entry["seq"], entry["received"]), (2, 1))
+        self.assertEqual(entry["velocity"], [0.0, 0.0, 110.0])
+
+    def test_slow_senders_forward_the_derived_velocity(self):
+        for at, lat in ((100.0, 30.0), (100.2, 30.001)):
+            self.table.update_position("OLD1", latitude=lat, longitude=120.0,
+                                       altitude=10000, pitch=0.0, bank=0.0,
+                                       heading=0.0, now=at)
+        entry = self.table.snapshot(now=100.3)[0]
+        self.assertEqual(entry["received"], 2)
+        self.assertAlmostEqual(entry["velocity"][2],
+                               0.001 * traffic_module.METRES_PER_DEGREE / 0.2, places=6)
+
+    def test_plane_info_first_still_gets_a_recording_motion(self):
+        self.table.set_plane_info("DAL1", equipment="B738")
+        self.fast(100.0)
+        self.assertIsInstance(self.table.get("DAL1").motion, bridge.RecordingMotion)
+        self.assertEqual(self.entry(100.0)["received"], 1)
+
+    def test_the_plugin_reproduces_the_client_motion(self):
+        """插件拿到样本的时刻和客户端一样时，画出来的和客户端算的一样。"""
+        aircraft = self.plugin.NetworkAircraft("DAL1")
+        times = [100.0 + 0.2 * i for i in range(10)]
+        now = times[0]
+        for index, at in enumerate(times):
+            aircraft.advance(at - now)
+            now = at
+            lat = 30.0 + index * 0.00018
+            if index == 5:
+                lat = 30.0 + 4 * 0.00018           # 重复快照 → refresh
+            self.fast(at, lat=lat, rotation=(0.0, 1.0 + index * 0.1, 0.0))
+            aircraft.accept(bridge.plugin_entry(self.entry(at)), at)
+        for _ in range(60):
+            aircraft.advance(1 / 60)
+        now += 1.0
+        client = self.table.get("DAL1").state_at(now)
+        plugin = aircraft.motion.state()
+        for key in plugin:
+            self.assertAlmostEqual(client[key], plugin[key], places=9, msg=key)
+
+    def test_a_missed_frame_still_receives_the_newest_target(self):
+        aircraft = self.plugin.NetworkAircraft("DAL1")
+        self.fast(100.0)
+        aircraft.accept(self.entry(100.0), 100.0)
+        self.fast(100.2, lat=30.0002)
+        self.fast(100.4, lat=30.0004)              # 中间那帧插件没收到
+        aircraft.accept(self.entry(100.4), 100.4)
+        self.assertEqual(aircraft.motion.target[0], 30.0004)
+        self.assertEqual(aircraft.motion.error_remaining,
+                         self.plugin.ERROR_TIME)
+
+    def test_the_same_entry_twice_changes_nothing(self):
+        aircraft = self.plugin.NetworkAircraft("DAL1")
+        self.fast(100.0)
+        entry = self.entry(100.0)
+        aircraft.accept(entry, 100.0)
+        aircraft.advance(0.3)
+        since = aircraft.motion.since_update
+        aircraft.accept(entry, 100.3)
+        self.assertEqual(aircraft.motion.since_update, since,
+                         "心跳帧不能被当成新样本")
+
+
+class TerrainClampTest(unittest.TestCase):
+    """xPilot 的贴地：本地地形和对方地形之差，慢慢加上、慢慢撤掉。"""
+
+    def setUp(self):
+        self.plugin = _load_plugin("pi_xpc_terrain")
+        self.clamp = self.plugin.TerrainClamp()
+
+    def test_no_terrain_means_no_change(self):
+        self.assertEqual(self.clamp.step(0.1, 5000.0, None, 5000.0, 4000.0,
+                                         False, True), 5000.0)
+
+    def test_airborne_without_usable_data_is_only_kept_above_ground(self):
+        self.assertEqual(self.clamp.step(0.1, 3000.0, 100.0, 3000.0, 2900.0,
+                                         False, False), 3000.0)
+        self.assertEqual(self.clamp.step(0.1, 50.0, 100.0, 50.0, 400.0,
+                                         False, False), 100.0)
+
+    def test_on_the_ground_the_first_frame_snaps(self):
+        # 对方在 50 ft 的跑道上，我们这边地面 80 ft
+        altitude = self.clamp.step(0.02, 50.0, 80.0, 50.0, 0.0, True, True)
+        self.assertAlmostEqual(altitude, 80.0)
+
+    def test_on_the_ground_the_offset_blends_in_over_two_seconds(self):
+        self.clamp.step(0.02, 50.0, 50.0, 50.0, 0.0, False, True)
+        # 接地，但本地地形比对方高 30 ft：两秒里走完，期间不低于地面
+        heights = [self.clamp.step(0.1, 50.0, 80.0, 50.0, 0.0, True, False)
+                   for _ in range(20)]
+        self.assertAlmostEqual(self.clamp.offset, 30.0)
+        self.assertTrue(all(h >= 80.0 for h in heights))
+
+    def test_offset_is_removed_over_ten_seconds_after_climb_out(self):
+        self.clamp.offset = self.clamp.target = 30.0
+        self.clamp.magnitude = 30.0
+        for _ in range(50):          # 5 s，离地 500 ft
+            self.clamp.step(0.1, 1000.0, 80.0, 1000.0, 500.0, False, False)
+        self.assertAlmostEqual(self.clamp.offset, 15.0, places=6)
+        for _ in range(60):
+            self.clamp.step(0.1, 1000.0, 80.0, 1000.0, 500.0, False, False)
+        self.assertEqual(self.clamp.offset, 0.0)
+
+    def test_usable_data_needs_two_seconds_below_100_ft_on_flat_ground(self):
+        self.clamp.local = 80.0
+        for index in range(12):
+            self.clamp.record(100.0 + 0.2 * index, 30.0 + index * 1e-4, 120.0,
+                              100.0 - index, 50.0 - index)
+        self.assertTrue(self.clamp.usable)
+        # 这样就在接地之前开始对齐：对方地形 50，本地 80
+        self.clamp.step(0.1, 60.0, 80.0, 60.0, 10.0, False, False)
+        self.assertAlmostEqual(self.clamp.target, 30.0)
+
+    def test_steep_terrain_is_not_trusted(self):
+        for index in range(12):
+            self.clamp.local = 80.0 + index * 20.0
+            self.clamp.record(100.0 + 0.2 * index, 30.0 + index * 1e-5, 120.0,
+                              100.0, 50.0)
+        self.assertFalse(self.clamp.usable)
+
+    def test_draw_does_not_probe_above_the_ceiling(self):
+        probed = []
+        aircraft = self.plugin.NetworkAircraft("DAL1")
+        aircraft.accept({"target": [30.0, 120.0, 30000.0, 0.0, 0.0, 90.0],
+                         "seq": 1, "received": 1}, 0.0)
+        aircraft.draw(0.02, lambda lat, lon: probed.append(1) or 0.0)
+        self.assertEqual(probed, [])
+
+
+class SurfaceMotionTest(unittest.TestCase):
+    """起落架和襟翼按 xPilot 的时长慢慢动，不再一步到位。"""
+
+    def setUp(self):
+        self.plugin = _load_plugin("pi_xpc_surfaces")
+
+    def aircraft(self, **entry):
+        aircraft = self.plugin.NetworkAircraft("DAL1")
+        base = {"target": [30.0, 120.0, 3000.0, 0.0, 0.0, 90.0], "seq": 1,
+                "received": 1, "groundspeed": 250}
+        base.update(entry)
+        aircraft.accept(base, 0.0)
+        aircraft.draw(0.02)
+        return aircraft, base
+
+    def test_the_first_frame_takes_the_target(self):
+        aircraft, _ = self.aircraft(gear_down=True, flaps=0.5)
+        self.assertEqual((aircraft.gear, aircraft.flaps), (1.0, 0.5))
+
+    def test_gear_takes_ten_seconds(self):
+        aircraft, entry = self.aircraft(gear_down=False)
+        entry = dict(entry, gear_down=True)
+        aircraft.accept(entry, 0.1)
+        for _ in range(50):
+            aircraft.draw(0.1)
+        self.assertAlmostEqual(aircraft.gear, 0.5, places=6)
+        for _ in range(60):
+            aircraft.draw(0.1)
+        self.assertEqual(aircraft.gear, 1.0)
+
+    def test_flaps_take_five_seconds_and_do_not_overshoot(self):
+        aircraft, entry = self.aircraft(flaps=0.0)
+        aircraft.accept(dict(entry, flaps=0.3), 0.1)
+        for _ in range(20):
+            aircraft.draw(0.1)
+        self.assertAlmostEqual(aircraft.flaps, 0.3)
+
+    def test_nose_wheel_and_moving_values_reach_the_animation(self):
+        aircraft, entry = self.aircraft(nose_wheel=12.5, gear_down=True)
+        values = self.plugin.PythonInterface._animation_values(
+            entry, aircraft.surfaces())
+        names = self.plugin.ANIMATION_DATAREFS
+        self.assertEqual(values[names.index("libxplanemp/controls/nws_ratio")], 12.5)
+        self.assertEqual(values[names.index("libxplanemp/controls/gear_ratio")], 1.0)
+
+
+class PluginFrameLoopTest(unittest.TestCase):
+    """插件的主循环：每帧积分，消息只带样本，心跳 30 s。用假的 xp 跑。"""
+
+    def setUp(self):
+        self.plugin = _load_plugin("pi_xpc_loop")
+        self.clock = [0.0]
+        self.positions = []
+        fake = types.SimpleNamespace(
+            getElapsedTime=lambda: self.clock[0],
+            worldToLocal=lambda lat, lon, alt: (lon * 1000.0, alt, -lat * 1000.0),
+            instanceSetPosition=lambda inst, pos, data: self.positions.append(pos),
+            loadObjectAsync=lambda path, cb, refcon: None,
+            destroyInstance=lambda inst: None,
+            unloadObject=lambda ref: None,
+            getSystemPath=lambda: "",
+            log=lambda text: None)
+        self.plugin.xp = fake
+        interface = self.plugin.PythonInterface.__new__(self.plugin.PythonInterface)
+        interface.reassembler = self.plugin.Reassembler()
+        interface.aircraft = {}
+        interface.order = []
+        interface.last_message = 0.0
+        interface.last_frame = None
+        interface.tcas_written = 0
+        interface.tcas_available = False
+        interface.have_planes = False
+        interface.probe = None
+        interface.probe_failed = False
+        self.inbox = []
+        interface._receive_latest = lambda: self.inbox.pop(0) if self.inbox else None
+        self.interface = interface
+
+    def message(self, *entries):
+        self.inbox.append({"type": "traffic", "aircraft": list(entries)})
+
+    def entry(self, seq=1, received=1, lat=30.0):
+        return {"callsign": "DAL1", "object": "a.obj", "seq": seq,
+                "received": received,
+                "target": [lat, 120.0, 10000.0, 0.0, 0.0, 90.0],
+                "velocity": [0.0, 0.0, 100.0], "rotation": [0.0, 0.0, 0.0]}
+
+    def frame(self, dt=1 / 60):
+        self.clock[0] += dt
+        self.interface._pump()
+
+    def test_aircraft_move_every_frame_between_messages(self):
+        self.message(self.entry())
+        self.frame()
+        self.interface.aircraft["DAL1"].instance = object()
+        for _ in range(6):
+            self.frame()
+        zs = [pos[2] for pos in self.positions]
+        self.assertEqual(len(zs), 6)
+        self.assertEqual(len(set(zs)), 6, "两次消息之间飞机也要每帧动")
+
+    def test_a_heartbeat_keeps_them_and_silence_clears_them(self):
+        self.message(self.entry())
+        self.frame()
+        for _ in range(25):
+            self.message(self.entry())
+            self.frame(1.0)
+        self.assertIn("DAL1", self.interface.aircraft)
+        self.frame(self.plugin.HEARTBEAT_TIMEOUT - 1.0)
+        self.assertIn("DAL1", self.interface.aircraft, "30 s 之内不该清场")
+        self.frame(2.0)
+        self.assertEqual(self.interface.aircraft, {})
+
+    def test_an_aircraft_missing_from_the_message_is_removed(self):
+        self.message(self.entry())
+        self.frame()
+        self.message()
+        self.frame()
+        self.assertEqual(self.interface.aircraft, {})
+
+    def test_the_sample_arrives_after_the_frame_advance(self):
+        """先积分到此刻再收样本，新样本的误差不是拿上一帧的位置算的。"""
+        self.message(self.entry())
+        self.frame()
+        self.frame(0.2)
+        self.message(self.entry(seq=2, received=2, lat=30.0))
+        self.frame(0.2)
+        motion = self.interface.aircraft["DAL1"].motion
+        # 画出来的已经往北走了 0.4 s，目标还在 30.0：误差速度向南
+        self.assertLess(motion.error_velocity[2], 0.0)
+        self.assertAlmostEqual(motion.error_velocity[2], -100.0 * 0.4 / 2.0, places=6)
+
+
+class VertOffsetTest(unittest.TestCase):
+    """CSL 模型的垂直偏移：xsb_aircraft.txt 写了就用，没写从 .obj 算。"""
+
+    def setUp(self):
+        self.directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.directory)
+
+    def write(self, name, text):
+        path = os.path.join(self.directory, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return path
+
+    def test_vert_offset_line(self):
+        self.write("xsb_aircraft.txt",
+                   "OBJ8_AIRCRAFT A\nOBJ8 SOLID YES a.obj\nICAO A320\nVERT_OFFSET 2.5\n"
+                   "OBJ8_AIRCRAFT B\nOBJ8 SOLID YES b.obj\nICAO B738\n"
+                   "OFFSET 0 0 3.1\n")
+        models = {m.name: m for m in cslmatch.parse_package(self.directory)}
+        self.assertEqual(models["A"].vert_offset, 2.5)
+        self.assertEqual(models["B"].vert_offset, 3.1)
+        self.assertEqual(cslmatch.vert_offset(models["A"]), 2.5)
+
+    def test_computed_from_the_lowest_vertex(self):
+        path = self.write("c.obj", "I\n800\nOBJ\n"
+                          "VT   1.000000   -2.250000   3.0   0 1 0   0 0\n"
+                          "VT   1.000000   4.500000   3.0   0 1 0   0 0\n")
+        model = cslmatch.Model("C", path, icao="A320")
+        self.assertAlmostEqual(cslmatch.vert_offset(model), 2.25)
+
+    def test_an_unreadable_obj_is_zero(self):
+        model = cslmatch.Model("D", os.path.join(self.directory, "none.obj"),
+                               icao="A320")
+        self.assertEqual(cslmatch.vert_offset(model), 0.0)
 
 
 if __name__ == "__main__":

@@ -89,15 +89,19 @@ DEFAULT_TYPE = "B738"
 class Model:
     """CSL 包里的一个模型。"""
 
-    __slots__ = ("name", "path", "icao", "airline", "livery", "package")
+    __slots__ = ("name", "path", "icao", "airline", "livery", "package",
+                 "vert_offset")
 
-    def __init__(self, name, path, package="", icao="", airline="", livery=""):
+    def __init__(self, name, path, package="", icao="", airline="", livery="",
+                 vert_offset=None):
         self.name = name
         self.path = path
         self.package = package
         self.icao = icao.upper()
         self.airline = airline.upper()
         self.livery = livery.upper()
+        # xsb_aircraft.txt 里写明的垂直偏移（米）。None = 没写，从 .obj 算
+        self.vert_offset = vert_offset
 
     def __repr__(self):
         return f"<Model {self.name} {self.icao}/{self.airline or '-'}>"
@@ -141,6 +145,11 @@ def parse_package(directory):
             if parts[1].upper() == "SOLID" and not current.path:
                 relative = " ".join(parts[3:]).replace("\\", "/")
                 current.path = os.path.normpath(os.path.join(directory, relative))
+        elif keyword == "VERT_OFFSET" and current is not None and len(parts) > 1:
+            current.vert_offset = _float_or_none(parts[1])
+        elif keyword == "OFFSET" and current is not None and len(parts) > 3:
+            # PilotEdge 的写法，只有第三个参数是垂直偏移（XPMP2 同样只认它）
+            current.vert_offset = _float_or_none(parts[3])
         elif keyword == "ICAO" and current is not None and len(parts) > 1:
             current.icao = parts[1].upper()
         elif keyword == "AIRLINE" and current is not None and len(parts) > 2:
@@ -156,6 +165,66 @@ def parse_package(directory):
              os.path.basename(directory), len(usable), len(models),
              len(models) - len(usable))
     return usable
+
+
+def _float_or_none(text):
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+# .obj 路径 -> 算出来的垂直偏移。一个模型只读一次文件。
+_obj_offsets = {}
+
+
+def obj_vert_offset(path):
+    """从 OBJ8 文件的顶点算垂直偏移（米），XPMP2 的 FetchVertOfsFromObjFile。
+
+    CSL 模型的原点通常在机身中间，不在轮子底下，按真高画轮子就陷在地里。
+    最低的顶点（VT/VLINE 的 y）取反就是要抬的高度。min 和 max 都从 0 起算、
+    min > 0 时取 -max，这些都照抄 XPMP2——它自己的注释也说不明白为什么，但
+    所有 CSL 包是对着它调的。读不了、不是 OBJ8 就返回 0。
+    """
+    if path in _obj_offsets:
+        return _obj_offsets[path]
+    low = high = 0.0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for number, line in enumerate(f, 1):
+                if number == 2:
+                    try:
+                        if int(line.split()[0]) < 800:
+                            break
+                    except (ValueError, IndexError):
+                        break
+                if len(line) < 20 or line[0] != "V" or line[1] not in "TL":
+                    continue
+                parts = line.split()
+                if len(parts) < 7 or parts[0] not in ("VT", "VLINE"):
+                    continue
+                try:
+                    y = float(parts[2])
+                except ValueError:
+                    continue
+                if y < low:
+                    low = y
+                elif y > high:
+                    high = y
+    except OSError as e:
+        log.debug("could not read %s for its vertical offset: %s", path, e)
+    offset = -low if low < 0.0 else -high
+    _obj_offsets[path] = offset
+    return offset
+
+
+def vert_offset(model):
+    """画这个模型时要往上抬多少米：xsb_aircraft.txt 写了就用，没写就从 .obj 算。"""
+    if model.vert_offset is not None:
+        return model.vert_offset
+    if not model.path:
+        return 0.0
+    return obj_vert_offset(model.path)
 
 
 def find_packages(root):

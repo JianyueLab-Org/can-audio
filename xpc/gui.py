@@ -149,11 +149,16 @@ class XpcWindow(QMainWindow):
         self.voice = None
         self.snapshot = None
 
-        # 他机：FSD 线程往表里写，tick() 读出来插值好推给插件
-        self.traffic = traffic_module.TrafficTable()
+        # 他机：FSD 线程往表里写，traffic_tick() 把每架的最新样本推给插件，
+        # 插件自己逐帧积分。SampleTable 是 xpc 自己的子类：条目里多带样本。
+        self.traffic = bridge.SampleTable()
         self.bridge = bridge.BridgeSender()
         self.models = cslmatch.ModelSet()
-        self._model_cache = {}          # 呼号 -> 匹配到的 .obj 路径
+        self._model_cache = {}          # 呼号 -> (匹配到的 .obj 路径, 垂直偏移 米)
+        # 上一次推给插件的内容和时刻。没变就不推，但至少每 PUSH_HEARTBEAT 秒
+        # 推一次，插件靠它判断客户端还活着。
+        self._last_pushed = None
+        self._last_push_time = float("-inf")
         self._load_models()
         # 键盘 / 摇杆 / 鼠标侧键三合一。连上之后才开始监听。
         self.ptt_watcher = ptt.PttWatcher(self.settings.ptt_bindings,
@@ -177,9 +182,10 @@ class XpcWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(500)
-        # 他机单独一个更快的节奏。插值是按时刻算的，500 ms 推一次的话一架
-        # 450 kt 的飞机每半秒瞬移 115 米，中间全程冻住——traffic.py 里的插值
-        # 等于白算。100 ms 推一次窗外才是连续的。
+        # 他机单独一个更快的节奏。插件每帧自己积分，平滑不靠这个定时器；它只
+        # 决定新样本多快送到插件——100 ms 以内，比误差速度的 2 s 窗口小得多。
+        # 没有变化的那几拍不推（_push_traffic），所以快也不费事。FSD 的位置
+        # 也在这一拍喂（见 traffic_tick）。
         self.traffic_timer = QTimer(self)
         self.traffic_timer.timeout.connect(self.traffic_tick)
         self.traffic_timer.start(100)
@@ -523,6 +529,7 @@ class XpcWindow(QMainWindow):
         for callsign in list(self.traffic.aircraft):
             self.traffic.remove(callsign)
         self._model_cache.clear()
+        self._last_pushed = None
         try:
             self.bridge.send_traffic([], own=None)
         except Exception:
@@ -642,7 +649,7 @@ class XpcWindow(QMainWindow):
         self._sync_frequency()
 
     def traffic_tick(self):
-        """每 0.1 秒：把他机插值到当下推给插件，并把最新的本机位置交给 FSD。
+        """每 0.1 秒：把他机的新样本推给插件，并把最新的本机位置交给 FSD。
 
         位置也在这里喂而不是在 tick() 里：FSD 每 0.2 秒发一个位置包，0.5 秒
         才喂一次的话，连着两三个包是同一份数据，别人那边飞机一走一停。
@@ -675,11 +682,20 @@ class XpcWindow(QMainWindow):
                  len(self.models), len(self.models.types))
 
     def _push_traffic(self, snapshot):
-        """把他机插值到当前时刻，推给插件去画。"""
+        """把每架他机的最新样本推给插件。插件自己逐帧积分。
+
+        内容和上一次一样就不推，但至少每 PUSH_HEARTBEAT 秒推一次——插件
+        HEARTBEAT_TIMEOUT 秒收不到任何东西就清场。
+        """
         # prune 不受开关控制：关着渲染的话表会涨一整场
         for callsign in self.traffic.prune():
             self._model_cache.pop(callsign, None)
         if not self.settings.render_traffic:
+            if self._last_pushed:
+                # 关掉时推一帧空的：插件现在自己积分，不清的话飞机会沿着最后
+                # 的速度一直飞到心跳超时
+                self.bridge.send_traffic([], own=None)
+            self._last_pushed = None
             return
 
         origin = (snapshot["latitude"], snapshot["longitude"])
@@ -688,10 +704,21 @@ class XpcWindow(QMainWindow):
             limit=bridge.MAX_TRAFFIC,
             max_range_nm=self.settings.traffic_range_nm or None)
 
+        outgoing = []
         for entry in entries:
-            entry["object"] = self._model_for(entry)
-        self.bridge.send_traffic(entries, own=origin)
+            entry["object"], entry["vert_offset"] = self._model_for(entry)
+            outgoing.append(bridge.plugin_entry(entry))
         self.traffic_label.setText(t("radio.traffic", count=len(entries)))
+
+        # 距离每拍都在变，只用来排序，不算"变了"
+        content = [{k: v for k, v in e.items() if k != "range_nm"} for e in outgoing]
+        now = traffic_module.clock()
+        if (content == self._last_pushed
+                and now - self._last_push_time < bridge.PUSH_HEARTBEAT):
+            return
+        self._last_pushed = content
+        self._last_push_time = now
+        self.bridge.send_traffic(outgoing, own=origin)
 
     def _model_for(self, entry):
         """给一架飞机挑模型。匹配结果缓存住，别每帧都算。"""
@@ -704,7 +731,8 @@ class XpcWindow(QMainWindow):
             airline=entry.get("airline", ""),
             csl=entry.get("csl", ""))
         path = model.path if model else ""
-        self._model_cache[callsign] = path
+        offset = cslmatch.vert_offset(model) if model else 0.0
+        self._model_cache[callsign] = (path, offset)
         # 带上这次匹配用的机型/航司：#SB 的回复如果恰好落在快照之后、这里
         # 之前，无条件清标记会把那次更新吞掉
         self.traffic.mark_model_clean(callsign,
@@ -719,7 +747,7 @@ class XpcWindow(QMainWindow):
                      model.name, why)
         else:
             log.debug("no model available for %s: %s", callsign, why)
-        return path
+        return path, offset
 
     # ---------- 槽 ----------
     def on_sim_state(self, connected, message):
