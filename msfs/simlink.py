@@ -22,6 +22,7 @@ import math
 import threading
 import time
 
+import altitude as altitude_model
 from i18n import t
 
 log = logging.getLogger("sim")
@@ -52,11 +53,9 @@ SIMVARS = {
     "longitude": "PLANE_LONGITUDE",                # 度（同上）
     "altitude": "PLANE_ALTITUDE",                  # 英尺（真高，不是高度表读数）
     "agl": "PLANE_ALT_ABOVE_GROUND",               # 英尺
-    # 只用来算位置包最后那个气压修正量，见 pressure_delta()。
-    # 别改用 PRESSURE_ALTITUDE：RequestList.py 给它写的单位是 **Meters**，
-    # 这一堆高度里就它一个不是英尺，直接当英尺用会差 3.28 倍。
-    "indicated_altitude": "INDICATED_ALTITUDE",    # 英尺
-    "baro_setting": "KOHLSMAN_SETTING_HG",         # inHg
+    # 气压高度。RequestList.py 给它写的单位是 Meters，UNIT_OVERRIDES 改成 Feet。
+    "pressure_altitude": "PRESSURE_ALTITUDE",      # 英尺（改过单位）
+    "sea_level_pressure": "SEA_LEVEL_PRESSURE",    # 百帕
     "groundspeed": "GROUND_VELOCITY",              # 节
     "pitch": "PLANE_PITCH_DEGREES",                # 弧度（名字骗人）
     "bank": "PLANE_BANK_DEGREES",                  # 弧度（名字同样骗人）
@@ -96,6 +95,7 @@ UNIT_OVERRIDES = {
     "ROTATION_VELOCITY_BODY_X": b"Radians per second",
     "ROTATION_VELOCITY_BODY_Y": b"Radians per second",
     "ROTATION_VELOCITY_BODY_Z": b"Radians per second",
+    "PRESSURE_ALTITUDE": b"Feet",
 }
 
 # 每一轮都读的那几个：位置包里会动的量。其余的（无线电、应答机、灯光、襟翼……）
@@ -108,12 +108,12 @@ UNIT_OVERRIDES = {
 # 一卡更久。位置包 5 Hz，于是连着好几个包是同一份快照。只把会动的九个放进
 # 每一轮，一轮的读数从 25 个降到 9 + 4 个。
 #
-# indicated_altitude 也在这里：pressure_delta() 拿它和真高相减，两个不是同一
-# 时刻读的话，爬升中每落后一秒就差出一截垂直速度。
+# pressure_altitude 也在这里：网络高度由它算，和真高不是同一时刻读的话，
+# 爬升中每落后一秒就差出一截垂直速度。
 #
 # 速度和角速度也在这里：快速位置包 5 Hz，和位置不是同一轮读的话，别人按这个
 # 速度往前推的起点就是错的。代价是每轮多六次读。
-FAST_SIMVARS = ("latitude", "longitude", "altitude", "indicated_altitude",
+FAST_SIMVARS = ("latitude", "longitude", "altitude", "pressure_altitude",
                 "groundspeed", "pitch", "bank", "heading", "on_ground",
                 "velocity_east", "velocity_up", "velocity_north",
                 "pitch_rate", "heading_rate", "bank_rate")
@@ -122,37 +122,6 @@ SLOW_PER_POLL = 4
 
 
 METRES_PER_FOOT = 0.3048
-
-# 标准大气压，高度表拨到这个值时"指示高度"就是气压高度。
-STANDARD_PRESSURE_INHG = 29.92
-# 高度表窗口能拨到的范围。超出这个范围的值一定是没读到（0）或者读错了，
-# 拿它去算修正量会把飞机在雷达上挪三万英尺，所以宁可不修正。
-BARO_RANGE = (25.0, 32.0)
-
-
-def pressure_delta(indicated_ft, baro_inhg, true_altitude_ft):
-    """位置包最后一个字段：气压高度减真高，英尺。
-
-    和 xpc/xplane.py 里那份是同一套算法，只是数据来自 SimConnect。
-
-    应答机报的是**气压高度**（高度表拨 29.92 时读到的数），而位置包第 7 个
-    字段报的是**真高**——两者在巡航高度上能差一千英尺，这就是"座舱里 35000、
-    雷达上 34000"的由来。FSD 协议把差值单独放在最后一个字段里，正是为了让
-    画他机的客户端拿真高摆飞机、让管制端拿真高加修正量当高度显示。
-
-    气压高度 = 指示高度 + (29.92 - 高度表拨的气压) * 1000。温度偏差带来的
-    误差不需要另算：指示高度本身就带着它，真高不带，相减自然就有了。
-
-    读不到就返回 0，也就是退回修正前的行为——宁可不修正，不能瞎修正。
-    """
-    if indicated_ft is None or baro_inhg is None:
-        return 0
-    if not BARO_RANGE[0] <= baro_inhg <= BARO_RANGE[1]:
-        return 0
-    pressure_altitude = (indicated_ft
-                         + (STANDARD_PRESSURE_INHG - baro_inhg) * 1000.0)
-    return int(round(pressure_altitude - true_altitude_ft))
-
 
 def bcd_to_squawk(raw):
     """应答机码在 SimVar 里是 BCD 编码的。
@@ -412,7 +381,12 @@ class SimLink:
         if not raw:
             return None
 
-        altitude = int(round(raw.get("altitude", 0.0)))
+        true_altitude = raw.get("altitude", 0.0)
+        altitude = int(round(true_altitude))
+        network, pressure, temperature_error = altitude_model.msfs_altitudes(
+            true_altitude, raw.get("sea_level_pressure"), raw.get("pressure_altitude"))
+        network = int(round(network))
+        pressure = int(round(pressure))
         groundspeed = int(round(raw.get("groundspeed", 0.0)))
         on_ground = bool(raw.get("on_ground", 0))
         return {
@@ -421,9 +395,12 @@ class SimLink:
             # 90 秒后把连接掐掉。
             "latitude": raw.get("latitude", 0.0),
             "longitude": raw.get("longitude", 0.0),
+            # 真高。网络高度、气压高度和修正量的算法见 altitude.py。
             "altitude": altitude,
-            "pressure_delta": pressure_delta(raw.get("indicated_altitude"),
-                                             raw.get("baro_setting"), altitude),
+            "network_altitude": network,
+            "pressure_altitude": pressure,
+            "temperature_error": int(round(temperature_error)),
+            "pressure_delta": pressure - network,
             "agl": int(round(raw.get("agl", 0.0))),
             "groundspeed": groundspeed,
             "pitch": -math.degrees(raw.get("pitch", 0.0)),

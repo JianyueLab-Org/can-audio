@@ -31,6 +31,7 @@ except Exception:
                   "opuslib.api.encoder", "opuslib.api.info", "opuslib.exceptions"):
         sys.modules.setdefault(_name, mock.MagicMock())
 
+import altitude
 import bridge
 import cslmatch
 import fsdpilot
@@ -2192,16 +2193,54 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(self.link.snapshot()["altitude"], 35000)
 
     def test_pressure_correction_without_the_datarefs(self):
-        """老 X-Plane 不推这两个 dataref 时退回修正前的行为。"""
-        self.assertEqual(self.link.snapshot()["pressure_delta"], 0)
-
-    def test_pressure_correction_from_the_altimeter(self):
-        """高度表读数和真高之差，就是管制端要加的那一千英尺。"""
-        self.link.values["indicated_altitude"] = 36000.0
-        self.link.values["baro_setting"] = 29.92
+        """一个高度 dataref 都没推时不修正。"""
         snapshot = self.link.snapshot()
-        self.assertEqual(snapshot["altitude"], 35000)     # 真高照旧
-        self.assertEqual(snapshot["pressure_delta"], 1000)
+        self.assertEqual(snapshot["network_altitude"], 35000)
+        self.assertEqual(snapshot["pressure_altitude"], 35000)
+        self.assertEqual(snapshot["pressure_delta"], 0)
+
+    def test_xplane_12_uses_its_own_datarefs(self):
+        """FL380、标准海压、比 ISA 暖：真高 39700，位置包报 38000。"""
+        self.link.values.update({
+            "elevation": 39700 * xplane.METRES_PER_FOOT,
+            "pressure_altitude": 38000.0, "temperature_error": -1700.0,
+            "sea_level_baro": 29.92,
+        })
+        snapshot = self.link.snapshot()
+        self.assertEqual(snapshot["altitude"], 39700)     # 真高照旧
+        self.assertEqual(snapshot["network_altitude"], 38000)
+        self.assertEqual(snapshot["pressure_altitude"], 38000)
+        self.assertEqual(snapshot["temperature_error"], -1700)
+        self.assertEqual(snapshot["pressure_delta"], 0)
+
+    def test_xplane_12_on_a_high_pressure_day(self):
+        self.link.values.update({
+            "elevation": 38334 * xplane.METRES_PER_FOOT,
+            "pressure_altitude": 38000.0, "temperature_error": 0.0,
+            "sea_level_baro": 1030.0 / 33.8639,
+        })
+        snapshot = self.link.snapshot()
+        self.assertEqual(snapshot["network_altitude"], 38334)
+        self.assertEqual(snapshot["pressure_delta"], -334)
+
+    def test_xplane_11_derives_pressure_altitude_from_sea_level_pressure(self):
+        """X-Plane 11 没有 pressure_altitude 和 temperature_error。"""
+        true_altitude = 38334.4
+        self.link.values.update({
+            "elevation": true_altitude * xplane.METRES_PER_FOOT,
+            "sea_level_baro": 1030.0 / 33.8639,
+        })
+        snapshot = self.link.snapshot()
+        self.assertEqual(snapshot["network_altitude"], 38334)
+        self.assertEqual(snapshot["temperature_error"], 0)
+        self.assertEqual(snapshot["pressure_altitude"], 38000)
+        self.assertEqual(snapshot["pressure_delta"], -334)
+
+    def test_nothing_reads_the_cockpit_altimeter(self):
+        """机模自己的气压旋钮不驱动默认高度表，读它就会带进拨错的气压。"""
+        for dataref in xplane.DATAREFS.values():
+            self.assertNotIn("altitude_ft_pilot", dataref)
+            self.assertNotIn("barometer_setting", dataref)
 
     def test_agl_in_feet(self):
         self.assertEqual(self.link.snapshot()["agl"], 10000)
@@ -2263,6 +2302,101 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(xplane.DATAREFS["pitch_rate"], "sim/flightmodel/position/Q")
         self.assertEqual(xplane.DATAREFS["heading_rate"], "sim/flightmodel/position/R")
         self.assertEqual(xplane.DATAREFS["bank_rate"], "sim/flightmodel/position/P")
+
+
+class AltitudeModelTest(unittest.TestCase):
+    """altitude.py：ISA 换算、X-Plane 11/12、他机修正。msfs 有一份逐字节相同的拷贝。"""
+
+    def test_standard_surface_height(self):
+        self.assertAlmostEqual(altitude.standard_surface_height(1013.25), 0.0)
+        self.assertAlmostEqual(altitude.standard_surface_height(1030.0), 453, delta=1)
+        self.assertAlmostEqual(altitude.standard_surface_height(990.0), -644, delta=1)
+
+    def test_isa_and_pressure_altitude_are_inverse(self):
+        for sea_level in (960.0, 1013.25, 1040.0):
+            for pressure in (-1000.0, 0.0, 10000.0, 38000.0, 45000.0):
+                true_altitude = altitude.isa_altitude(pressure, sea_level)
+                self.assertAlmostEqual(
+                    altitude.pressure_altitude(true_altitude, sea_level), pressure,
+                    places=6)
+
+    def test_standard_pressure_changes_nothing(self):
+        self.assertAlmostEqual(altitude.pressure_altitude(38000.0, 1013.25), 38000.0)
+        self.assertAlmostEqual(altitude.isa_altitude(38000.0, 1013.25), 38000.0)
+
+    def test_the_surface_height_is_the_altitude_of_pressure_altitude_zero(self):
+        self.assertAlmostEqual(altitude.isa_altitude(0.0, 1030.0),
+                               altitude.standard_surface_height(1030.0), places=6)
+
+    def test_xplane_12(self):
+        network, pressure, error = altitude.xplane_altitudes(
+            39700.0, 1013.25, 38000.0, -1700.0)
+        self.assertEqual((network, pressure, error), (38000.0, 38000.0, -1700.0))
+
+    def test_xplane_12_without_the_temperature_error(self):
+        network, pressure, error = altitude.xplane_altitudes(38334.0, 1030.0, 38000.0)
+        self.assertEqual((network, pressure, error), (38334.0, 38000.0, 0.0))
+
+    def test_xplane_11(self):
+        true_altitude = altitude.isa_altitude(38000.0, 1030.0)
+        network, pressure, error = altitude.xplane_altitudes(true_altitude, 1030.0)
+        self.assertAlmostEqual(network, true_altitude)
+        self.assertAlmostEqual(pressure, 38000.0, places=6)
+        self.assertEqual(error, 0.0)
+
+    def test_zeros_for_missing_xplane_12_datarefs_fall_back_to_xplane_11(self):
+        network, pressure, error = altitude.xplane_altitudes(38000.0, 1013.25, 0.0, 0.0)
+        self.assertEqual((network, error), (38000.0, 0.0))
+        self.assertAlmostEqual(pressure, 38000.0)
+
+    def test_xplane_11_without_sea_level_pressure(self):
+        self.assertEqual(altitude.xplane_altitudes(35000.0, None),
+                         (35000.0, 35000.0, 0.0))
+        self.assertEqual(altitude.xplane_altitudes(35000.0, 0.0),
+                         (35000.0, 35000.0, 0.0))
+
+    def test_xpilot_linear_fallback_is_off_by_a_hundred_and_sixty_feet(self):
+        """xPilot 的 X-Plane 11 路径按 30 ft/hPa 线性换算，FL380、1030 hPa 差 168 ft。"""
+        true_altitude = altitude.isa_altitude(38000.0, 1030.0)
+        linear = true_altitude + (1013.25 - 1030.0) * 30.0
+        self.assertTrue(100 <= 38000 - linear <= 200, 38000 - linear)
+        _, pressure, _ = altitude.xplane_altitudes(true_altitude, 1030.0)
+        self.assertAlmostEqual(pressure, 38000.0, places=6)
+
+    def test_msfs(self):
+        network, pressure, error = altitude.msfs_altitudes(39700.0, 1013.25, 38000.0)
+        self.assertAlmostEqual(network, 38000.0)
+        self.assertEqual(pressure, 38000.0)
+        self.assertAlmostEqual(error, -1700.0)
+
+    def test_msfs_rejects_a_pressure_altitude_in_metres(self):
+        self.assertEqual(altitude.msfs_altitudes(38000.0, 1013.25, 11582.4),
+                         (38000.0, 38000.0, 0.0))
+
+    def test_adjust_weights(self):
+        own, error = 38000.0, -1700.0
+        cases = {0: 1.0, 3000: 1.0, 4500: 0.5, 6000: 0.0, 7000: 0.0}
+        for distance, weight in cases.items():
+            for sign in (1, -1):
+                remote = own + sign * distance
+                self.assertAlmostEqual(
+                    altitude.adjust_incoming_altitude(remote, own, error),
+                    remote - error * weight, msg=(distance, sign))
+
+    def test_no_own_snapshot_means_no_adjustment(self):
+        self.assertEqual(altitude.adjust_incoming_altitude(38000.0, None, -1700.0),
+                         38000.0)
+
+    def test_no_temperature_error_means_no_adjustment(self):
+        self.assertEqual(altitude.adjust_incoming_altitude(38000.0, 38000.0, 0),
+                         38000.0)
+
+    def test_the_plugin_does_not_need_its_own_copy(self):
+        """插件拿到的 target 已经是修正过的高度：修正在 fsdpilot 里，进 TrafficTable 之前。"""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "plugin", "PI_XpcTraffic.py")
+        with open(path, encoding="utf-8") as f:
+            self.assertNotIn("temperature_error", f.read())
 
 
 class TransponderModeTest(unittest.TestCase):
@@ -4917,6 +5051,80 @@ class VertOffsetTest(unittest.TestCase):
         model = cslmatch.Model("D", os.path.join(self.directory, "none.obj"),
                                icao="A320")
         self.assertEqual(cslmatch.vert_offset(model), 0.0)
+
+
+class NetworkAltitudeTest(unittest.TestCase):
+    """位置包报网络高度，他机高度按本机温度误差修正（xPilot AdjustIncomingAltitude）。"""
+
+    OWN = {
+        "latitude": 31.2, "longitude": 121.5,
+        "altitude": 39700, "network_altitude": 38000,
+        "pressure_altitude": 38000, "temperature_error": -1700,
+        "pressure_delta": 0, "agl": 39000.0, "groundspeed": 450,
+        "pitch": 0.0, "bank": 0.0, "heading": 90.0, "squawk": 2000,
+        "xpdr_mode": 2, "on_ground": False,
+        "velocity_east": 230.0, "velocity_up": 0.0, "velocity_north": 0.0,
+        "pitch_rate": 0.0, "heading_rate": 0.0, "bank_rate": 0.0,
+        "nose_wheel": 0.0,
+    }
+    FAST = ("^CES2345:31.3:121.6:{alt}:{alt}:12582828:"
+            "230.0:0.0:0.0:0.0:0.0:0.0:0.0")
+
+    def setUp(self):
+        self.table = traffic_module.TrafficTable()
+        self.sent = []
+        self.pilot = fsdpilot.FSDPilot("fsd.example", "CCA1501", "1000", "pw",
+                                       traffic=self.table)
+        self.pilot._send = lambda packet: self.sent.append(packet) or True
+
+    def _at(self, alt):
+        pbh = fsdpilot.pack_pbh(0.0, 0.0, 90.0)
+        return f"@N:CES2345:2000:1:31.3:121.6:{alt}:450:{pbh}:0"
+
+    def _received(self):
+        return self.table.get("CES2345").latest.altitude
+
+    def test_position_packet_carries_the_network_altitude_and_the_delta(self):
+        own = dict(self.OWN, altitude=38334, network_altitude=38334,
+                   temperature_error=0, pressure_delta=-334)
+        self.pilot.update_position(own)
+        self.pilot._send_position()
+        fields = self.sent[0].split(":")
+        self.assertEqual(fields[6], "38334")
+        self.assertEqual(fields[9], "-334")
+        self.assertEqual(int(fields[6]) + int(fields[9]), 38000)
+
+    def test_warm_atmosphere_sends_the_flight_level(self):
+        self.pilot.update_position(dict(self.OWN))
+        self.pilot._send_position()
+        fields = self.sent[0].split(":")
+        self.assertEqual(fields[6], "38000")
+        self.assertEqual(fields[9], "0")
+
+    def test_fast_packets_carry_the_network_altitude(self):
+        self.pilot.update_position(dict(self.OWN))
+        for kind in ("^", "#SL", "#ST"):
+            packet = fsdpilot.fast_position_packet(kind, "CCA1501", self.OWN)
+            self.assertEqual(packet.split(":")[3], "38000.00", kind)
+
+    def test_incoming_position_is_adjusted_by_our_temperature_error(self):
+        self.pilot.update_position(dict(self.OWN))
+        self.pilot._handle_packet(self._at(38000))
+        self.assertEqual(self._received(), 39700)
+
+    def test_incoming_fast_position_is_adjusted_too(self):
+        self.pilot.update_position(dict(self.OWN))
+        self.pilot._handle_packet(self.FAST.format(alt="40000.00"))
+        self.assertAlmostEqual(self._received(), 41700.0)
+
+    def test_distant_traffic_is_left_alone(self):
+        self.pilot.update_position(dict(self.OWN))
+        self.pilot._handle_packet(self._at(31000))
+        self.assertEqual(self._received(), 31000)
+
+    def test_without_our_own_snapshot_nothing_is_adjusted(self):
+        self.pilot._handle_packet(self._at(38000))
+        self.assertEqual(self._received(), 38000)
 
 
 if __name__ == "__main__":

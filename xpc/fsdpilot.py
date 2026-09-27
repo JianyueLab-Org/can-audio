@@ -32,6 +32,7 @@ import time
 
 # _status() 的消息会直接进消息区，是界面文字，所以要过 i18n。日志那一半仍然
 # 是英文——分界线在"这句话最后到哪儿去"，不在它写在哪个模块里。
+from altitude import adjust_incoming_altitude
 from i18n import t
 
 log = logging.getLogger("fsd")
@@ -153,6 +154,11 @@ def wire_rotation(snapshot):
             -math.radians(snapshot.get("bank_rate", 0.0)))
 
 
+def wire_altitude(snapshot):
+    """位置包里报的高度：网络高度（真高 + 温度误差），见 altitude.py。"""
+    return snapshot.get("network_altitude", snapshot["altitude"])
+
+
 def is_stopped(snapshot):
     """xPilot 的 PositionalVelocityIsZero：速度和角速度都几乎为零。"""
     velocity = (snapshot.get("velocity_east", 0.0), snapshot.get("velocity_up", 0.0),
@@ -164,7 +170,7 @@ def is_stopped(snapshot):
 def fast_position_packet(kind, callsign, snapshot):
     """拼一个 `^` / `#SL` / `#ST`。字段和精度照 xPilot 的 PDUFastPilotPosition。
 
-        0 呼号  1 纬度  2 经度  3 真高（英尺）  4 离地高（英尺）  5 PBH
+        0 呼号  1 纬度  2 经度  3 网络高度（英尺）  4 离地高（英尺）  5 PBH
         6/7/8 速度 东/上/北（米每秒）  9/10/11 角速度（弧度每秒）  12 前轮角（度）
 
     `#ST` 没有 6-11 那六段，一共 7 段；另外两种 13 段——和 can-fsd 的
@@ -174,7 +180,7 @@ def fast_position_packet(kind, callsign, snapshot):
                    snapshot.get("on_ground", False))
     fields = [f"{kind}{callsign}",
               f"{snapshot['latitude']:.6f}", f"{snapshot['longitude']:.6f}",
-              f"{float(snapshot['altitude']):.2f}",
+              f"{float(wire_altitude(snapshot)):.2f}",
               f"{float(snapshot.get('agl', 0.0)):.2f}", str(pbh)]
     if kind != "#ST":
         fields += [f"{snapshot.get('velocity_east', 0.0):.4f}",
@@ -645,13 +651,12 @@ class FSDPilot:
 
         pbh = pack_pbh(snapshot["pitch"], snapshot["bank"], snapshot["heading"],
                        snapshot.get("on_ground", False))
-        # 最后一个字段是气压修正量：高度字段报的是真高，加上它才是应答机报的
-        # 气压高度。老代码这里写死 0，于是管制端看到的高度就是真高，和座舱
-        # 高度表能差一千英尺。取不到就还是 0，退回原来的行为。
+        # 第 7 段是网络高度，最后一段是修正量（气压高度 − 网络高度），两者
+        # 相加是应答机报的气压高度。见 altitude.py。
         self._send(
             f"@{mode}:{self.callsign}:{squawk:04d}:{self.rating}:"
             f"{snapshot['latitude']:.5f}:{snapshot['longitude']:.5f}:"
-            f"{snapshot['altitude']}:{snapshot['groundspeed']}:{pbh}:"
+            f"{wire_altitude(snapshot)}:{snapshot['groundspeed']}:{pbh}:"
             f"{snapshot.get('pressure_delta', 0)}")
 
         # 停在地面上没动就降频，省得刷屏
@@ -864,7 +869,8 @@ class FSDPilot:
                 latitude=float(fields[4]), longitude=float(fields[5]),
                 # int(float(...))：有的客户端把高度/地速写成带小数点的，
                 # 直接 int() 会抛 ValueError，整个包被丢，那架飞机就是隐形的
-                altitude=int(float(fields[6])), groundspeed=int(float(fields[7])),
+                altitude=int(self._adjust_altitude(float(fields[6]))),
+                groundspeed=int(float(fields[7])),
                 pitch=attitude["pitch"], bank=attitude["bank"],
                 heading=attitude["heading"], on_ground=attitude["on_ground"],
                 squawk=int(fields[2]), mode=fields[0][1:] or "S")
@@ -907,7 +913,7 @@ class FSDPilot:
             self.traffic.update_position(
                 callsign,
                 latitude=float(fields[1]), longitude=float(fields[2]),
-                altitude=float(fields[3]),
+                altitude=self._adjust_altitude(float(fields[3])),
                 groundspeed=int(round(math.hypot(north, east) * KNOTS_PER_MPS)),
                 pitch=attitude["pitch"], bank=attitude["bank"],
                 heading=attitude["heading"], on_ground=attitude["on_ground"],
@@ -916,6 +922,15 @@ class FSDPilot:
         except (IndexError, ValueError) as e:
             log.debug("could not parse the fast position packet %s: %s",
                       fields[:1], e)
+
+    def _adjust_altitude(self, altitude):
+        """他机高度按本机温度误差修正后再进运动模型。没有本机快照时不改。"""
+        with self._lock:
+            own = self._position
+        if not own:
+            return altitude
+        return adjust_incoming_altitude(altitude, own.get("network_altitude"),
+                                        own.get("temperature_error", 0))
 
     def request_plane_info(self, callsign):
         """问对方的机型，用于模型匹配。"""
