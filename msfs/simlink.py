@@ -75,6 +75,7 @@ SIMVARS = {
     "light_taxi": "LIGHT_TAXI",
     "light_strobe": "LIGHT_STROBE",
     "light_nav": "LIGHT_NAV",
+    "light_logo": "LIGHT_LOGO",
     # 快速位置包（`^` / `#SL`）要的速度。VELOCITY WORLD X/Y/Z 是东/上/北，
     # RequestList.py 按 Feet per second 要。
     "velocity_east": "VELOCITY_WORLD_X",
@@ -435,6 +436,7 @@ class SimLink:
                 "taxi_on": bool(raw.get("light_taxi", 0)),
                 "strobe_on": bool(raw.get("light_strobe", 0)),
                 "nav_on": bool(raw.get("light_nav", 0)),
+                "logo_on": bool(raw.get("light_logo", 0)),
             },
         }
 
