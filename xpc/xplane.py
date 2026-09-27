@@ -91,7 +91,20 @@ DATAREFS = {
     "bank_rate":    "sim/flightmodel/position/P",
     # 前轮转角，度（xPilot 用的同一个）
     "nose_wheel":   "sim/flightmodel2/gear/tire_steer_actual_deg[0]",
+    # 下面这些是报给别人做动画用的（ACC），dataref 和 xPilot 的 XplaneAdapter
+    # 用的同一套
+    "light_beacon":  "sim/cockpit/electrical/beacon_lights_on",
+    "light_landing": "sim/cockpit/electrical/landing_lights_on",
+    "light_taxi":    "sim/cockpit/electrical/taxi_light_on",
+    "light_strobe":  "sim/cockpit/electrical/strobe_lights_on",
+    "light_nav":     "sim/cockpit/electrical/nav_lights_on",
+    "gear":          "sim/cockpit/switches/gear_handle_status",
+    "flaps":         "sim/flightmodel/controls/flaprat",
+    "speedbrake":    "sim/flightmodel2/controls/speedbrake_ratio",
+    "engine_on":     "sim/flightmodel/engine/ENGN_running[0]",
 }
+# 扰流板比例超过这个值才算"放出"
+SPOILERS_OUT_RATIO = 0.1
 
 INDEX_TO_NAME = {index: name for index, name in enumerate(DATAREFS)}
 NAME_TO_INDEX = {name: index for index, name in INDEX_TO_NAME.items()}
@@ -407,6 +420,18 @@ class XPlaneLink:
             "heading_rate": raw.get("heading_rate", 0.0),
             "bank_rate": raw.get("bank_rate", 0.0),
             "nose_wheel": raw.get("nose_wheel", 0.0),
+            # 下面这些是报给别人做动画用的，键名和 msfs/simlink.py 一致
+            "gear_down": bool(raw.get("gear", 1)),
+            "flaps": max(0.0, min(1.0, raw.get("flaps", 0.0))),
+            "spoilers": raw.get("speedbrake", 0.0) > SPOILERS_OUT_RATIO,
+            "engines_on": bool(raw.get("engine_on", 1)),
+            "lights": {
+                "beacon_on": bool(raw.get("light_beacon", 0)),
+                "landing_on": bool(raw.get("light_landing", 0)),
+                "taxi_on": bool(raw.get("light_taxi", 0)),
+                "strobe_on": bool(raw.get("light_strobe", 0)),
+                "nav_on": bool(raw.get("light_nav", 0)),
+            },
         }
 
     @staticmethod

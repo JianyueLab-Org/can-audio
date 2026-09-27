@@ -53,6 +53,11 @@ SLOW_POSITION_INTERVAL = 5.0  # 停在地面上没动时降频
 # （handlePilotPosition），快速位置只刷新空闲计时（handleFastPilotPosition）。
 FAST_POSITION_INTERVAL = 0.2
 SLOW_FAST_INTERVAL = 5.0
+# 自己的配置（灯光/起落架/襟翼）变了就向附近广播，最密每秒一次。放襟翼的
+# 那几秒里 flaps_pct 一直在变，不限速的话一次放襟翼就是几十个包。
+CONFIG_BROADCAST_INTERVAL = 1.0
+# 广播给附近所有飞行员的收件人（can-fsd docs/protocol.md 的 @94836）
+RANGED_ALL = "@94836"
 # 速度和角速度都小于这个值就算停着（xPilot 的
 # POSITIONAL_VELOCITY_ZERO_TOLERANCE，米每秒 / 弧度每秒）
 STOPPED_TOLERANCE = 0.005
@@ -320,6 +325,8 @@ class FSDPilot:
         # 服务端的 $SF：附近有别的 101 飞行员，要 5 Hz 的快速位置
         self.send_fast = False
         self.controllers = {}       # 呼号 -> {frequency, ...}
+        # 最近一次广播出去的配置。None 表示下一次要发全量。
+        self._config_sent = None
 
     # ---------- 对外 ----------
     def start(self):
@@ -609,6 +616,8 @@ class FSDPilot:
         next_position = now + self._send_position()
         next_fast = 0.0
         next_slow = now + SLOW_FAST_INTERVAL
+        next_config = now
+        self._config_sent = None
         self._send_fast_position(slow=False)
         while self.running and not self.stop_event.is_set():
             # 收包的等待不能盖过下一次该发的时刻，否则 200 ms 的节奏会被拖成
@@ -635,6 +644,9 @@ class FSDPilot:
             if now >= next_slow:
                 self._send_fast_position(slow=True)
                 next_slow = now + SLOW_FAST_INTERVAL
+            if now >= next_config:
+                self._broadcast_config()
+                next_config = now + CONFIG_BROADCAST_INTERVAL
 
     def _send_position(self):
         """发一个位置包，返回下一次的间隔。"""
@@ -814,27 +826,30 @@ class FSDPilot:
                 self._logged_in = True
             elif (fields[2] == "ACC" and len(fields) > 3
                     and self.traffic is not None):
-                # 对方回的配置 JSON。正文里有冒号，得把后面的段拼回去。
+                # 本客户端早先版本的回答：$CR 加不包 "config" 的 JSON。标准的
+                # 回答走 $CQ，见 _handle_config_query。正文里有冒号，得把后面
+                # 的段拼回去。
                 try:
                     config = json.loads(":".join(fields[3:]))
                 except ValueError:
                     config = None
+                if isinstance(config, dict) and isinstance(config.get("config"), dict):
+                    config = config["config"]
                 if isinstance(config, dict):
                     self.traffic.set_config(head[3:], config)
             return True
 
         if head.startswith("$CQ") and len(fields) >= 3:
             sender, recipient, query = head[3:], fields[1], fields[2]
-            if recipient == self.callsign:
+            if query == "ACC" and recipient in (self.callsign, RANGED_ALL):
+                self._handle_config_query(sender, recipient, ":".join(fields[3:]))
+            elif recipient == self.callsign:
                 if query == "CAPS":
-                    self._send(f"$CR{self.callsign}:{sender}:CAPS:ATCINFO=0:MODELDESC=1")
+                    # ACCONFIG=1：xPilot/vPilot 只向报了它的客户端要 ACC
+                    self._send(f"$CR{self.callsign}:{sender}:CAPS:"
+                               "ATCINFO=0:MODELDESC=1:ACCONFIG=1")
                 elif query == "RN":
                     self._send(f"$CR{self.callsign}:{sender}:RN:{self.real_name}::{self.rating}")
-                elif query == "ACC":
-                    # 回配置 JSON（灯光/襟翼/起落架），对面拿去驱动动画。
-                    # 以前这里回的是机型码——和请求方期望的负载完全对不上，
-                    # 结果就是所有他机永远全程关灯。
-                    self._send(f"$CR{self.callsign}:{sender}:ACC:{self._config_json()}")
             return True
 
         if head.startswith("$PI") and len(fields) >= 3:
@@ -937,21 +952,86 @@ class FSDPilot:
         return self._send(f"#SB{self.callsign}:{callsign}:PIR")
 
     def request_config(self, callsign):
-        """问对方的配置（灯光/襟翼/起落架），用于动画。TrafficTable 定期触发。"""
-        return self._send(f"$CQ{self.callsign}:{callsign}:ACC")
+        """问对方的配置（灯光/襟翼/起落架），用于动画。TrafficTable 定期触发。
 
-    def _config_json(self):
-        """把自己的快照攒成 ACC 回复的 JSON，键名和 TrafficTable.set_config 对齐。"""
+        格式照 can-fsd docs/protocol.md 的 ACC：请求体是 {"request":"full"}，
+        xPilot/vPilot 不带它的请求不答。
+        """
+        return self._send(f'$CQ{self.callsign}:{callsign}:ACC:{{"request":"full"}}')
+
+    def _handle_config_query(self, sender, recipient, body):
+        """$CQ … ACC：别人要我们的配置，或者别人发来他的配置。
+
+        标准格式里请求和回答都走 $CQ：请求体是 {"request":"full"}，回答和
+        广播是 {"config":{...}}。本客户端早先的版本请求不带正文、回答走
+        $CR 且不包 "config"——对它们照旧那样答，那边才解析得了。
+        """
+        try:
+            payload = json.loads(body) if body.strip() else None
+        except ValueError:
+            log.debug("unreadable ACC payload from %s: %r", sender, body)
+            return
+        if isinstance(payload, dict) and isinstance(payload.get("config"), dict):
+            if self.traffic is not None:
+                self.traffic.set_config(sender, payload["config"])
+            return
+        if recipient != self.callsign:
+            return
+        if payload is None:
+            self._send(f"$CR{self.callsign}:{sender}:ACC:"
+                       f"{self._wire_json(self._config())}")
+        elif isinstance(payload, dict) and payload.get("request") == "full":
+            self._send(f"$CQ{self.callsign}:{sender}:ACC:"
+                       f"{self._wire_json({'config': self._config(full=True)})}")
+
+    def _config(self, full=False):
+        """自己的配置，键名照 protocol.md 的 ACC，和 TrafficTable.set_config 对齐。
+
+        没有快照（还没连上模拟器）返回 None。
+        """
         with self._lock:
-            snapshot = dict(self._position) if self._position else {}
+            snapshot = dict(self._position) if self._position else None
+        if snapshot is None:
+            return None
         lights = snapshot.get("lights") or {}
-        return json.dumps({
-            "gear_down": bool(snapshot.get("gear_down", True)),
-            "flaps_pct": round(float(snapshot.get("flaps", 0.0)) * 100.0, 1),
-            "spoilers_out": bool(snapshot.get("spoilers", False)),
+        config = {
             "lights": {key: bool(value) for key, value in lights.items()},
-            "engines": {"1": {"on": bool(snapshot.get("engines_on", True))}},
-        }, separators=(",", ":"))
+            "engines": {"1": {"on": bool(snapshot.get("engines_on", True)),
+                              "is_reversing": False}},
+            "gear_down": bool(snapshot.get("gear_down", True)),
+            "flaps_pct": int(round(float(snapshot.get("flaps", 0.0)) * 100.0)),
+            "spoilers_out": bool(snapshot.get("spoilers", False)),
+            "on_ground": bool(snapshot.get("on_ground", False)),
+        }
+        if full:
+            config = {"is_full_data": True, **config}
+        return config
+
+    @staticmethod
+    def _wire_json(value):
+        return json.dumps(value if value is not None else {}, separators=(",", ":"))
+
+    def _broadcast_config(self):
+        """配置变了就向附近广播（$CQ…:@94836:ACC），只带变了的键。
+
+        xPilot 就是这样把开灯、放襟翼推给别人的；只靠对方每 10 秒来问一次的话，
+        着陆灯要晚十秒才亮。连上后的第一次发全量。
+        """
+        config = self._config()
+        if config is None:
+            return
+        last = self._config_sent
+        if last is None:
+            changed = {"is_full_data": True, **config}
+        else:
+            changed = {key: value for key, value in config.items()
+                       if last.get(key) != value}
+            if not changed:
+                return
+            changed = {"is_full_data": False, **changed}
+        self._config_sent = config
+        self._send(f"$CQ{self.callsign}:{RANGED_ALL}:ACC:"
+                   f"{self._wire_json({'config': changed})}")
 
     def _handle_plane_info(self, sender, fields):
         """#SB。别人问我们机型要答，别人报机型要记下来。"""
