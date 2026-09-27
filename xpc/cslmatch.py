@@ -218,6 +218,94 @@ def obj_vert_offset(path):
     return offset
 
 
+# Bluebell 等从 World Traffic 转来的 CSL 用 cjs/world_traffic/* 驱动灯光和舵面，
+# 插件只注册 libxplanemp/controls/*，不换名的话这些灯永远不跟我们的值走。
+# 表抄自 XPMP2 的 Resources/Obj8DataRefs.txt，只留插件注册了的目标。
+# wolrd 的拼写错误是模型里真实存在的，XPMP2 同样照抄。
+OBJ_DATAREF_REPLACEMENTS = (
+    ("cjs/world_traffic/hstab_ratio", "libxplanemp/controls/yoke_pitch_ratio"),
+    ("cjs/world_traffic/rudder_ratio", "libxplanemp/controls/yoke_heading_ratio"),
+    ("cjs/world_traffic/aileron_ratio", "libxplanemp/controls/yoke_roll_ratio"),
+    ("cjs/world_traffic/roll_spoiler_ratio_L", "libxplanemp/controls/spoiler_ratio"),
+    ("cjs/world_traffic/roll_spoiler_ratio_R", "libxplanemp/controls/spoiler_ratio"),
+    ("cjs/world_traffic/flaperon_ratio_L", "libxplanemp/controls/flap_ratio"),
+    ("cjs/world_traffic/flaperon_ratio_R", "libxplanemp/controls/flap_ratio"),
+    ("cjs/world_traffic/tef_ratio", "libxplanemp/controls/flap_ratio"),
+    ("cjs/world_traffic/speed_brake_ratio", "libxplanemp/controls/speed_brake_ratio"),
+    ("cjs/world_traffic/main_gear_retraction_ratio", "libxplanemp/controls/gear_ratio"),
+    ("cjs/world_traffic/nose_gear_retraction_ratio", "libxplanemp/controls/gear_ratio"),
+    ("cjs/world_traffic/nose_gear_steering_angle", "libxplanemp/controls/nws_ratio"),
+    ("cjs/wolrd_traffic/landing_lights_on", "libxplanemp/controls/landing_lites_on"),
+    ("cjs/world_traffic/landing_lights_on", "libxplanemp/controls/landing_lites_on"),
+    ("cjs/world_traffic/wing_landing_lights_on", "libxplanemp/controls/landing_lites_on"),
+    ("cjs/world_traffic/taxi_lights_on", "libxplanemp/controls/taxi_lites_on"),
+    ("cjs/world_traffic/nav_lights_on", "libxplanemp/controls/nav_lites_on"),
+    ("cjs/world_traffic/beacon_lights_on", "libxplanemp/controls/beacon_lites_on"),
+    ("cjs/world_traffic/strobe_lights_on", "libxplanemp/controls/strobe_lites_on"),
+)
+# 换过名的副本和原件放在同一个目录（OBJ 里的贴图是相对路径），文件名加这个后缀
+REWRITTEN_SUFFIX = ".xpc.obj"
+# 副本第 4 行的标记。表改了就改这个号，旧副本会重写。
+REWRITE_MARK = "# XPC for CAN dataref rewrite v1"
+
+# 原件路径 -> 实际交给插件的路径。一个模型只处理一次。
+_drawn_paths = {}
+
+
+def _rewrite_line(line):
+    """换一行里的 dataref。和 XPMP2 一样：每行最多换一处，先匹配的算。"""
+    if "/" not in line:
+        return line
+    for old, new in OBJ_DATAREF_REPLACEMENTS:
+        if old in line:
+            return line.replace(old, new, 1)
+    return line
+
+
+def obj_for_drawing(path):
+    """插件该加载的 .obj：需要换 dataref 的给换过名的副本，否则原样。
+
+    XPMP2 的 CSLObj::CopyAndReplace。副本写不出来（目录只读等）就用原件，
+    模型照样画，只是灯和舵面不动。
+    """
+    if not path:
+        return path
+    if path in _drawn_paths:
+        return _drawn_paths[path]
+    result = path
+    try:
+        with open(path, "r", encoding="utf-8", errors="surrogateescape",
+                  newline="") as f:
+            lines = f.readlines()
+        rewritten = [_rewrite_line(line) for line in lines]
+        if rewritten != lines:
+            copy = os.path.splitext(path)[0] + REWRITTEN_SUFFIX
+            if not _copy_is_current(copy, path):
+                rewritten.insert(min(3, len(rewritten)), REWRITE_MARK + "\n")
+                with open(copy, "w", encoding="utf-8", errors="surrogateescape",
+                          newline="") as f:
+                    f.writelines(rewritten)
+                log.info("rewrote the animation datarefs of %s into %s",
+                         os.path.basename(path), os.path.basename(copy))
+            result = copy
+    except OSError as e:
+        log.warning("could not rewrite the datarefs of %s, its lights and "
+                    "surfaces will not animate: %s", path, e)
+    _drawn_paths[path] = result
+    return result
+
+
+def _copy_is_current(copy, original):
+    try:
+        if os.path.getmtime(copy) < os.path.getmtime(original):
+            return False
+        with open(copy, "r", encoding="utf-8", errors="replace") as f:
+            head = [f.readline() for _ in range(4)]
+    except OSError:
+        return False
+    return head[-1].rstrip("\r\n") == REWRITE_MARK
+
+
 def vert_offset(model):
     """画这个模型时要往上抬多少米：xsb_aircraft.txt 写了就用，没写就从 .obj 算。"""
     if model.vert_offset is not None:
