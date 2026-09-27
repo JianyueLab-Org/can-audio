@@ -1146,6 +1146,297 @@ class InjectorTest(unittest.TestCase):
                       "万一模拟器其实建出来了，号码回来时要补删")
 
 
+class TakeControlTest(unittest.TestCase):
+    """建好的 AI 飞机要冻结并释放 AI 控制，否则两次写入之间 MSFS 自己推它。
+
+    实测 v2.2.12：他机"一卡卡，然后抽搐"——AI 的飞行模型在两次
+    SetDataOnSimObject 之间把飞机往别处带，下一次写入再拽回来。
+    """
+
+    def setUp(self):
+        import ctypes
+        import inject
+        self.inject = inject
+        self.ctypes = ctypes
+
+    def _fake(self, map_result=0, transmit_result=0):
+        """照 Python-SimConnect 的形状做的替身，记下每一次 DLL 调用。
+
+        dispatch 跳板在构造时就包好（SimConnect.py:140），收消息走跳板。
+        """
+        ctypes = self.ctypes
+        calls = []
+        packets = iter(range(500, 10000))
+
+        class Dll:
+            @staticmethod
+            def DispatchProc(func):
+                return ("trampoline", func)
+
+            @staticmethod
+            def AddToDataDefinition(*args):
+                return 0
+
+            @staticmethod
+            def MapClientEventToSimEvent(handle, event_id, name):
+                calls.append(("map", event_id, name))
+                if isinstance(map_result, Exception):
+                    raise map_result
+                return map_result
+
+            @staticmethod
+            def TransmitClientEvent(handle, object_id, event_id, data, group, flags):
+                calls.append(("transmit", object_id, event_id, data, group, flags))
+                return transmit_result
+
+            @staticmethod
+            def AIReleaseControl(handle, object_id, request_id):
+                calls.append(("release", object_id, request_id))
+                return 0
+
+            @staticmethod
+            def AICreateNonATCAircraft(handle, title, tail, init, request_id):
+                calls.append(("create", title, request_id))
+                return 0
+
+            @staticmethod
+            def AIRemoveObject(handle, object_id, request_id):
+                calls.append(("remove", object_id))
+                return 0
+
+            @staticmethod
+            def SetDataOnSimObject(*args):
+                calls.append(("move", args[2]))
+                return 0
+
+            @staticmethod
+            def GetLastSentPacketID(handle, pointer):
+                pointer._obj.value = next(packets)
+                return 0
+
+        class Sim:
+            def __init__(self):
+                self.dll = Dll()
+                self.hSimConnect = "handle"
+                self.my_dispatch_proc = self.original
+                self.my_dispatch_proc_rd = self.dll.DispatchProc(self.my_dispatch_proc)
+
+            def original(self, pData, cbData, pContext):
+                pass
+
+            def deliver(self, message):
+                return self.my_dispatch_proc_rd[1](ctypes.pointer(message), 0, None)
+
+        class Assigned(ctypes.Structure):
+            _fields_ = [("dwID", ctypes.c_uint32),
+                        ("dwRequestID", ctypes.c_uint32),
+                        ("dwObjectID", ctypes.c_uint32)]
+
+        class Init(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_double) for name in
+                        ("Latitude", "Longitude", "Altitude", "Pitch", "Bank",
+                         "Heading")] + [("OnGround", ctypes.c_uint32),
+                                        ("Airspeed", ctypes.c_uint32)]
+
+        class Enums:
+            SIMCONNECT_RECV_ID = type("R", (), {
+                "SIMCONNECT_RECV_ID_ASSIGNED_OBJECT_ID": 12,
+                "SIMCONNECT_RECV_ID_EXCEPTION": 9})()
+            SIMCONNECT_RECV_ASSIGNED_OBJECT_ID = Assigned
+            SIMCONNECT_DATA_INITPOSITION = Init
+            SIMCONNECT_DATATYPE = type("T", (), {"SIMCONNECT_DATATYPE_FLOAT64": 4})()
+            SIMCONNECT_UNUSED = 0xFFFFFFFF
+
+        sim = Sim()
+        injector = self.inject.TrafficInjector(sim=None)
+        injector.sim = sim
+        injector._enums = Enums
+        injector._install_dispatch()
+        injector._define_position()
+        injector._map_freeze_events()
+        injector.available = True
+        self.Assigned = Assigned
+        return injector, sim, calls
+
+    def _entry(self, model):
+        return {"callsign": "CES2345", "latitude": 31.2, "longitude": 121.5,
+                "altitude": 5000.0, "pitch": 2.0, "bank": 0.0, "heading": 90.0,
+                "groundspeed": 200, "on_ground": False, "model": model,
+                "equipment": "B738"}
+
+    def _assign(self, injector, sim, calls, object_id):
+        request_id = [c for c in calls if c[0] == "create"][-1][2]
+        sim.deliver(self.Assigned(dwID=12, dwRequestID=request_id,
+                                  dwObjectID=object_id))
+
+    def _control(self, calls, object_id):
+        return [c for c in calls
+                if c[0] in ("transmit", "release") and c[1] == object_id]
+
+    def test_the_freeze_events_are_mapped_once_at_setup(self):
+        injector, sim, calls = self._fake()
+        maps = [c for c in calls if c[0] == "map"]
+        self.assertEqual([c[2] for c in maps], list(self.inject.FREEZE_EVENTS))
+        self.assertEqual(len({c[1] for c in maps}), 3, "三个事件要三个不同的号")
+        injector.sync([self._entry("738")])
+        self._assign(injector, sim, calls, 4242)
+        injector.sync([self._entry("738")])
+        self.assertEqual(len([c for c in calls if c[0] == "map"]), 3,
+                         "映射只在建注入器时做一次")
+
+    def test_an_assigned_object_is_frozen_and_released_once(self):
+        injector, sim, calls = self._fake()
+        injector.sync([self._entry("738")])
+        self._assign(injector, sim, calls, 4242)
+        injector.sync([self._entry("738")])
+        injector.sync([self._entry("738")])
+
+        control = self._control(calls, 4242)
+        releases = [c for c in control if c[0] == "release"]
+        transmits = [c for c in control if c[0] == "transmit"]
+        self.assertEqual(len(releases), 1, "AIReleaseControl 每个对象只发一次")
+        event_ids = {c[1] for c in calls if c[0] == "map"}
+        self.assertEqual({c[2] for c in transmits}, event_ids)
+        self.assertEqual(len(transmits), 3, "三个冻结事件每个对象各一次")
+        for _, object_id, _, data, group, flags in transmits:
+            self.assertEqual(object_id, 4242)
+            self.assertEqual(data, 1, "dwData=1 是冻上")
+            self.assertEqual(group, self.inject.GROUP_PRIORITY_HIGHEST)
+            self.assertEqual(flags, self.inject.EVENT_FLAG_GROUPID_IS_PRIORITY)
+        self.assertTrue(injector.aircraft["CES2345"]["frozen"])
+        # 冻结要在第一次写位置之前
+        first_move = next(i for i, c in enumerate(calls) if c[0] == "move")
+        last_control = max(i for i, c in enumerate(calls)
+                           if c in control)
+        self.assertLess(last_control, first_move)
+
+    def test_a_model_change_freezes_the_new_object_too(self):
+        injector, sim, calls = self._fake()
+        injector.sync([self._entry("通用模型")])
+        self._assign(injector, sim, calls, 4242)
+        injector.sync([self._entry("通用模型")])
+        # #SB 回来了，换模型 = 删了重建
+        injector.sync([self._entry("738 Air China")])
+        self.assertIn(("remove", 4242), calls)
+        self._assign(injector, sim, calls, 5151)
+        injector.sync([self._entry("738 Air China")])
+        self.assertEqual(len(self._control(calls, 4242)), 4)
+        self.assertEqual(len(self._control(calls, 5151)), 4,
+                         "重建出来的新对象没有被冻结")
+
+    def test_a_refused_call_is_logged_once_per_object(self):
+        injector, sim, calls = self._fake(transmit_result=-2147467259)
+        with self.assertLogs("inject", level="WARNING") as logs:
+            injector.sync([self._entry("738")])
+            self._assign(injector, sim, calls, 4242)
+            injector.sync([self._entry("738")])
+            injector.sync([self._entry("738")])
+        lines = [line for line in logs.output if "off AI control" in line]
+        self.assertEqual(len(lines), 1, logs.output)
+        self.assertIn("0x80004005", lines[0])
+        self.assertFalse(injector.aircraft["CES2345"]["frozen"])
+
+    def test_a_raised_hresult_is_caught(self):
+        # 包里 restype 是 ctypes.HRESULT：失败在 Windows 上是抛 OSError
+        injector, sim, calls = self._fake(map_result=OSError("-2147467259"))
+        self.assertEqual(injector._freeze_events, ())
+        injector.sync([self._entry("738")])
+        with self.assertLogs("inject", level="WARNING") as logs:
+            self._assign(injector, sim, calls, 4242)
+            injector.sync([self._entry("738")])
+        self.assertTrue(any("not frozen" in line for line in logs.output),
+                        logs.output)
+        # 冻结不了也照样释放 AI、照样写位置
+        self.assertIn("release", [c[0] for c in self._control(calls, 4242)])
+        self.assertIn(("move", 4242), calls)
+
+    def test_a_refused_freeze_names_the_aircraft(self):
+        injector, sim, calls = self._fake()
+        injector.sync([self._entry("738")])
+        self._assign(injector, sim, calls, 4242)
+        injector.sync([self._entry("738")])
+        packet = next(send_id for send_id, (_, _, what)
+                      in injector._control_packets.items()
+                      if what == "FREEZE_ALTITUDE_SET")
+        exceptions = type("X", (), {
+            "SIMCONNECT_EXCEPTION_CREATE_OBJECT_FAILED": 22,
+            "SIMCONNECT_EXCEPTION_OBJECT_OUTSIDE_REALITY_BUBBLE": 30,
+            "SIMCONNECT_EXCEPTION_OBJECT_CONTAINER": 31,
+        })
+        injector._enums.SIMCONNECT_EXCEPTION = exceptions
+        body = type("B", (), {"dwException": 3, "UNKNOWN_SENDID": packet})()
+        with self.assertLogs("inject", level="WARNING") as logs:
+            injector._note_exception(body)
+        self.assertIn("FREEZE_ALTITUDE_SET", logs.output[0])
+        self.assertIn("CES2345", logs.output[0])
+
+    def test_constants_match_the_simconnect_package(self):
+        try:
+            from SimConnect import Enum as sc_enum
+        except Exception:
+            self.skipTest("SimConnect package not installed")
+        self.assertEqual(self.inject.GROUP_PRIORITY_HIGHEST,
+                         sc_enum.SIMCONNECT_GROUP_PRIORITY_HIGHEST.value)
+        self.assertEqual(
+            self.inject.EVENT_FLAG_GROUPID_IS_PRIORITY,
+            int(sc_enum.SIMCONNECT_EVENT_FLAG.SIMCONNECT_EVENT_FLAG_GROUPID_IS_PRIORITY))
+        # 包自己的 EXCEPTION 结构体里，真正的 dwSendID 落在 UNKNOWN_SENDID 上
+        fields = [name for name, _ in sc_enum.SIMCONNECT_RECV_EXCEPTION._fields_]
+        self.assertEqual(fields[fields.index("dwException") + 1], "UNKNOWN_SENDID")
+
+
+class InjectionLoopTest(unittest.TestCase):
+    """写入频率：原来 Qt 定时器 5 Hz，MSFS 画面上一卡一卡。"""
+
+    def setUp(self):
+        import inject
+        self.inject = inject
+
+    def test_runs_off_the_calling_thread_at_the_target_rate(self):
+        import threading
+        seen = []
+        loop = self.inject.InjectionLoop(
+            lambda: seen.append((threading.current_thread(), time.perf_counter())))
+        loop.start()
+        time.sleep(1.0)
+        loop.stop()
+        threads = {thread for thread, _ in seen}
+        self.assertNotIn(threading.current_thread(), threads)
+        self.assertEqual(len(threads), 1, "应当是同一条常驻线程")
+        rate = (len(seen) - 1) / (seen[-1][1] - seen[0][1])
+        self.assertGreater(rate, self.inject.FRAME_RATE * 0.75, f"{rate:.1f} Hz")
+        self.assertLess(rate, self.inject.FRAME_RATE * 1.25, f"{rate:.1f} Hz")
+
+    def test_stop_is_final_and_restart_works(self):
+        calls = []
+        loop = self.inject.InjectionLoop(lambda: calls.append(1))
+        loop.start()
+        time.sleep(0.1)
+        loop.stop()
+        self.assertFalse(loop.running)
+        count = len(calls)
+        time.sleep(0.15)
+        self.assertEqual(len(calls), count, "stop() 之后还在跑")
+        loop.start()
+        time.sleep(0.1)
+        loop.stop()
+        self.assertGreater(len(calls), count, "停了之后再也起不来")
+
+    def test_a_failing_step_does_not_kill_the_loop(self):
+        calls = []
+
+        def step():
+            calls.append(1)
+            raise RuntimeError("boom")
+
+        loop = self.inject.InjectionLoop(step)
+        with self.assertLogs("inject", level="WARNING"):
+            loop.start()
+            time.sleep(0.15)
+            loop.stop()
+        self.assertGreater(len(calls), 1)
+
+
 class VoiceHostTest(unittest.TestCase):
     """语音服务器换域名之后，老配置里存的那个旧域名必须换掉。
 

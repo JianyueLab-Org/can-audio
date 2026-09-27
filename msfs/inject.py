@@ -9,6 +9,8 @@ X-Plane 还要单独去填 sim/cockpit2/tcas/targets/*。
 
     创建   AICreateNonATCAircraft(title, 尾号, 初始位置, requestID)
     移动   SetDataOnSimObject(objectID, 位置定义)
+    接管   AIReleaseControl(objectID) + FREEZE_*_SET（objectID 回来之后各一次）
+    移动   SetDataOnSimObject(objectID, 位置定义)，InjectionLoop 每秒 30 次
     删除   AIRemoveObject(objectID, requestID)
 
 **objectID 是异步回来的，而且必须自己关联。** 创建函数只是把请求发出去，真正的
@@ -39,6 +41,27 @@ PENDING_TIMEOUT = 15.0
 # 同一个模型连着建败几次才拉黑。EXCEPTION 消息对不上是哪次请求，一次失败
 # 就拉黑会把同一轮里无辜的模型全部错杀（一分钟内能把整个机队拉黑）。
 BLACKLIST_AFTER = 3
+
+# 注入循环的频率。MSFS 每帧画的是最后一次写进去的位置，写得越稀，画面上
+# 越是一格一格地跳。
+FRAME_RATE = 30.0
+
+# 接管 AI 飞机用的三个模拟器事件。AICreateNonATCAircraft 建出来的飞机归 MSFS
+# 的 AI 管：它自己的飞行模型和自动驾驶在两次写入之间继续推飞机，下一次
+# SetDataOnSimObject 再把它拽回来——画面上就是抽搐。冻住经纬度、高度和姿态，
+# 再 AIReleaseControl，位置就只由我们写。
+FREEZE_EVENTS = (b"FREEZE_LATITUDE_LONGITUDE_SET", b"FREEZE_ALTITUDE_SET",
+                 b"FREEZE_ATTITUDE_SET")
+# 这三个事件的客户端事件号。避开 Python-SimConnect 自己的号段：它的
+# EventID 枚举从 0 起编，map_to_sim_event 每映射一个往后加一。
+FREEZE_EVENT_BASE = 90000
+# SimConnect.h 的 SIMCONNECT_GROUP_PRIORITY_HIGHEST 和
+# SIMCONNECT_EVENT_FLAG_GROUPID_IS_PRIORITY。带上这个标志时 GroupID 参数
+# 就是优先级。
+GROUP_PRIORITY_HIGHEST = 1
+EVENT_FLAG_GROUPID_IS_PRIORITY = 0x00000010
+# 记多少个"接管请求的包号 -> 哪架飞机"，给 EXCEPTION 认领用
+CONTROL_PACKETS_KEPT = 512
 
 
 class _Definition:
@@ -82,6 +105,12 @@ class TrafficInjector:
         self._title_failures = {}   # 模型名 -> 连续建败次数
         self._next_request = REQUEST_BASE
         self._enums = None
+        # 映射成功的冻结事件号。映射失败时是空的，飞机照样建、照样动，只是
+        # 不冻结（日志里有一条警告）。
+        self._freeze_events = ()
+        # SimConnect 包号 -> (呼号, 对象号, 哪个请求)。EXCEPTION 只带包号，
+        # 靠这张表才说得出是哪架飞机的冻结/释放被拒了。
+        self._control_packets = {}
         # sync() 和 clear() 各自会发一串 DLL 调用，一个在注入线程、一个在
         # Qt 线程（断开/退出时）。不串行化的话断开那一刻两串请求交错着发。
         self._op_lock = threading.Lock()
@@ -99,6 +128,7 @@ class TrafficInjector:
         self._enums = sc_enum
         self._install_dispatch()
         self._define_position()
+        self._map_freeze_events()
 
     def _install_dispatch(self):
         """接管 ASSIGNED_OBJECT_ID，按 requestID 关联。
@@ -192,6 +222,8 @@ class TrafficInjector:
             code = int(body.dwException)
         except Exception:
             return
+        if self._note_control_exception(body, code):
+            return
         reason = interesting.get(code)
         if reason is None:
             return
@@ -229,6 +261,33 @@ class TrafficInjector:
             self._orphaned.update(self._pending)
             self._pending.clear()
 
+    def _note_control_exception(self, body, code):
+        """接管请求（AIReleaseControl / FREEZE_*_SET）被拒的话，说清是哪架。
+
+        包号在 Python-SimConnect 的结构体里叫 `UNKNOWN_SENDID`：它把头文件里
+        的静态常量 UNKNOWN_SENDID 当成了字段，于是真正的 dwSendID 落在这个
+        名字上（包自己的 handle_exception_event 也是拿它去对 LastID）。
+        """
+        send_id = getattr(body, "UNKNOWN_SENDID", None)
+        if send_id is None:
+            return False
+        try:
+            send_id = int(send_id)
+        except (TypeError, ValueError):
+            return False
+        with self._lock:
+            control = self._control_packets.pop(send_id, None)
+        if control is None:
+            return False
+        callsign, object_id, what = control
+        try:
+            name = self._enums.SIMCONNECT_EXCEPTION(code).name
+        except Exception:
+            name = str(code)
+        log.warning("the simulator refused %s for %s (object %d): %s",
+                    what, callsign, object_id, name)
+        return True
+
     def _define_position(self):
         """注册位置的数据定义。只需要做一次。"""
         for name, unit in _Definition.FIELDS:
@@ -238,6 +297,93 @@ class TrafficInjector:
                 0, self._enums.SIMCONNECT_UNUSED)
             if hr != 0:
                 raise RuntimeError(f"AddToDataDefinition({name!r}) 失败: {hr}")
+
+    def _map_freeze_events(self):
+        """把三个 FREEZE_*_SET 映射成我们自己的客户端事件号。只需要做一次。
+
+        失败不影响注入本身：飞机照样建、照样写位置，只是没有冻结。
+        """
+        mapped = []
+        for offset, name in enumerate(FREEZE_EVENTS):
+            event_id = FREEZE_EVENT_BASE + offset
+            error = self._call("MapClientEventToSimEvent",
+                               self.sim.hSimConnect, event_id, name)
+            if error:
+                log.warning("could not map %s, injected traffic will not be "
+                            "frozen: %s", name.decode(), error)
+                self._freeze_events = ()
+                return
+            mapped.append((event_id, name.decode()))
+        self._freeze_events = tuple(mapped)
+
+    def _call(self, name, *args):
+        """调一个 SimConnect 函数。成功返回 None，失败返回一句说明。
+
+        包里的 restype 是 ctypes.HRESULT：失败的 HRESULT 在 Windows 上会直接
+        抛 OSError，而不是返回非零。两种都要接住。
+        """
+        try:
+            hr = getattr(self.sim.dll, name)(*args)
+        except OSError as e:
+            return f"{name}: {e}"
+        except Exception as e:
+            return f"{name}: {type(e).__name__}: {e}"
+        if hr:
+            try:
+                return f"{name}: HRESULT {int(hr) & 0xFFFFFFFF:#010x}"
+            except (TypeError, ValueError):
+                return f"{name}: HRESULT {hr!r}"
+        return None
+
+    def _remember_packet(self, callsign, object_id, what):
+        """记下刚发出去的那个包的包号，EXCEPTION 回来时好认领。
+
+        GetLastSentPacketID 返回的是这个连接上**最后**发出的包。simlink 的轮询
+        线程也在同一个连接上发请求，两次调用之间插进一个它的包的话，这里会
+        记错号——结果只是少认领一条异常，异常本身仍由包自己的日志打出来。
+        """
+        packet = ctypes.c_ulong(0)
+        if self._call("GetLastSentPacketID", self.sim.hSimConnect,
+                      ctypes.byref(packet)):
+            return
+        with self._lock:
+            self._control_packets[int(packet.value)] = (callsign, object_id, what)
+            while len(self._control_packets) > CONTROL_PACKETS_KEPT:
+                self._control_packets.pop(next(iter(self._control_packets)))
+
+    def _take_control(self, callsign, object_id):
+        """把刚建好的飞机从 MSFS 的 AI 手里拿过来：释放 AI 控制，冻结位置和姿态。
+
+        每个对象号只做一次：objectID 回来、被认领的那一刻。换模型是删了重建，
+        新对象号回来时会再走一遍。返回是否全部发出去了。
+        """
+        failures = []
+        error = self._call("AIReleaseControl", self.sim.hSimConnect,
+                           object_id, self._request_id())
+        if error:
+            failures.append(error)
+        else:
+            self._remember_packet(callsign, object_id, "AIReleaseControl")
+        for event_id, name in self._freeze_events:
+            error = self._call("TransmitClientEvent", self.sim.hSimConnect,
+                               object_id, event_id, 1, GROUP_PRIORITY_HIGHEST,
+                               EVENT_FLAG_GROUPID_IS_PRIORITY)
+            if error:
+                failures.append(error)
+            else:
+                self._remember_packet(callsign, object_id, name)
+        if failures:
+            log.warning("could not take %s (object %d) off AI control: %s",
+                        callsign, object_id, "; ".join(failures))
+            return False
+        if not self._freeze_events:
+            log.warning("%s (object %d) is released from AI control but not "
+                        "frozen: the freeze events are not mapped",
+                        callsign, object_id)
+            return False
+        log.info("%s (object %d) is frozen and released from AI control",
+                 callsign, object_id)
+        return True
 
     def _request_id(self):
         with self._lock:
@@ -279,6 +425,7 @@ class TrafficInjector:
         天上，而我们连它的号码都不再记得。
         """
         now = time.time()
+        claimed = []
         with self._lock:
             ready = [(rid, oid) for rid, oid in self._assigned.items()
                      if rid in self._pending]
@@ -289,6 +436,7 @@ class TrafficInjector:
                 record = self.aircraft.get(callsign)
                 if record is not None:
                     record["object_id"] = oid
+                    claimed.append((callsign, oid))
                     # 建成了就洗清嫌疑——失败计数只数**连续**的
                     self._title_failures.pop(record.get("title"), None)
                     log.info("%s is in the simulator (object %d, model %s)",
@@ -315,6 +463,11 @@ class TrafficInjector:
                               callsign)
 
         # DLL 调用放到锁外面：_request_id() 自己也要拿这把锁
+        for callsign, object_id in claimed:
+            record = self.aircraft.get(callsign)
+            frozen = self._take_control(callsign, object_id)
+            if record is not None:
+                record["frozen"] = frozen
         for _, object_id in strays:
             try:
                 self.sim.dll.AIRemoveObject(self.sim.hSimConnect, object_id,
@@ -424,3 +577,65 @@ class TrafficInjector:
         with self._op_lock:
             for callsign in list(self.aircraft):
                 self.remove(callsign)
+
+
+class InjectionLoop:
+    """在自己的线程上按固定频率调 step()，把他机写进模拟器。
+
+    原来是 Qt 定时器每 200 ms 起一个线程做一轮 sync：5 Hz 的写入，MSFS 每帧
+    画的是最后一次写进去的位置，于是一卡一卡。这里换成一条常驻线程、每秒
+    FRAME_RATE 次。
+
+    不挂在 SimConnect 的 "Frame" 系统事件上：那个事件在包的 dispatch 线程上
+    回调，而 objectID、EXCEPTION 和 simlink 读 SimVar 的回复都走同一个线程，
+    每帧四十次 SetDataOnSimObject 会压着它们；帧率还跟着模拟器走，144 fps
+    就是 144 轮。
+
+    节拍用 time.sleep：Python 3.11 起它在 Windows 上用高精度等待计时器，
+    Event.wait 仍是 15.6 ms 的系统粒度，33 ms 的周期会抖成 31/47。
+    """
+
+    def __init__(self, step, rate=FRAME_RATE, name="traffic-inject"):
+        self.step = step
+        self.period = 1.0 / rate
+        self.name = name
+        self._stop = threading.Event()
+        self._thread = None
+
+    @property
+    def running(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self):
+        if self.running:
+            return
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, args=(self._stop,),
+                                        name=self.name, daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout=2.0):
+        """停下并等线程退出。返回之后不会再有 step() 在跑（超时除外）。"""
+        thread = self._thread
+        self._stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout)
+            if thread.is_alive():
+                log.warning("the traffic injection loop did not stop within %.1f s",
+                            timeout)
+        self._thread = None
+
+    def _run(self, stop):
+        deadline = time.perf_counter()
+        while not stop.is_set():
+            try:
+                self.step()
+            except Exception as e:
+                log.warning("injecting traffic into the simulator raised: %s", e)
+            deadline += self.period
+            now = time.perf_counter()
+            if deadline < now:
+                # 落后了（模拟器卡了一下）就从现在重新数，别连着补跑
+                deadline = now
+                continue
+            time.sleep(deadline - now)

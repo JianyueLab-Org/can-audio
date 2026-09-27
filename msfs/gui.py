@@ -156,10 +156,16 @@ class MsfsWindow(QMainWindow):
         self.voice = None
         self.snapshot = None
 
-        # 他机：FSD 线程往表里写，tick() 读出来插值好放进模拟器
-        self.traffic = traffic_module.TrafficTable()
+        # 他机：FSD 线程往表里写，注入循环读出来插值好放进模拟器。
+        # 渲染延迟见 traffic.RENDER_DELAY：每帧直接写进模拟器，要在两个真实
+        # 样本之间插值，不能追着最新样本外推。
+        self.traffic = traffic_module.TrafficTable(
+            render_delay=traffic_module.RENDER_DELAY)
         self.injector = None            # 要等 SimConnect 连上才能建
-        self._injecting = threading.Event()   # 上一轮注入还没做完
+        # traffic_tick 每 200 ms 更新一次：(本机经纬度, 呼号 -> 模型名)。
+        # 注入循环只读这个引用，不碰 _model_cache。
+        self._traffic_plan = None
+        self.injection_loop = inject.InjectionLoop(self._inject_frame)
         self.models = aimatch.ModelSet()
         self._model_cache = {}          # 呼号 -> 匹配到的 title
         self._load_models()
@@ -185,9 +191,8 @@ class MsfsWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(500)
-        # 他机单独一个更快的节奏：500 ms 推一次的话一架 450 kt 的飞机每半秒
-        # 瞬移 115 米，traffic.py 的插值等于白算。200 ms 是注入开销（每架一次
-        # SimConnect IPC）和平滑度之间的折中；上一轮没做完会自动跳过。
+        # 200 ms：把本机位置喂给 FSD（位置包 5 Hz），并给注入循环挑模型。
+        # 写进模拟器的那一步不在这里，在 injection_loop 上（30 Hz）。
         self.traffic_timer = QTimer(self)
         self.traffic_timer.timeout.connect(self.traffic_tick)
         self.traffic_timer.start(200)
@@ -503,6 +508,7 @@ class MsfsWindow(QMainWindow):
             threading.Thread(target=self.voice.start, daemon=True).start()
 
         self.ptt_watcher.start()
+        self.injection_loop.start()
         self.connect_button.setEnabled(True)
         self.connect_button.setText(t("connect.disconnect"))
 
@@ -531,7 +537,10 @@ class MsfsWindow(QMainWindow):
         self.channel_label.setText("")
         self.tx_light.set_lit(False)
         self.rx_light.set_lit(False)
-        # 断开网络就没有他机来源了，把已经放进去的清掉，否则会冻在天上
+        # 断开网络就没有他机来源了，把已经放进去的清掉，否则会冻在天上。
+        # 先停注入循环：不停的话表里还没过期的飞机下一帧又被建回来。
+        self.injection_loop.stop()
+        self._traffic_plan = None
         if self.injector is not None:
             self.injector.clear()
         self._model_cache.clear()
@@ -646,7 +655,7 @@ class MsfsWindow(QMainWindow):
         self._sync_frequency()
 
     def traffic_tick(self):
-        """每 0.2 秒：把他机插值到当下放进模拟器，并把最新的本机位置交给 FSD。
+        """每 0.2 秒：把最新的本机位置交给 FSD，并更新注入循环要的模型表。
 
         位置也在这里喂而不是在 tick() 里：FSD 每 0.2 秒发一个位置包，0.5 秒
         才喂一次的话，连着两三个包是同一份数据，别人那边飞机一走一停。
@@ -701,17 +710,16 @@ class MsfsWindow(QMainWindow):
         threading.Thread(target=scan, daemon=True).start()
 
     def _push_traffic(self, snapshot):
-        """把他机插值到当前时刻，放进模拟器。"""
+        """给注入循环准备好这一轮要的东西：注入器、本机位置、每架飞机的模型。
+
+        真正写进模拟器的是 _inject_frame，在注入循环的线程上。
+        """
         # prune 不受开关控制：关着渲染的话表会涨一整场
         for callsign in self.traffic.prune():
             self._model_cache.pop(callsign, None)
         if not self.settings.render_traffic:
-            # 刚关掉开关时把已经放进去的清掉——不清的话飞机全部冻在天上，
-            # 用户本来是嫌掉帧才关的，结果掉帧还在
-            if (self.injector is not None and self.injector.aircraft
-                    and not self._injecting.is_set()):
-                self._injecting.set()
-                threading.Thread(target=self._clear_injected, daemon=True).start()
+            # 已经放进去的由注入循环清掉（_inject_frame）
+            self._traffic_plan = None
             return
         # SimLink 断线重连后句柄是新建的，旧注入器抱着死句柄：创建请求发到
         # 关掉的连接上、objectID 永远不回来。句柄一换就重建注入器。
@@ -731,33 +739,36 @@ class MsfsWindow(QMainWindow):
             origin=origin,
             limit=inject.MAX_AIRCRAFT,
             max_range_nm=self.settings.traffic_range_nm or None)
-
-        for entry in entries:
-            entry["model"] = self._model_for(entry)
+        models = {entry["callsign"]: self._model_for(entry) for entry in entries}
         self.traffic_label.setText(t("radio.traffic", count=len(entries)))
-        # 注入走后台线程。sync() 里每架飞机都是一次 SimConnect 同步 IPC，最多
-        # 40 架、每 0.5 秒一轮——在 Qt 主线程上做这件事窗口会"未响应"。
-        # 上一轮还没做完就跳过这一轮，别让请求越堆越多。
-        if self.injector is not None and not self._injecting.is_set():
-            self._injecting.set()
-            threading.Thread(target=self._inject, args=(entries,),
-                             daemon=True).start()
+        # 整个换掉引用，不原地改：注入循环在另一条线程上读它
+        self._traffic_plan = (origin, models)
 
-    def _inject(self, entries):
-        try:
-            self.injector.sync(entries)
-        except Exception as e:
-            log.warning("injecting traffic into the simulator raised: %s", e)
-        finally:
-            self._injecting.clear()
+    def _inject_frame(self):
+        """注入循环的一帧（不在 Qt 线程上）：插值到此刻，写进模拟器。
 
-    def _clear_injected(self):
-        try:
-            self.injector.clear()
-        except Exception as e:
-            log.warning("clearing the injected traffic raised: %s", e)
-        finally:
-            self._injecting.clear()
+        sync() 里每架飞机一次 SimConnect 调用；放在 Qt 线程上窗口会"未响应"。
+        """
+        injector = self.injector
+        if injector is None:
+            return
+        if not self.settings.render_traffic:
+            # 刚关掉开关时把已经放进去的清掉——不清的话飞机全部冻在天上，
+            # 用户本来是嫌掉帧才关的，结果掉帧还在
+            if injector.aircraft:
+                injector.clear()
+            return
+        plan = self._traffic_plan
+        if plan is None:
+            return
+        origin, models = plan
+        entries = self.traffic.snapshot(
+            origin=origin,
+            limit=inject.MAX_AIRCRAFT,
+            max_range_nm=self.settings.traffic_range_nm or None)
+        for entry in entries:
+            entry["model"] = models.get(entry["callsign"], "")
+        injector.sync(entries)
 
     def _model_for(self, entry):
         """给一架飞机挑模型。匹配结果缓存住，别每帧都算。
@@ -1126,6 +1137,9 @@ class MsfsWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.timer.stop()
+        self.traffic_timer.stop()
+        # 注入循环要在 clear() 之前停，否则它下一帧又把飞机建回来
+        self.injection_loop.stop()
         self.ptt_watcher.stop()
         if self.fsd:
             self.fsd.stop()

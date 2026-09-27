@@ -4024,6 +4024,126 @@ class VelocityTrafficTest(unittest.TestCase):
                                5.08 * traffic_module.FEET_PER_METRE * 60.0)
 
 
+class RenderDelayTest(unittest.TestCase):
+    """render_delay > 0（msfs 的用法）：取稍早的时刻，在两个真实样本之间插值。
+
+    msfs 每帧直接把 position_at(now) 写进模拟器。追着最新样本外推的话，每个
+    新样本到达都把外推误差在一帧里纠正过来，30 Hz 下就是一抽一抽的。
+    """
+
+    DELAY = 0.3
+
+    def setUp(self):
+        self.table = traffic_module.TrafficTable(render_delay=self.DELAY)
+
+    def add(self, at, lat, lon=120.0, heading=90.0, altitude=10000.0,
+            velocity=None):
+        self.table.update_position("CES1", latitude=lat, longitude=lon,
+                                   altitude=altitude, pitch=0.0, bank=0.0,
+                                   heading=heading, groundspeed=250, now=at,
+                                   velocity=velocity)
+
+    def at(self, now):
+        return self.table.get("CES1").position_at(now)
+
+    def test_renders_between_the_samples_that_bracket_render_time(self):
+        self.add(100.0, 30.00)
+        self.add(100.2, 30.01)
+        self.add(100.4, 30.02)
+        # 渲染时刻 100.3，夹在 100.2 和 100.4 之间
+        self.assertAlmostEqual(self.at(100.6)["latitude"], 30.015, places=9)
+        # 渲染时刻 100.1，更早的那一段也还留着
+        self.assertAlmostEqual(self.at(100.4)["latitude"], 30.005, places=9)
+
+    def test_a_new_sample_does_not_move_the_rendered_position(self):
+        """样本按 5 Hz 带抖动到达，到达那一刻前后渲染出来的位置一样。"""
+        arrivals = [100.0, 100.21, 100.38, 100.62, 100.8, 101.05, 101.2, 101.43]
+        for index, when in enumerate(arrivals):
+            if index:
+                before = self.at(when)
+            self.add(when, 30.0 + 0.001 * index * index)   # 在加速
+            if index:
+                after = self.at(when)
+                for key in ("latitude", "longitude", "altitude", "heading"):
+                    self.assertAlmostEqual(before[key], after[key], places=9,
+                                           msg=f"{key} 在 {when} 跳了")
+
+    def test_an_extrapolation_error_is_blended_not_snapped(self):
+        """样本间隔比延迟长（外推到了最新样本之后），修正要在 BLEND_TIME 里走完。"""
+        self.add(100.0, 30.000)
+        self.add(101.0, 30.010)
+        # 渲染时刻 101.7 已经过了最新样本，按 0.01°/s 外推到 30.017
+        before = self.at(102.0)
+        self.assertAlmostEqual(before["latitude"], 30.017, places=9)
+        # 实际上减速了
+        self.add(102.0, 30.012)
+        self.assertAlmostEqual(self.at(102.0)["latitude"], before["latitude"],
+                               places=9, msg="新样本让飞机跳了一下")
+        # 中途还带着一半的修正（时间只往前走，所以先看中途）
+        middle = self.at(102.0 + traffic_module.BLEND_TIME / 2)["latitude"]
+        raw_middle = self.table.get("CES1")._raw_position(
+            102.0 + traffic_module.BLEND_TIME / 2 - self.DELAY)["latitude"]
+        self.assertGreater(middle, raw_middle)
+        # 抹平完之后就是真实数据
+        later = 102.0 + traffic_module.BLEND_TIME + 0.01
+        settled = self.at(later)
+        raw = self.table.get("CES1")._raw_position(later - self.DELAY)
+        self.assertAlmostEqual(settled["latitude"], raw["latitude"], places=9)
+
+    def test_a_teleport_is_not_blended(self):
+        # 差出几公里就不是外推误差了，是换了位置，直接过去
+        self.add(100.0, 30.0)
+        self.add(101.0, 30.01)
+        self.add(102.0, 31.0)
+        raw = self.table.get("CES1")._raw_position(102.0 - self.DELAY)
+        self.assertAlmostEqual(self.at(102.0)["latitude"], raw["latitude"], places=9)
+
+    def test_heading_wraps_across_north(self):
+        self.add(100.0, 30.0, heading=359.0)
+        self.add(100.2, 30.0, heading=1.0)
+        self.add(100.4, 30.0, heading=3.0)
+        heading = self.at(100.4)["heading"]         # 渲染时刻 100.1
+        self.assertAlmostEqual(heading, 0.0, places=6)
+
+    def test_a_blended_heading_stays_on_the_short_arc(self):
+        self.add(100.0, 30.0, heading=356.0)
+        self.add(101.0, 30.0, heading=358.0)
+        before = self.at(102.0)["heading"]          # 外推到 359.4
+        self.add(102.0, 30.0, heading=2.0)
+        after = self.at(102.0)["heading"]
+        self.assertAlmostEqual(before, after, places=6)
+        for step in range(1, 10):
+            heading = self.at(102.0 + step * 0.05)["heading"]
+            self.assertTrue(0.0 <= heading < 360.0, heading)
+            distance = abs((heading - 0.0 + 180.0) % 360.0 - 180.0)
+            self.assertLess(distance, 5.0, f"航向绕了远路：{heading}")
+
+    def test_a_single_velocity_sample_is_dead_reckoned(self):
+        # 带速度的样本（#SL 五秒一个）：没有夹得住的两点，按速度推
+        self.add(100.0, 30.0, velocity=(100.0, 0.0, 0.0))
+        position = self.at(101.3)                   # 渲染时刻 101.0
+        self.assertAlmostEqual(position["latitude"],
+                               30.0 + 100.0 / traffic_module.METRES_PER_DEGREE)
+
+    def test_slow_senders_fall_back_to_bounded_extrapolation(self):
+        # 只发 `@`、五秒一个（VATSIM 老客户端）：外推，但有上限
+        self.add(100.0, 30.0)
+        self.add(105.0, 30.05)
+        self.assertAlmostEqual(self.at(105.5)["latitude"], 30.052, places=9)
+        far = self.at(1000.0)["latitude"]
+        self.assertAlmostEqual(far, 30.05 + 0.01 * traffic_module.MAX_EXTRAPOLATE,
+                               places=9)
+
+    def test_zero_delay_keeps_the_old_meaning(self):
+        # xpc 用 0：position_at(now) 就是 now 那一刻，不插延迟也不抹平
+        table = traffic_module.TrafficTable()
+        table.update_position("CES1", latitude=30.0, longitude=120.0,
+                              altitude=0, pitch=0, bank=0, heading=0, now=100.0)
+        table.update_position("CES1", latitude=30.01, longitude=120.0,
+                              altitude=0, pitch=0, bank=0, heading=0, now=101.0)
+        self.assertAlmostEqual(table.get("CES1").position_at(101.0)["latitude"], 30.01)
+
+
 class DuplicateSampleTest(unittest.TestCase):
     """发送方把同一份快照重复发几次，不能被当成"停下来了"。"""
 

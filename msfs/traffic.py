@@ -1,7 +1,7 @@
 """他机航迹表。
 
 对应 xPilot 的 `src/aircrafts/`。FSD 的 `@` 位置包一秒才 5 个，直接照着画飞机
-会一跳一跳，所以这里保留每架飞机的前后两个采样，由渲染端按时间插值。
+会一跳一跳，所以这里保留每架飞机最近几个采样，由渲染端按时间插值。
 
 这个模块**不碰 X-Plane、不碰网络**，只有数据和时间——所以它是这套东西里唯一
 能完整测到的部分。插件和 FSD 各自把数据递进来：
@@ -21,6 +21,7 @@
 ——所以 `Aircraft.model_dirty` 存在，让渲染端知道该重新匹配了。
 """
 
+import collections
 import logging
 import math
 import threading
@@ -45,6 +46,18 @@ DUPLICATE_WINDOW = 2.0
 MAX_VELOCITY_EXTRAPOLATE = 6.0
 # 这么久以内收到过带速度的样本，`@` 就不再当位置样本用。
 VELOCITY_FRESH = 7.0
+# 渲染端按"现在减这么多"的时刻取位置（TrafficTable(render_delay=...)）。取在
+# 最新样本之前，两个样本之间就总有一段真实数据可插，新样本到达时画面不跳。
+# 5 Hz 的发送方样本间隔 200 ms，再留出网络抖动和重复快照的余量。
+RENDER_DELAY = 0.3
+# 每架飞机留多少个样本。取位置的时刻落在最新样本之前，要能找到夹住它的两个。
+HISTORY_SIZE = 8
+# 新样本到达时，旧的画法和新的画法之间的差（外推的误差）在这么久里抹平，
+# 而不是一帧跳过去。
+BLEND_TIME = 0.25
+# 差得比这还多就直接跳：那是换了位置（重新连线、瞬移），不是外推误差。
+BLEND_MAX_METRES = 2000.0
+BLEND_MAX_FEET = 1000.0
 
 FEET_PER_METRE = 3.280839895
 NM_PER_DEGREE = 60.0
@@ -94,15 +107,80 @@ def _interpolate_angle(a, b, ratio):
     return (a + difference * ratio) % 360.0
 
 
-class Aircraft:
-    """一架他机。"""
+def _wrap_longitude(longitude):
+    if longitude > 180.0:
+        longitude -= 360.0
+    elif longitude < -180.0:
+        longitude += 360.0
+    return longitude
 
-    def __init__(self, callsign):
+
+def _interpolate(older, newer, ratio):
+    """两个样本之间按 ratio 插值。ratio 可以大于 1（外推）。"""
+    # 经度也要按最短弧走：179.98°E 到 -179.98° 是往前 0.04°，
+    # 线性差值会让飞机横穿整个地球再回来
+    lon_step = (newer.longitude - older.longitude + 180.0) % 360.0 - 180.0
+    return {
+        "latitude": older.latitude + (newer.latitude - older.latitude) * ratio,
+        "longitude": _wrap_longitude(older.longitude + lon_step * ratio),
+        "altitude": older.altitude + (newer.altitude - older.altitude) * ratio,
+        "pitch": older.pitch + (newer.pitch - older.pitch) * ratio,
+        "bank": older.bank + (newer.bank - older.bank) * ratio,
+        "heading": _interpolate_angle(older.heading, newer.heading, ratio),
+        "on_ground": newer.on_ground,
+        "groundspeed": newer.groundspeed,
+    }
+
+
+_BLENDED = ("latitude", "longitude", "altitude", "pitch", "bank", "heading")
+
+
+def _difference(a, b):
+    """a - b，经度和航向按最短弧。"""
+    offset = {key: a[key] - b[key] for key in _BLENDED}
+    offset["longitude"] = (offset["longitude"] + 180.0) % 360.0 - 180.0
+    offset["heading"] = (offset["heading"] + 180.0) % 360.0 - 180.0
+    return offset
+
+
+def _worth_blending(offset, latitude):
+    """差值不为零、又没大到"换了位置"的程度。"""
+    if not any(offset[key] for key in _BLENDED):
+        return False
+    north = offset["latitude"] * METRES_PER_DEGREE
+    east = (offset["longitude"] * METRES_PER_DEGREE
+            * max(1e-6, math.cos(math.radians(latitude))))
+    return (math.hypot(north, east) <= BLEND_MAX_METRES
+            and abs(offset["altitude"]) <= BLEND_MAX_FEET)
+
+
+def _apply_offset(position, offset, weight):
+    for key in _BLENDED:
+        position[key] += offset[key] * weight
+    position["longitude"] = _wrap_longitude(position["longitude"])
+    position["heading"] %= 360.0
+
+
+class Aircraft:
+    """一架他机。
+
+    render_delay 为 0 时 position_at(now) 就是 now 那一刻的位置（xpc 的用法，
+    插件那边自己再插值）。大于 0 时 position_at(now) 是**给渲染用的**：取
+    now - render_delay 那一刻，在历史样本里找夹住它的两个插值，新样本带来的
+    修正在 BLEND_TIME 里抹平。
+    """
+
+    def __init__(self, callsign, render_delay=0.0):
         self.callsign = callsign
         self.squawk = 0
         self.transponder_mode = "S"
         self.previous = None
         self.latest = None
+        self.render_delay = render_delay
+        # 最近 HISTORY_SIZE 个位置样本，按时间排。latest 永远是最后一个。
+        self.history = collections.deque(maxlen=HISTORY_SIZE)
+        # (开始时刻, 差值字典)：新样本到达那一刻，旧画法减新画法
+        self._blend = None
         # 建表时刻。机型先于位置到达的那些 latest 是 None，prune 按这个给
         # 它们留一段宽限，不然半秒后就被当成"太久没消息"清掉了。
         self.created = clock()
@@ -149,24 +227,51 @@ class Aircraft:
             pass
         elif latest is None:
             self.latest = sample
+            self.history.append(sample)
         elif sample.time <= latest.time:
             # 时间戳打平（同一次 recv 读出的两个包）：新的那个替换 latest，
             # previous 不动。丢掉新的就是丢掉更新的位置；拿它当新一段的话
             # 两点间隔是零，插值除零。
             sample.time = latest.time
-            self.latest = sample
+            self._accept(sample, replace=True)
         elif (sample.velocity is None and sample.same_place(latest)
                 and sample.time - latest.time < DUPLICATE_WINDOW):
             # 同一份快照又发了一遍。当新样本的话前后两点一样，速度被拉成
             # 零，飞机在两次真正的更新之间停下来。
             pass
         else:
-            self.previous = latest
-            self.latest = sample
+            self._accept(sample, replace=False)
         if squawk is not None:
             self.squawk = squawk
         if mode is not None:
             self.transponder_mode = mode
+
+    def _accept(self, sample, replace):
+        """把一个新样本收进来，并记下它给渲染带来的跳变，好在之后抹平。
+
+        渲染时刻就是 sample.time - render_delay（样本按到达时刻打时间戳）。
+        收之前和收之后各算一次那一刻的位置，差值就是这个样本带来的修正——
+        夹得住的时候两次一样，差值是零；只有外推过了头才有差。
+        """
+        at = sample.time
+        before = self.position_at(at) if self.render_delay > 0 else None
+        if replace:
+            self.latest = sample
+            if self.history:
+                self.history[-1] = sample
+            else:
+                self.history.append(sample)
+        else:
+            self.previous = self.latest
+            self.latest = sample
+            self.history.append(sample)
+        if before is None:
+            return
+        self._blend = None
+        after = self.position_at(at)
+        offset = _difference(before, after)
+        if _worth_blending(offset, after["latitude"]):
+            self._blend = (at, offset)
 
     def set_plane_info(self, equipment=None, airline=None, livery=None, csl=None):
         """收到 PI:GEN。有变化才置脏，免得渲染端反复重新加载模型。"""
@@ -196,43 +301,56 @@ class Aircraft:
         return (self.latest.altitude - self.previous.altitude) / span * 60.0
 
     def position_at(self, now):
-        """插值出 now 时刻的位置。没有数据返回 None。
+        """now 时刻的位置。没有数据返回 None。
 
-        两个采样之间走线性插值；超过最后一个采样就按最后的速度外推，但最多
-        外推 MAX_EXTRAPOLATE 秒——对方掉线时飞机应当停在原地，不是一直飞下去。
+        render_delay 为 0：两个采样之间线性插值；超过最后一个采样就按最后的
+        速度外推，但最多外推 MAX_EXTRAPOLATE 秒——对方掉线时飞机应当停在原地，
+        不是一直飞下去。
+
+        render_delay 大于 0：取 now - render_delay 那一刻（见类说明），再叠上
+        还没抹平完的修正。
         """
-        latest = self.latest
-        if not latest:
+        if not self.latest:
             return None
+        if self.render_delay <= 0:
+            return self._raw_position(now)
+        position = self._raw_position(now - self.render_delay)
+        blend = self._blend
+        if blend is not None:
+            started, offset = blend
+            remaining = 1.0 - (now - started) / BLEND_TIME
+            if remaining <= 0:
+                self._blend = None
+            else:
+                _apply_offset(position, offset, min(1.0, remaining))
+        return position
+
+    def _raw_position(self, at):
+        """样本数据在 at 时刻的位置，不带延迟、不带抹平。"""
+        latest = self.latest
+        history = self.history
+        if len(history) >= 2 and at < latest.time:
+            # 在历史里找夹住 at 的两个样本
+            if at <= history[0].time:
+                return self._as_dict(history[0])
+            for index in range(len(history) - 1, 0, -1):
+                older = history[index - 1]
+                newer = history[index]
+                if older.time <= at <= newer.time:
+                    if newer.time <= older.time:
+                        return self._as_dict(newer)
+                    ratio = (at - older.time) / (newer.time - older.time)
+                    return _interpolate(older, newer, ratio)
         previous = self.previous
         if not previous or latest.time <= previous.time:
-            return self._dead_reckon(self._as_dict(latest), latest, now)
+            return self._dead_reckon(self._as_dict(latest), latest, at)
 
         span = latest.time - previous.time
-        ratio = (now - previous.time) / span
+        ratio = (at - previous.time) / span
         # 往前不外推（收到乱序包时会出现），往后最多外推固定秒数
         limit = 1.0 + min(MAX_EXTRAPOLATE, span * 2) / span
         ratio = max(0.0, min(limit, ratio))
-
-        # 经度也要按最短弧走：179.98°E 到 -179.98° 是往前 0.04°，
-        # 线性差值会让飞机横穿整个地球再回来
-        lon_step = (latest.longitude - previous.longitude + 180.0) % 360.0 - 180.0
-        longitude = previous.longitude + lon_step * ratio
-        if longitude > 180.0:
-            longitude -= 360.0
-        elif longitude < -180.0:
-            longitude += 360.0
-
-        return self._dead_reckon({
-            "latitude": previous.latitude + (latest.latitude - previous.latitude) * ratio,
-            "longitude": longitude,
-            "altitude": previous.altitude + (latest.altitude - previous.altitude) * ratio,
-            "pitch": previous.pitch + (latest.pitch - previous.pitch) * ratio,
-            "bank": previous.bank + (latest.bank - previous.bank) * ratio,
-            "heading": _interpolate_angle(previous.heading, latest.heading, ratio),
-            "on_ground": latest.on_ground,
-            "groundspeed": latest.groundspeed,
-        }, latest, now)
+        return self._dead_reckon(_interpolate(previous, latest, ratio), latest, at)
 
     @staticmethod
     def _dead_reckon(position, latest, now):
@@ -269,11 +387,15 @@ class Aircraft:
 class TrafficTable:
     """所有他机。FSD 线程写，渲染线程读，所以整体上锁。"""
 
-    def __init__(self, on_request_info=None, on_request_config=None):
+    def __init__(self, on_request_info=None, on_request_config=None,
+                 render_delay=0.0):
         # on_request_info(callsign) —— 需要向对方要机型时调用
         # on_request_config(callsign) —— 需要向对方要配置（灯光等）时调用
+        # render_delay —— 见 Aircraft。xpc 用 0（插件自己插值），msfs 用
+        # RENDER_DELAY（每帧直接写进模拟器）。
         self.on_request_info = on_request_info
         self.on_request_config = on_request_config
+        self.render_delay = render_delay
         self.aircraft = {}
         self._lock = threading.Lock()
 
@@ -302,7 +424,7 @@ class TrafficTable:
         with self._lock:
             aircraft = self.aircraft.get(callsign)
             if aircraft is None:
-                aircraft = Aircraft(callsign)
+                aircraft = Aircraft(callsign, self.render_delay)
                 self.aircraft[callsign] = aircraft
                 # 降 DEBUG：紧跟着的模型匹配那行已经点了名。离线那条
                 # 留在 INFO——飞机什么时候消失的，是查问题要看的
@@ -337,7 +459,7 @@ class TrafficTable:
             aircraft = self.aircraft.get(callsign)
             if aircraft is None:
                 # 机型先于位置到达也要留住，别丢
-                aircraft = Aircraft(callsign)
+                aircraft = Aircraft(callsign, self.render_delay)
                 self.aircraft[callsign] = aircraft
             changed = aircraft.set_plane_info(**info)
         if changed:

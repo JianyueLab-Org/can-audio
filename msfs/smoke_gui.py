@@ -310,10 +310,21 @@ def main():
             self.sim = None
 
         def sync(self, entries):
+            self.threads.add(threading.current_thread())
             self.synced.append(entries)
 
         def clear(self):
             self.synced.append("cleared")
+
+    FakeInjector.threads = set()
+
+    def wait_for(condition, timeout=1.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if condition():
+                return True
+            time.sleep(0.01)
+        return condition()
 
     def traffic_from_fsd():
         import aimatch
@@ -331,15 +342,13 @@ def main():
     check("从 FSD 收到一架他机", traffic_from_fsd)
 
     def traffic_reaches_the_injector():
+        window.injection_loop.start()     # connect_all 里启动的那条循环
         window.injector = FakeInjector()
         window.tick()
-        window.traffic_tick()      # 他机现在走自己的快节奏定时器
-        # 注入走后台线程了，等它跑完
-        for _ in range(50):
-            if window.injector.synced:
-                break
-            time.sleep(0.02)
-        assert window.injector.synced, "他机没有交给注入器"
+        window.traffic_tick()      # 挑模型；写进模拟器的是注入循环
+        assert wait_for(lambda: window.injector.synced), "他机没有交给注入器"
+        assert threading.main_thread() not in FakeInjector.threads, \
+            "注入跑到了 Qt 线程上"
         entries = window.injector.synced[-1]
         assert entries, "交给注入器的列表是空的"
         entry = entries[0]
@@ -368,6 +377,7 @@ def main():
         window.traffic_tick()
         elapsed = time.time() - started
         assert elapsed < 0.2, f"tick() 被注入拖了 {elapsed:.2f} 秒"
+        window.injector = FakeInjector()
         time.sleep(1.2)                  # 让后台线程收尾，别泄漏到下一项
     check("注入不阻塞界面", tick_does_not_block_on_injection)
 
@@ -387,24 +397,28 @@ def main():
         window.traffic.set_plane_info("CES2345", equipment="B738", airline="CCA")
         window.tick()
         window.traffic_tick()
-        time.sleep(0.15)
-        first = window.injector.synced[-1][0]["model"]
-        assert first == "坏模型", first
+        assert wait_for(lambda: window.injector.synced
+                        and window.injector.synced[-1]
+                        and window.injector.synced[-1][0]["model"] == "坏模型"), \
+            window.injector.synced[-1:]
 
         # 模拟器拒绝了它
         window.injector.bad_titles.add("坏模型")
         window.tick()
         window.traffic_tick()
-        time.sleep(0.15)
-        second = window.injector.synced[-1][0]["model"]
-        assert second == "好模型", f"被拒之后还在用 {second}"
+        assert wait_for(lambda: window.injector.synced[-1]
+                        and window.injector.synced[-1][0]["model"] == "好模型"), \
+            f"被拒之后还在用 {window.injector.synced[-1][0]['model']}"
     check("被拒绝的模型会换一个", rejected_model_is_replaced)
 
     def render_can_be_turned_off():
-        window.injector = FakeInjector()
         window.settings.render_traffic = False
+        window.traffic_tick()
+        time.sleep(0.1)                  # 正在跑的那一帧收尾
+        window.injector = FakeInjector()
         window.tick()
         window.traffic_tick()
+        time.sleep(0.1)                  # 给注入循环几帧
         window.settings.render_traffic = True
         assert not [s for s in window.injector.synced if s != "cleared"], \
             "关掉之后不该再放飞机进去"
@@ -425,6 +439,7 @@ def main():
         window.injector = FakeInjector()
         window.disconnect_all()
         assert "cleared" in window.injector.synced, "断开时没有清掉他机"
+        assert not window.injection_loop.running, "断开之后注入循环还在跑"
     check("断开时清掉已注入的飞机", disconnect_clears_injected_traffic)
 
     print("观察员模式：")
