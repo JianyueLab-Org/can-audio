@@ -3228,6 +3228,68 @@ class AnimationValuesTest(unittest.TestCase):
         self.assertIn("tcas_available", source)
 
 
+class ObjDataRefRewriteTest(unittest.TestCase):
+    """Bluebell 的灯和舵面用 cjs/world_traffic/*，要换成插件驱动的 libxplanemp/*。"""
+
+    BLUEBELL = ("I\n800\nOBJ\n\nTEXTURE b738.png\n"
+                "ANIM_show 1 1 cjs/world_traffic/taxi_lights_on\n"
+                "LIGHT_NAMED airplane_taxi 0 0 0\n"
+                "ANIM_show 1 1 cjs/wolrd_traffic/landing_lights_on\n"
+                "ANIM_rotate 1 0 0 0 90 0 1 cjs/world_traffic/main_gear_retraction_ratio\n")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        cslmatch._drawn_paths.clear()
+        self.addCleanup(cslmatch._drawn_paths.clear)
+
+    def _obj(self, name, text):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        return path
+
+    def test_world_traffic_datarefs_are_rewritten_into_a_copy(self):
+        original = self._obj("b738.obj", self.BLUEBELL)
+        drawn = cslmatch.obj_for_drawing(original)
+        self.assertEqual(drawn, os.path.join(self.tmp, "b738" + cslmatch.REWRITTEN_SUFFIX))
+        with open(drawn, encoding="utf-8") as f:
+            text = f.read()
+        self.assertNotIn("world_traffic", text)
+        self.assertNotIn("wolrd_traffic", text)
+        self.assertIn("libxplanemp/controls/taxi_lites_on", text)
+        self.assertIn("libxplanemp/controls/landing_lites_on", text)
+        self.assertIn("libxplanemp/controls/gear_ratio", text)
+        self.assertEqual(text.splitlines()[3], cslmatch.REWRITE_MARK)
+        with open(original, encoding="utf-8") as f:
+            self.assertEqual(f.read(), self.BLUEBELL, "原件不能动")
+
+    def test_a_model_already_on_libxplanemp_is_used_as_is(self):
+        original = self._obj("a320.obj", "I\n800\nOBJ\n\n"
+                             "ANIM_show 1 1 libxplanemp/controls/taxi_lites_on\n")
+        self.assertEqual(cslmatch.obj_for_drawing(original), original)
+        self.assertEqual(os.listdir(self.tmp), ["a320.obj"])
+
+    def test_every_target_is_registered_by_the_plugin(self):
+        """换成插件没注册的 dataref 和不换一样，灯照样不亮。"""
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "plugin", "PI_XpcTraffic.py")
+        spec = importlib.util.spec_from_file_location("pi_xpc_rewrite", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        registered = set(module.ANIMATION_DATAREFS)
+        for _, new in cslmatch.OBJ_DATAREF_REPLACEMENTS:
+            self.assertIn(new, registered)
+
+    def test_an_unwritable_directory_falls_back_to_the_original(self):
+        original = self._obj("b738.obj", self.BLUEBELL)
+        with mock.patch("builtins.open", side_effect=[open(original, encoding="utf-8",
+                                                           newline=""),
+                                                      PermissionError("read-only")]):
+            self.assertEqual(cslmatch.obj_for_drawing(original), original)
+
+
 class PluginInstallTest(unittest.TestCase):
     """把他机插件装进 X-Plane。
 

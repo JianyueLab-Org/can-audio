@@ -732,7 +732,7 @@ class XpcWindow(QMainWindow):
             equipment=entry.get("equipment", ""),
             airline=entry.get("airline", ""),
             csl=entry.get("csl", ""))
-        path = model.path if model else ""
+        path = cslmatch.obj_for_drawing(model.path) if model else ""
         offset = cslmatch.vert_offset(model) if model else 0.0
         self._model_cache[callsign] = (path, offset)
         # 带上这次匹配用的机型/航司：#SB 的回复如果恰好落在快照之后、这里
