@@ -18,6 +18,7 @@ import struct
 import threading
 import time
 
+import altitude as altitude_model
 from i18n import t
 
 log = logging.getLogger("sim")
@@ -57,10 +58,12 @@ DATAREFS = {
     # 真高（米），FSD 要英尺
     "elevation":    "sim/flightmodel/position/elevation",
     "agl":          "sim/flightmodel/position/y_agl",
-    # 高度表上读到的数（英尺）和高度表窗口里拨的气压（inHg）。这两个只用来
-    # 算位置包最后那个气压修正量，不参与"飞机实际在哪儿"。
-    "indicated_altitude": "sim/cockpit2/gauges/indicators/altitude_ft_pilot",
-    "baro_setting": "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot",
+    # 海平面气压（inHg）。X-Plane 11 用它算气压高度，见 altitude.xplane_altitudes()。
+    "sea_level_baro": "sim/weather/barometer_sealevel_inhg",
+    # 这两个只有 X-Plane 12 有：气压高度（英尺）和高度表温度误差（英尺）。
+    # 不存在的 dataref X-Plane 不推送，推了就是 12，不按版本分支。
+    "pressure_altitude": "sim/flightmodel2/position/pressure_altitude",
+    "temperature_error": "sim/weather/aircraft/altimeter_temperature_error",
     "groundspeed":  "sim/flightmodel/position/groundspeed",
     "pitch":        "sim/flightmodel/position/theta",
     "bank":         "sim/flightmodel/position/phi",
@@ -101,35 +104,6 @@ XPDR_ONLINE = 2
 XPDR_STANDBY = 1
 # 判"停着"的地速门槛（节）。和 fsdpilot 降低位置包频率用的是同一条线。
 PARKED_SPEED_KT = 1
-
-# 标准大气压，高度表拨到这个值时"指示高度"就是气压高度。
-STANDARD_PRESSURE_INHG = 29.92
-# 高度表窗口能拨到的范围。超出这个范围的值一定是没读到（0）或者读错了，
-# 拿它去算修正量会把飞机在雷达上挪三万英尺，所以宁可不修正。
-BARO_RANGE = (25.0, 32.0)
-
-
-def pressure_delta(indicated_ft, baro_inhg, true_altitude_ft):
-    """位置包最后一个字段：气压高度减真高，英尺。
-
-    应答机报的是**气压高度**（高度表拨 29.92 时读到的数），而位置包第 7 个
-    字段报的是**真高**——两者在巡航高度上能差一千英尺，这就是"座舱里 35000、
-    雷达上 34000"的由来。FSD 协议把差值单独放在最后一个字段里，正是为了让
-    画他机的客户端拿真高摆飞机、让管制端拿真高加修正量当高度显示。
-
-    气压高度 = 指示高度 + (29.92 - 高度表拨的气压) * 1000。温度偏差带来的
-    误差不需要另算：指示高度本身就带着它，真高不带，相减自然就有了。
-
-    读不到就返回 0，也就是退回修正前的行为——宁可不修正，不能瞎修正。
-    """
-    if indicated_ft is None or baro_inhg is None:
-        return 0
-    if not BARO_RANGE[0] <= baro_inhg <= BARO_RANGE[1]:
-        return 0
-    pressure_altitude = (indicated_ft
-                         + (STANDARD_PRESSURE_INHG - baro_inhg) * 1000.0)
-    return int(round(pressure_altitude - true_altitude_ft))
-
 
 def xpdr_mode(raw_mode, on_ground, groundspeed_kt):
     """transponder_mode dataref -> 位置包要的应答机模式。
@@ -393,16 +367,26 @@ class XPlaneLink:
         if not raw:
             return None
 
-        elevation = raw.get("elevation", 0.0)
-        altitude = int(round(elevation / METRES_PER_FOOT))
+        elevation = raw.get("elevation", 0.0) / METRES_PER_FOOT
+        altitude = int(round(elevation))
+        sea_level = raw.get("sea_level_baro")
+        network, pressure, temperature_error = altitude_model.xplane_altitudes(
+            elevation,
+            sea_level * altitude_model.INHG_TO_HPA if sea_level else None,
+            raw.get("pressure_altitude"), raw.get("temperature_error"))
+        network = int(round(network))
+        pressure = int(round(pressure))
         groundspeed = int(round(raw.get("groundspeed", 0.0) * KNOTS_PER_MPS))
         on_ground = bool(raw.get("on_ground", 0))
         return {
             "latitude": raw.get("latitude", 0.0),
             "longitude": raw.get("longitude", 0.0),
+            # 真高。网络高度、气压高度和修正量的算法见 altitude.py。
             "altitude": altitude,
-            "pressure_delta": pressure_delta(raw.get("indicated_altitude"),
-                                             raw.get("baro_setting"), altitude),
+            "network_altitude": network,
+            "pressure_altitude": pressure,
+            "temperature_error": int(round(temperature_error)),
+            "pressure_delta": pressure - network,
             "agl": int(round(raw.get("agl", 0.0) / METRES_PER_FOOT)),
             "groundspeed": groundspeed,
             "pitch": raw.get("pitch", 0.0),
