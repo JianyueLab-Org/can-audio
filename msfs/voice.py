@@ -521,6 +521,13 @@ class Voice:
             self._status('error', t("voice.connect_failed", error=e))
             return
 
+        # stop() 可以在连接线程等待 is_ready() 时由 GUI 触发。连接成功后必须
+        # 再看一次 running；否则旧 Voice 会在快速断开/重连后继续启动发送和切频
+        # 线程，并让已经过期的 Mumble 会话继续占用账号。
+        if not self.running:
+            self._release()
+            return
+
         # is_ready() 返回不代表连上了：服务器拒绝时 pymumble 的连接线程会带着
         # ConnectionRejectedError 直接死掉，而 is_ready() 照样放行。实测里
         # 用户名填错，Mumble 回 "Wrong certificate or password"，界面却报

@@ -255,6 +255,19 @@ def main():
         def set_frequency(self, value):
             pass
 
+    def ignores_stale_link_status():
+        old_voice, current_voice = FakeLink(), FakeLink()
+        window.voice = current_voice
+        window.on_voice_status("offline", "旧连接已结束", old_voice)
+        assert window.voice is current_voice, "旧语音连接不能清掉新连接"
+
+        old_fsd, current_fsd = FakeLink(), FakeLink()
+        window.fsd = current_fsd
+        window.on_fsd_status("offline", "旧连接已结束", old_fsd)
+        assert window.fsd is current_fsd, "旧 FSD 连接不能清掉新连接"
+        window.fsd = window.voice = None
+    check("忽略旧连接状态", ignores_stale_link_status)
+
     def voice_offline_keeps_fsd():
         # 语音服务器一抖，飞机不能从网络上消失
         fsd, voice = FakeLink(), FakeLink()
