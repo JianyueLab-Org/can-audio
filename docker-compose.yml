@@ -14,7 +14,7 @@
 
 services:
   mumble:
-    image: ${SERVER_IMAGE:-ghcr.io/jianyuelab-org/airwaysn_audio-server:latest}
+    image: ${SERVER_IMAGE:-ghcr.io/jianyuelab-org/can-audio-server:latest}
     # 只有 docker compose up -d --build 时才用得上；平时是拉镜像。
     build:
       context: .
