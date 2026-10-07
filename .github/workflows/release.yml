@@ -285,6 +285,18 @@ jobs:
         with:
           path: packages
 
+      - name: 生成发布包 SHA-256 清单
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > packages/SHA256SUMS
+          while IFS= read -r -d '' file; do
+            sha256sum "$file" \
+              | awk -v name="${file#packages/}" '{print $1 "  " name}' \
+              >> packages/SHA256SUMS
+          done < <(find packages -type f -name '*.zip' -print0 | sort -z)
+          test -s packages/SHA256SUMS
+
       - name: 打标签
         # 标签是"已发布版本"的唯一事实来源，下一次就靠它算补丁号
         run: |
@@ -299,7 +311,9 @@ jobs:
         with:
           tag_name: ${{ needs.version.outputs.tag }}
           name: ${{ needs.version.outputs.tag }}
-          files: packages/**/*.zip
+          files: |
+            packages/**/*.zip
+            packages/SHA256SUMS
           generate_release_notes: true
           body: |
             ## 下载哪个

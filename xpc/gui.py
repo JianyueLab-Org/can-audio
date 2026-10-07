@@ -1060,11 +1060,11 @@ class XpcWindow(QMainWindow):
         box.exec()
 
         clicked = box.clickedButton()
-        if clicked is download and found.download:
+        if clicked is download and update.is_safe_url(found.download):
             QDesktopServices.openUrl(QUrl(found.download))
             self.add_message(t("msg.update_downloading", version=found.version),
                              theme.ON_COLOR)
-        elif clicked is notes and found.notes:
+        elif clicked is notes and update.is_safe_url(found.notes):
             QDesktopServices.openUrl(QUrl(found.notes))
         elif clicked is skip:
             self.settings.skipped_version = found.version
