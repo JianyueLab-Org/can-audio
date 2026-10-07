@@ -377,7 +377,13 @@ class XPlaneLink:
         """当前这一份数据，已经换算成 FSD 要的单位。"""
         with self._lock:
             raw = dict(self.values)
+            last_update = self.last_update
         if not raw:
+            return None
+        # Do not let the FSD client keep broadcasting the last frame after
+        # X-Plane has stopped producing samples.  A zero timestamp is kept as
+        # a fresh value for callers that preload a snapshot in tests/tools.
+        if last_update and time.time() - last_update >= STALE_AFTER:
             return None
 
         elevation = raw.get("elevation", 0.0) / METRES_PER_FOOT

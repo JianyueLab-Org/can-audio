@@ -379,7 +379,13 @@ class SimLink:
         """当前这一份数据，字段和 xpc/xplane.py 的 snapshot() 完全一致。"""
         with self._lock:
             raw = dict(self.values)
+            last_update = self.last_update
         if not raw:
+            return None
+        # Do not let the FSD client keep broadcasting the last frame after
+        # SimConnect has stopped producing samples.  A zero timestamp is kept
+        # as a fresh value for callers that preload a snapshot in tests/tools.
+        if last_update and time.time() - last_update >= STALE_AFTER:
             return None
 
         true_altitude = raw.get("altitude", 0.0)

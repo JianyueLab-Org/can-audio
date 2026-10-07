@@ -558,8 +558,10 @@ class XpcWindow(QMainWindow):
                 f"{snapshot['groundspeed']} kt  "
                 f"{snapshot['heading']:03.0f}°  A{snapshot['squawk']:04d}")
 
-            if self.fsd:
-                self.fsd.update_position(snapshot)
+        if self.fsd:
+            # Passing None clears the last simulator sample after the
+            # freshness deadline, so the FSD worker cannot rebroadcast it.
+            self.fsd.update_position(snapshot)
 
         # 语音频率每一拍都要跟一次，而且**不能挂在"这轮读到了模拟器数据"下面**：
         # 观察员多半根本没开模拟器，上面整段一次都不会跑，手输的频率就永远送不
@@ -659,8 +661,8 @@ class XpcWindow(QMainWindow):
         snapshot = self.sim.snapshot()
         if snapshot:
             self.snapshot = snapshot
-            if self.fsd:
-                self.fsd.update_position(snapshot)
+        if self.fsd:
+            self.fsd.update_position(snapshot)
         snapshot = self.snapshot
         if snapshot:
             self._push_traffic(snapshot)
