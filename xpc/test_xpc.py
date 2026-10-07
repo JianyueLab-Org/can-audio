@@ -1906,6 +1906,22 @@ class UpdateCheckTest(unittest.TestCase):
         with self.answer(self.payload("2.0.1", available=False)):
             self.assertIsNone(self.update.check("xpc-for-can", "2.0.1"))
 
+    def test_update_links_must_be_absolute_https_urls(self):
+        for value in (
+            "https://ceruleanavi.net/api/v1/clients/download/xpc-for-can",
+            "HTTPS://github.com/JianyueLab-Org/can-audio/releases",
+        ):
+            self.assertTrue(self.update.is_safe_url(value), value)
+        for value in (
+            "",
+            "http://ceruleanavi.net/update.zip",
+            "javascript:alert(1)",
+            "file:///Users/me/update.zip",
+            "//ceruleanavi.net/update.zip",
+            "https://user:password@ceruleanavi.net/update.zip",
+        ):
+            self.assertFalse(self.update.is_safe_url(value), value)
+
     def test_a_server_that_offers_the_same_version_is_ignored(self):
         """服务端说有新版但版本号和自己一样——本地这道闸挡住，别天天催。"""
         with self.answer(self.payload("2.0.1", available=True)):
