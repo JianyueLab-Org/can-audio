@@ -81,8 +81,8 @@ VERSION = version.display()
 class Signals(QObject):
     """后台线程 → GUI 线程的唯一通道。"""
     sim_state = pyqtSignal(bool, str)
-    fsd_status = pyqtSignal(str, str)
-    voice_status = pyqtSignal(str, str)
+    fsd_status = pyqtSignal(str, str, object)
+    voice_status = pyqtSignal(str, str, object)
     text_message = pyqtSignal(str, str, str)
     controllers = pyqtSignal(list)
     ptt = pyqtSignal(bool)
@@ -476,28 +476,45 @@ class XpcWindow(QMainWindow):
         # 观察员**永远不连 FSD**：网络上只能有机长那一架飞机。这里不看
         # connect_fsd，那个开关管的是普通连接。
         if self.settings.connect_fsd and not watching:
-            self.fsd = fsdpilot.FSDPilot(
+            pilot = fsdpilot.FSDPilot(
                 host=self.settings.fsd_host, port=self.settings.fsd_port,
                 callsign=callsign, cid=cid, password=password,
                 real_name=self.settings.real_name or cid,
                 rating=self.settings.rating,
                 aircraft=self.settings.aircraft,
-                on_status=self.signals.fsd_status.emit,
                 on_text=self.signals.text_message.emit,
                 on_controllers=self.signals.controllers.emit,
                 traffic=self.traffic)
+            pilot.on_status = lambda state, message, pilot=pilot: \
+                self.signals.fsd_status.emit(state, message, pilot)
+            pilot.on_text = lambda sender, recipient, message, pilot=pilot: \
+                self.signals.text_message.emit(sender, recipient, message) \
+                if pilot is self.fsd else None
+            pilot.on_controllers = lambda controllers, pilot=pilot: \
+                self.signals.controllers.emit(controllers) \
+                if pilot is self.fsd else None
+            self.fsd = pilot
             self.fsd.start()
 
         # 观察员只有语音这一条链路，connect_voice 关着也要连——否则点了"连接"
         # 之后什么都不会发生，界面上却写着已连接。
         if self.settings.connect_voice or watching:
-            self.voice = voice_module.Voice(
+            voice = voice_module.Voice(
                 host=self.settings.mumble_host, username=cid, password=password,
                 settings=self.settings,
-                on_status=self.signals.voice_status.emit,
                 on_ptt=self.signals.ptt.emit,
                 on_rx=self.signals.rx.emit,
                 on_channel=self.signals.channel.emit)
+            voice.on_status = lambda state, message, voice=voice: \
+                self.signals.voice_status.emit(state, message, voice)
+            voice.on_ptt = lambda transmitting, voice=voice: \
+                self.signals.ptt.emit(transmitting) if voice is self.voice else None
+            voice.on_rx = lambda receiving, voice=voice: \
+                self.signals.rx.emit(receiving) if voice is self.voice else None
+            voice.on_channel = lambda frequency, channel, voice=voice: \
+                self.signals.channel.emit(frequency, channel) \
+                if voice is self.voice else None
+            self.voice = voice
             threading.Thread(target=self.voice.start, daemon=True).start()
 
         self.ptt_watcher.start()
@@ -759,7 +776,9 @@ class XpcWindow(QMainWindow):
         self.add_message(t("msg.sim", message=message),
                          theme.ON_COLOR if connected else theme.ACTIVE_COLOR)
 
-    def on_fsd_status(self, state, message):
+    def on_fsd_status(self, state, message, source=None):
+        if source is not None and source is not self.fsd:
+            return
         colour = {'online': theme.ON_COLOR, 'error': theme.MUTED_COLOR,
                   'offline': theme.MUTED_COLOR}.get(state, theme.ACTIVE_COLOR)
         keys = {'online': "net.online", 'reconnecting': "net.reconnecting",
@@ -788,7 +807,9 @@ class XpcWindow(QMainWindow):
             self.connect_button.setText(
                 t("connect.disconnect") if self.voice else t("connect.connect"))
 
-    def on_voice_status(self, state, message):
+    def on_voice_status(self, state, message, source=None):
+        if source is not None and source is not self.voice:
+            return
         colour = {'online': theme.ON_COLOR, 'error': theme.MUTED_COLOR,
                   'offline': theme.MUTED_COLOR}.get(state, theme.ACTIVE_COLOR)
         keys = {'online': "voicebar.online", 'reconnecting': "voicebar.reconnecting",

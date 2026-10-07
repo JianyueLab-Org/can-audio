@@ -1193,6 +1193,80 @@ class VoiceStartupFailureTest(unittest.TestCase):
         self.assertEqual(len(self.stopped), 3)
 
 
+class VoiceStartCancellationTest(unittest.TestCase):
+    """A stop racing with the initial Mumble handshake must cancel startup."""
+
+    def setUp(self):
+        for name in ("pyaudio", "pymumble_py3", "pymumble_py3.constants",
+                     "pymumble_py3.errors"):
+            sys.modules.setdefault(name, mock.MagicMock())
+        import voice
+        self.voice = voice
+        self.connected = voice.PYMUMBLE_CONN_STATE_CONNECTED
+        voice.pymumble.errors.ConnectionRejectedError = type(
+            "ConnectionRejectedError", (Exception,), {})
+        self.ready_entered = threading.Event()
+        self.allow_ready = threading.Event()
+        self.stopped = threading.Event()
+        self.current = None
+        outer = self
+
+        class FakeMumble:
+            connected = 0
+
+            def __init__(self, *args, **kwargs):
+                self.callbacks = types.SimpleNamespace(
+                    set_callback=lambda *a: None)
+                self.parent_thread = threading.current_thread()
+
+            def set_receive_sound(self, value):
+                pass
+
+            def run(self):
+                self.connected = outer.connected
+                outer.current._on_connected()
+                outer.allow_ready.wait()
+
+            def is_ready(self):
+                outer.ready_entered.set()
+                outer.allow_ready.wait()
+
+            def stop(self):
+                outer.stopped.set()
+                outer.allow_ready.set()
+
+        self._real_mumble = voice.pymumble.Mumble
+        voice.pymumble.Mumble = FakeMumble
+
+    def tearDown(self):
+        self.allow_ready.set()
+        self.voice.pymumble.Mumble = self._real_mumble
+
+    def test_stop_during_handshake_does_not_start_worker_threads(self):
+        v = self.voice.Voice(
+            "host", "1000", "pw",
+            settings=types.SimpleNamespace(mic_volume=100, speaker_volume=100))
+        v._open_audio = lambda: (
+            setattr(v, "_audio", types.SimpleNamespace(terminate=lambda: None)),
+            setattr(v, "_input", FakeStream()),
+            setattr(v, "_output", FakeStream()))
+        self.current = v
+        v._run = mock.Mock()
+        v._channel_loop = mock.Mock()
+
+        starter = threading.Thread(target=v.start, daemon=True)
+        starter.start()
+        self.assertTrue(self.ready_entered.wait(3), "start() never reached handshake")
+        v.stop()
+        self.allow_ready.set()
+        starter.join(timeout=3)
+
+        self.assertFalse(starter.is_alive())
+        self.assertTrue(self.stopped.is_set())
+        v._run.assert_not_called()
+        v._channel_loop.assert_not_called()
+
+
 class VoiceParentThreadTest(unittest.TestCase):
     """pymumble 的主循环不能挂在那个"调完 start() 就退"的线程上。
 
