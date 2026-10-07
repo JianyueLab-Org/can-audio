@@ -306,6 +306,12 @@ class PositionPacketTest(unittest.TestCase):
         pilot._send_position()
         self.assertEqual(self.sent, [])
 
+    def test_clearing_the_simulator_sample_stops_position_packets(self):
+        self.pilot._send_position()
+        self.pilot.update_position(None)
+        self.pilot._send_position()
+        self.assertEqual(len(self.sent), 1)
+
 
 class PasswordLoggingTest(unittest.TestCase):
     """日志会被用户贴出来，密码不能在里面。"""
@@ -2364,6 +2370,10 @@ class SnapshotTest(unittest.TestCase):
     def test_no_values_means_no_snapshot(self):
         self.assertIsNone(xplane.XPlaneLink().snapshot())
 
+    def test_snapshot_expires_after_simulator_stops(self):
+        self.link.last_update = time.time() - xplane.STALE_AFTER - 0.1
+        self.assertIsNone(self.link.snapshot())
+
     def test_lights_and_surfaces_are_reported(self):
         """以前一个灯都没订，ACC 回的 lights 永远是空的，别人看我们全程关灯。"""
         self.link.values.update({
@@ -4355,6 +4365,12 @@ class FastPositionSendTest(unittest.TestCase):
         pilot._send = self.sent.append
         self.assertIsNone(pilot._send_fast_position(slow=False))
         self.assertEqual(self.sent, [])
+
+    def test_clearing_the_simulator_sample_stops_fast_packets(self):
+        self.pilot._send_fast_position(slow=False)
+        self.pilot.update_position(None)
+        self.assertIsNone(self.pilot._send_fast_position(slow=False))
+        self.assertEqual(len(self.sent), 1)
 
     def test_small_rates_count_as_stopped(self):
         self.assertTrue(fsdpilot.is_stopped(parked_snapshot()))

@@ -178,6 +178,10 @@ class SnapshotTest(unittest.TestCase):
     def test_no_values_means_no_snapshot(self):
         self.assertIsNone(simlink.SimLink().snapshot())
 
+    def test_snapshot_expires_after_simulator_stops(self):
+        self.link.last_update = time.time() - simlink.STALE_AFTER - 0.1
+        self.assertIsNone(self.link.snapshot())
+
     def test_field_names_match_the_xplane_client(self):
         """和 xpc 共用 fsdpilot/voice，字段名对不上就会静默出错。"""
         required = {"latitude", "longitude", "altitude", "groundspeed",
@@ -3060,6 +3064,12 @@ class FastPositionSendTest(unittest.TestCase):
         pilot._send = self.sent.append
         self.assertIsNone(pilot._send_fast_position(slow=False))
         self.assertEqual(self.sent, [])
+
+    def test_clearing_the_simulator_sample_stops_fast_packets(self):
+        self.pilot._send_fast_position(slow=False)
+        self.pilot.update_position(None)
+        self.assertIsNone(self.pilot._send_fast_position(slow=False))
+        self.assertEqual(len(self.sent), 1)
 
     def test_small_rates_count_as_stopped(self):
         self.assertTrue(fsdpilot.is_stopped(parked_snapshot()))
