@@ -1268,6 +1268,11 @@ class VoiceClient:
         if previous and previous.is_alive() and previous is not threading.current_thread():
             previous.join(timeout=1)
 
+        myself = getattr(self.mumble.users, "myself", None)
+        log.info("PTT started: target %s, channels %s, joined channel %s, input device %s, rate %s Hz",
+             PTT_TARGET_ID, self._tx_channels,
+             myself.get("channel_id") if myself else None,
+             self._input_device, self.RATE)
         self.transmitting = True
         if self.on_tx:
             self.on_tx(True)
@@ -1296,6 +1301,10 @@ class VoiceClient:
                                   self._mic_limiter)
 
     def _transmit_loop(self):
+        started = time.monotonic()
+        reads = queued = audible = skipped = errors = 0
+        peak = 0
+        exit_reason = "PTT released"
         try:
             with self._audio_lock:
                 self.mumble.sound_output.target = PTT_TARGET_ID
@@ -1307,24 +1316,49 @@ class VoiceClient:
                 with self._stream_lock:
                     stream = self.input_stream
                     if not stream:
+                        exit_reason = "input stream missing"
                         break
                     data = stream.read(self.CHUNK, exception_on_overflow=False)
                 if data:
+                    reads += 1
                     audio = self._process_mic(data)
+                    if audio.size:
+                        peak = max(peak, int(np.max(np.abs(audio.astype(np.int32)))))
+                        audible += bool(np.any(audio))
                     # 断线期间不要往外灌音频，否则会在缓冲里堆积
                     if not self.connected:
+                        skipped += 1
                         continue
                     with self._audio_lock:
                         # 交叉耦合可能刚把 target 切走，每次都重新确认
                         self.mumble.sound_output.target = PTT_TARGET_ID
                         self.mumble.sound_output.add_sound(audio.tobytes())
+                        queued += 1
             except Exception as e:
+                errors += 1
                 log.warning(f"recording raised: {e}")
                 time.sleep(0.1)
             time.sleep(0.001)
 
+        if not self.running:
+            exit_reason = "voice stopped"
+        try:
+            output = self.mumble.sound_output
+            pending_seconds = output.get_buffer_size()
+            encoder_ready = bool(output.encoder) if hasattr(output, "encoder") else None
+            mumble_alive = self.mumble.is_alive()
+        except Exception as e:
+            pending_seconds = encoder_ready = mumble_alive = None
+            log.debug("could not inspect the outgoing audio queue: %s", e)
         try:
             with self._audio_lock:
                 self.mumble.sound_output.target = 0
         except Exception:
             pass
+        log.info("PTT ended (%s): %.1f s, mic reads %d, non-silent %d, peak %d/32768, "
+                 "queued %d, skipped offline %d, errors %d, pending %s s, "
+                 "encoder ready %s, Mumble thread alive %s",
+                 exit_reason, time.monotonic() - started, reads, audible, peak,
+                 queued, skipped, errors,
+                 f"{pending_seconds:.3f}" if pending_seconds is not None else "unavailable",
+                 encoder_ready, mumble_alive)
