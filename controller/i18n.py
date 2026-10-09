@@ -227,6 +227,7 @@ TEXT = {
 
     # ---------- 设置对话框 ----------
     "settings.title":       {"zh": "设置", "en": "Settings"},
+    "settings.mumble_host": {"zh": "语音服务器:", "en": "Voice server:"},
     "settings.volume":      {"zh": "音量", "en": "Volume"},
     "settings.mic":         {"zh": "麦克风:", "en": "Microphone:"},
     "settings.speaker":     {"zh": "主音量:", "en": "Master:"},

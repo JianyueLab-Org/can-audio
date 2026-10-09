@@ -590,6 +590,28 @@ def main():
     check("建立设置对话框", lambda: dialog)
     check("PTT 绑定列表", lambda: dialog.ptt_list.bindings)
 
+    def custom_voice_host_is_used_for_login():
+        window.pages.setCurrentIndex(0)
+        app.processEvents()
+        assert window.login_settings_button.isVisible(), "登录页需要能打开设置"
+        dialog.mumble_host_input.setText("  voice.example.net  ")
+        dialog.save_and_close()
+        assert gui.Settings().mumble_host == "voice.example.net"
+        window.username_input.setText("1000")
+        window.password_input.setText("test-password")
+        with mock.patch.object(gui, "VoiceClient") as voice_client, \
+                mock.patch.object(window, "refresh_datafeed"), \
+                mock.patch.object(gui.threading, "Thread"):
+            voice_client.return_value.connect.return_value = True
+            window.connect_voice()
+            assert voice_client.call_args.args[:3] == (
+                "voice.example.net", "1000", "test-password")
+            assert "voice.example.net" in window.session_label.text()
+            window.disconnect_voice()
+        window.password_input.clear()
+        window.pages.setCurrentIndex(1)
+    check("自定义语音地址保存后用于登录", custom_voice_host_is_used_for_login)
+
     def a_binding_can_be_added_and_removed():
         """录制那条路要真的走一遍：它是唯一能加绑定的入口。"""
         added = ptt.Binding(ptt.MOUSE, button="x2")

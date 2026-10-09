@@ -74,6 +74,22 @@ class MicCalibrationSettingsTest(unittest.TestCase):
             json.dump({"mic_calibration": [1, 2]}, f)
         self.assertEqual(settings_module.Settings().mic_calibration, {})
 
+    def test_voice_host_defaults_and_round_trips(self):
+        settings = settings_module.Settings()
+        self.assertEqual(settings.mumble_host, "audio.ceruleanavi.net")
+        settings.mumble_host = "voice.example.net"
+        settings.save_settings()
+        with open(settings.config_file, encoding="utf-8") as config:
+            self.assertEqual(json.load(config)["mumble_host"], "voice.example.net")
+        self.assertEqual(settings_module.Settings().mumble_host, "voice.example.net")
+
+    def test_old_settings_keep_the_default_voice_host(self):
+        with open("radio_settings.json", "w", encoding="utf-8") as config:
+            json.dump({"last_username": "1000"}, config)
+        settings = settings_module.Settings()
+        self.assertEqual(settings.mumble_host, "audio.ceruleanavi.net")
+        self.assertEqual(settings.last_username, "1000")
+
 
 if __name__ == "__main__":
     unittest.main()

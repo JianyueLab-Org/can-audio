@@ -237,6 +237,10 @@ class Voice:
         self._chunk = 960
         self._last_rx = 0.0
         self._sent_frames = 0           # 本次 PTT 已发出的帧数
+        self._mic_reads = 0
+        self._non_silent_frames = 0
+        self._mic_peak = 0
+        self._ptt_started = 0.0
         self._received_frames = 0       # 本段接收已播放的帧数
         self._skip_reason = ""          # 明明按着 PTT 却没发的原因
         self._stuck_reason = ""         # 迟迟进不了频率频道的原因
@@ -912,9 +916,31 @@ class Voice:
         self.transmitting = value
         if value:
             self._sent_frames = 0
+            self._mic_reads = 0
+            self._non_silent_frames = 0
+            self._mic_peak = 0
+            self._ptt_started = time.monotonic()
             self._skip_reason = ""
-            log.info("PTT down")
+            myself = getattr(getattr(self.mumble, "users", None), "myself", None)
+            log.info("PTT down: channel %s, frequency %s, mic=%s, rate %d Hz",
+                     myself["channel_id"] if myself else None,
+                     self.frequency, self._last_devices[2] if hasattr(self, "_last_devices")
+                     else getattr(self.settings, "input_device_index", None), self._rate)
         else:
+            sound_output = getattr(self.mumble, "sound_output", None)
+            try:
+                pending = sound_output.get_buffer_size()
+                pending_label = f"{pending:.3f}"
+            except Exception:
+                pending_label = "unavailable"
+            encoder_ready = (bool(sound_output.encoder) if hasattr(sound_output, "encoder")
+                             else None)
+            log.info("PTT up: %.1f s, mic reads %d, non-silent %d, peak %d/32768, "
+                     "queued %d, pending %s s, encoder ready %s, voice loop alive %s",
+                     time.monotonic() - self._ptt_started, self._mic_reads,
+                     self._non_silent_frames, self._mic_peak, self._sent_frames,
+                     pending_label, encoder_ready,
+                     self._mumble_thread.is_alive() if self._mumble_thread else None)
             # 松开时把这一次到底发出去多少帧说清楚。"语音用不了"最常见的两种
             # 情况——根本没进发送分支、和发了但对方听不到——只有这个数能分开。
             if self._sent_frames:
@@ -1217,6 +1243,11 @@ class Voice:
                     continue
 
                 samples = self._process_mic(data)
+                self._mic_reads += 1
+                if samples.size:
+                    peak = int(np.max(np.abs(samples.astype(np.int32))))
+                    self._mic_peak = max(self._mic_peak, peak)
+                    self._non_silent_frames += peak > 0
                 with self._lock:
                     self.mumble.sound_output.add_sound(samples.tobytes())
                 self._sent_frames += 1

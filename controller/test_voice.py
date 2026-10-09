@@ -165,6 +165,26 @@ class CrossCoupleDuringPttTest(unittest.TestCase):
 
 class TransmitThreadTest(unittest.TestCase):
 
+    def test_ptt_summary_reports_microphone_and_queue_progress(self):
+        client = make_client()
+        client._tx_channels = [11]
+        client.input_stream = mock.Mock()
+        client.input_stream.read.return_value = b"\x01" * 1920
+
+        with self.assertLogs("voice", level="INFO") as captured:
+            client.start_transmit()
+            deadline = time.monotonic() + 2
+            while not client.mumble.sound_output.sent and time.monotonic() < deadline:
+                time.sleep(0.01)
+            client.stop_transmit()
+            client._tx_thread.join(timeout=2)
+
+        self.assertFalse(client._tx_thread.is_alive())
+        self.assertTrue(client.mumble.sound_output.sent)
+        summary = next(line for line in captured.output if "PTT ended" in line)
+        self.assertRegex(summary, r"mic reads [1-9]\d*, non-silent [1-9]\d*, ")
+        self.assertRegex(summary, r"queued [1-9]\d*, skipped offline 0, errors 0")
+
     def test_rapid_ptt_does_not_start_two_threads(self):
         client = make_client()
         client._tx_channels = [11]
