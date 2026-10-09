@@ -13,7 +13,7 @@ import os
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QWidget
 from qfluentwidgets import (BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentIcon,
-                            PrimaryPushButton, PushButton, Slider, StrongBodyLabel,
+                            LineEdit, PrimaryPushButton, PushButton, Slider, StrongBodyLabel,
                             TransparentToolButton)
 
 import applog
@@ -30,6 +30,7 @@ log = logging.getLogger("settings")
 
 # 新装的默认 PTT 键。老配置里的 ptt_key 会被升级成一条键盘绑定，见 ptt.load()。
 DEFAULT_PTT_KEY = "v"
+DEFAULT_MUMBLE_HOST = "audio.ceruleanavi.net"
 
 
 class Settings:
@@ -48,6 +49,7 @@ class Settings:
         self.input_device_index = None
         self.output_device_index = None
         self.last_username = ""
+        self.mumble_host = DEFAULT_MUMBLE_HOST
         # 电台栈**不存**。频率该从数据源来：上了席位的自动加，别人的席位在
         # "在线频率"里点。留着上一场的频率反而危险——那些临时频道多半早就没
         # 人了，屏幕上却看起来一切正常。老配置里的 radios 键读到也直接忽略。
@@ -82,6 +84,7 @@ class Settings:
                     self.input_device_index = data.get("input_device_index", None)
                     self.output_device_index = data.get("output_device_index", None)
                     self.last_username = data.get("last_username", "")
+                    self.mumble_host = data.get("mumble_host") or DEFAULT_MUMBLE_HOST
                     self.always_on_top = bool(data.get("always_on_top", False))
                     self.compact = bool(data.get("compact", False))
                     self.language = data.get("language", "") or ""
@@ -104,6 +107,7 @@ class Settings:
                 "input_device_index": self.input_device_index,
                 "output_device_index": self.output_device_index,
                 "last_username": self.last_username,
+                "mumble_host": self.mumble_host,
                 "always_on_top": self.always_on_top,
                 "compact": self.compact,
                 "language": self.language,
@@ -242,6 +246,13 @@ class SettingsDialog(QDialog):
     def setup_ui(self):
         layout = QVBoxLayout()
         layout.setSpacing(10)
+
+        host_layout = QHBoxLayout()
+        self.mumble_host_input = LineEdit()
+        self.mumble_host_input.setText(self.settings.mumble_host)
+        host_layout.addWidget(BodyLabel(t("settings.mumble_host")))
+        host_layout.addWidget(self.mumble_host_input, 1)
+        layout.addLayout(host_layout)
 
         layout.addWidget(StrongBodyLabel(t("settings.volume")))
 
@@ -409,6 +420,8 @@ class SettingsDialog(QDialog):
         self._refresh_baseline()
 
     def save_and_close(self):
+        self.settings.mumble_host = (self.mumble_host_input.text().strip()
+                                    or DEFAULT_MUMBLE_HOST)
         self.settings.ptt_bindings = list(self.ptt_list.bindings)
         self.settings.mic_volume = self.mic_slider.value()
         self.settings.speaker_volume = self.speaker_slider.value()

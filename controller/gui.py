@@ -49,8 +49,6 @@ from voice import VoiceClient
 
 log = logging.getLogger("gui")
 
-SERVER = "audio.ceruleanavi.net"
-
 # 数据源多久查一次：上了席位之后自动把频率捡回来，同时刷新 CID→呼号 对照表。
 # 席位不会秒变，60 秒足够及时，也不至于把数据源打太狠。
 DATAFEED_INTERVAL = 60
@@ -520,6 +518,10 @@ class ControllerWindow(QMainWindow):
         self.login_status.setWordWrap(True)
         layout.addWidget(self.login_status)
 
+        self.login_settings_button = PushButton(FluentIcon.SETTING, t("main.settings"))
+        self.login_settings_button.clicked.connect(self.open_settings)
+        layout.addWidget(self.login_settings_button)
+
         row = QHBoxLayout()
         row.addStretch()
         row.addWidget(card)
@@ -787,6 +789,7 @@ class ControllerWindow(QMainWindow):
         self.username_input.setPlaceholderText(t("login.username"))
         self.password_input.setPlaceholderText(t("login.password"))
         self.connect_button.setText(t("login.connect"))
+        self.login_settings_button.setText(t("main.settings"))
         self.top_button.setText(t("main.pin"))
         self.top_button.setToolTip(t("main.pin_tip"))
         self.settings_button.setText(t("main.settings"))
@@ -1053,8 +1056,9 @@ class ControllerWindow(QMainWindow):
         self.login_status.setText(t("login.connecting"))
         QApplication.processEvents()
 
+        server = self.settings.mumble_host
         self.voice = VoiceClient(
-            SERVER, username, password,
+            server, username, password,
             on_state=self.signals.state.emit,
             on_rx=self.signals.rx.emit,
             on_tx=self.signals.tx.emit,
@@ -1078,7 +1082,7 @@ class ControllerWindow(QMainWindow):
         self.cid = username
         self.settings.last_username = username
         self.settings.save_settings()
-        self.session_label.setText(f'{username} · {SERVER}')
+        self.session_label.setText(f'{username} · {server}')
         self._set_connection_style(True)
         self.pages.setCurrentIndex(1)
         threading.Thread(target=self.voice.sync, args=(self.stack,),
