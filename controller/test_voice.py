@@ -246,6 +246,24 @@ class MicProcessingTest(unittest.TestCase):
 
 class RxIndicatorTest(unittest.TestCase):
 
+    def test_atis_is_played_but_never_cross_coupled(self):
+        client = make_client()
+        class Users(dict):
+            myself = {"name": "1000", "channel_id": 7}
+        client.mumble.users = Users()
+        client.mumble.channels = {7: {"name": "FREQ_118000"}}
+        client._channel_to_khz = {7: 118000}
+        client._channel_ids = {118000: 7}
+        client._xc_targets = {7: 3}
+        client.output_stream = mock.MagicMock()
+        pcm = np.array([10, 20], dtype=np.int16).tobytes()
+        for name in ("900_atis118000", "900_atis118000_RJTT_ATIS"):
+            client._on_sound({"name": name, "channel_id": 7}, types.SimpleNamespace(pcm=pcm))
+        self.assertEqual(client.output_stream.write.call_count, 2)
+        self.assertEqual(client.mumble.sound_output.sent, [])
+        client._on_sound({"name": "1001", "channel_id": 7}, types.SimpleNamespace(pcm=pcm))
+        self.assertEqual(len(client.mumble.sound_output.sent), 1)
+
     def test_continuous_audio_never_reports_rx_end(self):
         """有人一直在讲话时，监控线程不该报 RX 结束——那会让指示灯闪。"""
         client = make_client()

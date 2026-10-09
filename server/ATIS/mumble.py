@@ -1,3 +1,5 @@
+"""通播登录名包含 callsign；不同机场可以使用同一个频率频道。"""
+
 import request
 import process
 import os
@@ -17,12 +19,14 @@ import serverconf
 # 握手根本没开始。四个客户端一直都调这一句，服务端这队通播机漏了：Debian 13
 # 和新一点的 Ubuntu 上 python 都 >= 3.12，装上就是连不上。
 import mumblecompat
+import atisrouting
 mumblecompat.install()
 
 import pymumble_py3 as pymumble
 from pymumble_py3 import messages
 from pymumble_py3.constants import (PYMUMBLE_CONN_STATE_CONNECTED,
-                                    PYMUMBLE_CONN_STATE_FAILED)
+                                    PYMUMBLE_CONN_STATE_FAILED,
+                                    PYMUMBLE_CLBK_SOUNDRECEIVED)
 import threading
 import numpy as np
 import time
@@ -48,16 +52,22 @@ JOIN_TIMEOUT = 10.0
 CONNECT_TIMEOUT = 10.0
 
 class ATISBroadcaster(threading.Thread):
-    def __init__(self, atis_id, frequency, atis_text):
+    def __init__(self, atis_id, frequency, atis_text, feed=None,
+                 datafeed_url=None, atis_range_nm=None):
         super().__init__()
         freq_value = int(round(float(frequency) * 1000))
         channel_name = f"FREQ_{str(freq_value).zfill(6)}"
         self.channel_name = channel_name
         # 口令不写在这里，见 server/serverconf.py
-        self.user = f"{serverconf.atis_account()}_atis{str(freq_value).zfill(6)}"
+        self.user = f"{serverconf.atis_account()}_atis{freq_value:06d}_{atis_id}"
         self.password = serverconf.atis_password(required=True)
         self.running = False
         self.mumble = None
+        self._router = atisrouting.ATISRouter(
+            atis_id, freq_value,
+            datafeed_url if datafeed_url is not None else serverconf.atis_datafeed_url(),
+            atis_range_nm if atis_range_nm is not None else serverconf.atis_range_nm(),
+            feed=feed)
         
         # 处理ATIS文本
         print (f"原始ATIS文本: {atis_text}")
@@ -85,6 +95,8 @@ class ATISBroadcaster(threading.Thread):
                 
             self.mumble = pymumble.Mumble("audio.ceruleanavi.net", self.user, password=self.password, reconnect=True)
             self.mumble.set_receive_sound(True)
+            self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_SOUNDRECEIVED, self._on_sound)
+            self._router.attach(self.mumble)
             self.mumble.start()
 
             if not self._wait_until_connected():
@@ -102,6 +114,7 @@ class ATISBroadcaster(threading.Thread):
             return False
 
     def _stop_mumble(self):
+        self._router.close()
         if getattr(self, "mumble", None) is None:
             return
         try:
@@ -257,15 +270,15 @@ class ATISBroadcaster(threading.Thread):
         return myself is not None and myself["channel_id"] == channel_id
 
     def check_channel_silence(self):
-        """检查频道是否处于静音状态"""
-        current_time = time.time()
-        for user in self.mumble.users.values():
-            if user["name"] != self.mumble.users.myself["name"]:
-                sound = user.sound
-                if sound and sound.is_sound():
-                    self.last_sound_time = current_time
-                    return False
-        return (current_time - self.last_sound_time) >= self.silence_duration
+        return time.time() - self.last_sound_time >= self.silence_duration
+
+    def _on_sound(self, user, soundchunk):
+        try:
+            user.sound.get_sound()
+        except Exception:
+            pass
+        if user.get("name") != self.user and self._router.hears(user):
+            self.last_sound_time = time.time()
 
     async def _text_to_audio_edge(self, text, voice="en-US-ChristopherNeural"):
         """使用edge-tts将文本转换为音频"""
@@ -326,7 +339,11 @@ class ATISBroadcaster(threading.Thread):
     def broadcast_audio(self, audio_data):
         """广播音频数据"""
         if not audio_data:
-            return
+            return False
+
+        generation = self._router.begin_cycle()
+        if generation is None:
+            return False
 
         position = 0
         total_size = len(audio_data)
@@ -338,21 +355,36 @@ class ATISBroadcaster(threading.Thread):
                 if len(chunk) < chunk_size:
                     chunk += b'\x00' * (chunk_size - len(chunk))
                 
-                self.mumble.sound_output.add_sound(chunk)
+                if not self._router.enqueue(chunk, generation):
+                    return False
                 position += chunk_size
                 time.sleep(0.02)
             else:
-                time.sleep(0.5)
+                self._router.discard()
+                return False
+        deadline = time.monotonic() + 5
+        while self.running and time.monotonic() < deadline:
+            if self._router.generation != generation:
+                return False
+            if self.mumble.sound_output.get_buffer_size() <= 0:
+                return True
+            time.sleep(0.02)
+        self._router.discard()
+        return False
 
     def run(self):
         """线程主函数"""
         self.running = True
-        if not self.connect_to_server():
-            print(f"ATIS {self.user} 连接失败")
-            return
-
-        print(f"ATIS {self.user} 开始广播")
-        self._broadcast_loop()
+        try:
+            if not self.connect_to_server():
+                print(f"ATIS {self.user} 连接失败")
+                return
+            print(f"ATIS {self.user} 开始广播")
+            self._broadcast_loop()
+        finally:
+            self.running = False
+            self._stop_mumble()
+            self.loop.close()
 
     def _broadcast_loop(self):
         """广播循环函数"""
@@ -373,7 +405,9 @@ class ATISBroadcaster(threading.Thread):
                         print("\n开始播放中文ATIS...")
                         chinese_audio = self.text_to_audio(self.chinese_text)
                         if chinese_audio:
-                            self.broadcast_audio(chinese_audio)
+                            if not self.broadcast_audio(chinese_audio):
+                                time.sleep(1)
+                                continue
 
                         if not self.running:
                             break
@@ -403,21 +437,34 @@ class ATISBroadcaster(threading.Thread):
     def stop(self):
         """停止广播"""
         self.running = False
+        self._router.close()
         if self.mumble:
             self.mumble.stop()
 
 class ATISManager:
     def __init__(self):
         self.broadcasters = {}
-        self.update_interval = 30
+        self.update_interval = 5
         self._stop_flag = False
         self.update_thread = None
+        self.feed = None
+        self._metadata_lock = threading.Lock()
+        self._station_metadata = None
 
     def start(self):
         """启动ATIS管理器"""
         self._stop_flag = False
+        self.feed = atisrouting.acquire_feed(serverconf.atis_datafeed_url())
+        self.feed.subscribe(self._on_feed)
         self.update_thread = threading.Thread(target=self._update_loop)
         self.update_thread.start()
+
+    def _on_feed(self, data):
+        stations = None if data is None else [
+            {key: station.get(key) for key in ("callsign", "frequency", "text_atis")}
+            for station in data.get("atis", [])]
+        with self._metadata_lock:
+            self._station_metadata = stations
 
     def _retire(self, callsign):
         """收掉一个通播席位。**join 必须带超时。**
@@ -451,56 +498,19 @@ class ATISManager:
         for callsign in list(self.broadcasters.keys()):
             self._retire(callsign)
         self.broadcasters.clear()
+        if self.feed is not None:
+            self.feed.unsubscribe(self._on_feed)
+            atisrouting.release_feed(self.feed)
+            self.feed = None
 
     def _update_loop(self):
         """更新ATIS信息的循环"""
         while not self._stop_flag:
             try:
-                data = request.get_can_data()
-                if data and 'atis' in data:
-                    current_atis = {atis['callsign']: atis for atis in data['atis']}
-                    
-                    # 停止不再活跃的ATIS
-                    for callsign in list(self.broadcasters.keys()):
-                        if callsign not in current_atis:
-                            self._retire(callsign)
-                    
-                    # 更新或启动新的ATIS
-                    for callsign, atis in current_atis.items():
-                        # 检查是否为199.998频率
-                        if abs(float(atis.get('frequency', '0')) - 199.998) < 0.001:
-                            print(f"跳过频率199.998的ATIS: {callsign}")
-                            continue
-                            
-                        text = ' '.join(atis.get('text_atis', []))
-                        # 线程死了（启动那次登录失败、频道被拒……）等于没有：
-                        # 只查"在不在字典里"的话，一次瞬时故障就让这个席位
-                        # 永远停播，而管理器还以为它好好的、每 30 秒给它更新文本
-                        stale = self.broadcasters.get(callsign)
-                        if stale is not None and not stale.is_alive():
-                            print(f"{callsign} 的通播线程已经死了，重新拉起")
-                            self.broadcasters.pop(callsign, None)
-                        if callsign not in self.broadcasters:
-                            # 新的ATIS
-                            broadcaster = ATISBroadcaster(
-                                atis_id=callsign,
-                                frequency=atis.get('frequency', '0'),
-                                atis_text=text
-                            )
-                            broadcaster.start()
-                            self.broadcasters[callsign] = broadcaster
-                        else:
-                            # 检查并更新现有ATIS的文本
-                            current_broadcaster = self.broadcasters[callsign]
-                            if text != current_broadcaster.english_text:  # 如果文本有变化
-                                print(f"更新 {callsign} 的ATIS文本")
-                                if '|' in text:
-                                    english, chinese = [part.strip() for part in text.split('|')]
-                                    current_broadcaster.english_text = process.process_single_atis_text(english, is_chinese=False)
-                                    current_broadcaster.chinese_text = process.process_single_atis_text(chinese, is_chinese=True)
-                                else:
-                                    current_broadcaster.english_text = process.process_single_atis_text(text.strip(), is_chinese=False)
-                                    current_broadcaster.chinese_text = None
+                with self._metadata_lock:
+                    stations = self._station_metadata
+                if stations is not None:
+                    self._reconcile(stations)
             except Exception as e:
                 print(f"更新ATIS信息时出错: {e}")
             
@@ -509,6 +519,40 @@ class ATISManager:
                 if self._stop_flag:
                     break
                 time.sleep(1)
+
+    def _reconcile(self, stations):
+        current = {station['callsign']: station for station in stations}
+        for callsign in list(self.broadcasters):
+            if callsign not in current:
+                self._retire(callsign)
+        for callsign, station in current.items():
+            frequency = station.get('frequency', '0')
+            khz = int(round(float(frequency) * 1000))
+            if not 118000 <= khz <= 136975:
+                self._retire(callsign)
+                continue
+            channel_name = f"FREQ_{khz:06d}"
+            previous = self.broadcasters.get(callsign)
+            if previous is not None and (not previous.is_alive() or previous.channel_name != channel_name):
+                self._retire(callsign)
+            text = ' '.join(station.get('text_atis') or [])
+            if callsign not in self.broadcasters:
+                broadcaster = ATISBroadcaster(
+                    atis_id=callsign, frequency=frequency, atis_text=text,
+                    feed=self.feed, datafeed_url=serverconf.atis_datafeed_url(),
+                    atis_range_nm=serverconf.atis_range_nm())
+                self.broadcasters[callsign] = broadcaster
+                broadcaster.start()
+            else:
+                broadcaster = self.broadcasters[callsign]
+                if text != broadcaster.english_text:
+                    if '|' in text:
+                        english, chinese = [part.strip() for part in text.split('|')]
+                        broadcaster.english_text = process.process_single_atis_text(english, is_chinese=False)
+                        broadcaster.chinese_text = process.process_single_atis_text(chinese, is_chinese=True)
+                    else:
+                        broadcaster.english_text = process.process_single_atis_text(text.strip(), is_chinese=False)
+                        broadcaster.chinese_text = None
 
 if __name__ == "__main__":
     manager = ATISManager()
@@ -521,4 +565,3 @@ if __name__ == "__main__":
         print("正在停止ATIS服务...")
         manager.stop()
         print("ATIS服务已停止")
-

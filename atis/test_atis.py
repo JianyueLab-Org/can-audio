@@ -1634,31 +1634,28 @@ class BroadcastRulesTest(unittest.TestCase):
         self.assertIsNotNone(self.refuse())
 
     # ---------- 频率冲突 ----------
-    def test_same_frequency_is_refused(self):
-        """语音账号是 {cid}_atis{频率}，同频率再开一个会把先连上的踢掉。"""
+    def test_same_frequency_distinct_airports_can_broadcast(self):
         twin = Station("ZSSS", "虹桥", "127.850")     # 同频率，不同机场
         self.profile.add(twin)
-        title, message = self.refuse(broadcasting={twin.callsign})
-        self.assertEqual(title, "频率冲突")
-        self.assertIn(twin.callsign, message)
-        self.assertIn("踢掉", message)
+        self.assertIsNone(self.refuse(broadcasting={twin.callsign}))
 
     def test_a_different_frequency_is_fine(self):
         other = Station("ZSSS", "虹桥", "132.250")
         self.profile.add(other)
         self.assertIsNone(self.refuse(broadcasting={other.callsign}))
 
-    def test_itself_is_not_a_conflict(self):
-        """自己已经在播的话，调用方走的是停播那条路，不该报冲突。"""
-        self.assertIsNone(rules.frequency_conflict(
-            self.pudong, self.profile, {self.pudong.callsign}))
+    def test_duplicate_callsigns_are_still_refused(self):
+        with self.assertRaises(ValueError):
+            self.profile.add(Station("ZSPD", "Duplicate", "128.800"))
 
-    def test_conflict_names_the_other_station(self):
-        twin = Station("ZSSS", "虹桥", "127.850")
-        self.profile.add(twin)
-        found = rules.frequency_conflict(self.pudong, self.profile,
-                                         {twin.callsign})
-        self.assertIs(found, twin)
+    def test_same_frequency_broadcasters_use_distinct_usernames(self):
+        broadcast = _load_broadcast()
+        with mock.patch.object(broadcast, "Synthesizer"):
+            tokyo = broadcast.Broadcaster("host", "1000", "pw", Station("RJTT", "Tokyo", "128.800"))
+            osaka = broadcast.Broadcaster("host", "1000", "pw", Station("RJOO", "Osaka", "128.800"))
+        self.assertEqual(tokyo.user, "1000_atis128800_RJTT_ATIS")
+        self.assertEqual(osaka.user, "1000_atis128800_RJOO_ATIS")
+        self.assertNotEqual(tokyo.user, osaka.user)
 
     def test_credentials_are_checked_before_the_conflict(self):
         """先报最好改的那一条：没填账号时不该先弹频率冲突。"""
