@@ -14,6 +14,8 @@
 
 import contextlib
 import io
+
+import json
 import sys
 import threading
 import time
@@ -268,6 +270,38 @@ class AuthenticateTest(UpstreamTestCase):
         self.assertEqual(user_id, 118000)
         self.assertEqual(name, "1005_atis118000")
 
+    def test_same_frequency_stations_have_distinct_authenticated_ids(self):
+        upstream = self.upstream(Response(200))
+        names = ["1005_atis128800_RJTT_ATIS", "1005_atis128800_RJOO_ATIS"]
+        first = self.authenticate(names[0], "pw")
+        second = self.authenticate(names[1], "pw")
+        self.assertGreater(first[0], 0)
+        self.assertGreater(second[0], 0)
+        self.assertNotEqual(first[0], second[0])
+        for user_id, name, _ in (first, second):
+            self.assertEqual(self.auth.nameToId(name), user_id)
+        self.assertEqual(self.kicked, names)
+        for _, request in upstream.calls:
+            self.assertEqual(json.loads(request["data"])["cid"], "1005")
+
+    def test_same_frequency_station_does_not_kick_another_callsign(self):
+        self.upstream(Response(200))
+        auth = login_module.AuthenticatorI(types.SimpleNamespace(), None)
+        tokyo = "1005_atis128800_RJTT_ATIS"
+        osaka = "1005_atis128800_RJOO_ATIS"
+        first = auth.authenticate(tokyo, "pw", [], "", False)
+        auth.online_users[tokyo] = 42
+        kicked = []
+        auth.server.kickUserAsync = lambda *args: kicked.append(args)
+        second = auth.authenticate(osaka, "pw", [], "", False)
+        self.assertNotEqual(first[0], second[0])
+        self.assertEqual(kicked, [])
+
+    def test_station_identity_still_requires_member_credentials(self):
+        self.upstream(Response(400))
+        result = self.authenticate("1005_atis128800_RJTT_ATIS", "wrong")
+        self.assertEqual(result[0], login_module.AUTH_FAILED)
+
     def test_there_is_no_shortcut_for_any_account(self):
         """保留账号的旁路已经去掉了，谁都得去问上游。
 
@@ -379,6 +413,23 @@ class UserIdAgreementTest(unittest.TestCase):
 
     def test_an_atis_account_is_its_frequency(self):
         self.assertEqual(self.auth.nameToId("1000_atis118000"), 118000)
+
+    def test_station_ids_do_not_collide_with_legacy_or_each_other(self):
+        names = [f"1000_atis128800_{airport}{kind}_ATIS"
+                 for airport in ("0000", "RJTT", "RJOO", "ZZZZ")
+                 for kind in ("", "_D", "_A")]
+        ids = [login_module.user_id_for(name) for name in names]
+        self.assertEqual(len(set(ids)), len(names))
+        self.assertTrue(all(0 < user_id <= 2**31 - 1 for user_id in ids))
+        self.assertNotIn(128800, ids)
+        self.assertNotIn(1000, ids)
+        for user_id in ids:
+            with self.assertRaises(ValueError):
+                login_module.user_id_for(str(user_id))
+
+    def test_reconnecting_a_callsign_preserves_its_id(self):
+        self.assertEqual(login_module.user_id_for("1000_atis128800_RJTT_ATIS"),
+                         login_module.user_id_for("1001_atis128900_RJTT_ATIS"))
 
     def test_it_agrees_with_authenticate(self):
         for name in ("1000", "1005_atis127800", "900_atis118000"):

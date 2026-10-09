@@ -1061,14 +1061,9 @@ class AtisWindow(QMainWindow):
 
         self.start_broadcast(station, cid, password, rating)
 
-    def frequency_conflict(self, station):
-        return rules.frequency_conflict(station, self.profile, self.broadcasters)
-
     def start_broadcast(self, station, cid, password, rating=0):
         """核对通过之后真正建立两条连接。"""
-        # **必须再查一遍。** 数据源核对要走网络，隔着几秒，这期间完全可能又开
-        # 了一个同频率的席位——只信点按钮那一刻的检查会漏。规则本身在 rules.py
-        # 里，两条路径共用一份，文案不会各说各的。
+        # 数据源核对后再次检查账号和播出稿，两条路径共用 rules.py。
         rendered = self.render_for(station)
         refused = rules.blocking_reason(
             station, self.profile, self.broadcasters, cid, password, rendered)
@@ -1112,6 +1107,8 @@ class AtisWindow(QMainWindow):
 
         broadcaster = Broadcaster(
             SERVER, cid, password, station,
+            datafeed_url=self.settings.datafeed_url,
+            atis_range_nm=self.settings.atis_range_nm,
             on_state=lambda state, message, _c=callsign:
                 self.signals.state.emit(_c, state, message))
         self.broadcasters[callsign] = broadcaster
