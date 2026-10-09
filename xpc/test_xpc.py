@@ -1008,6 +1008,16 @@ class VoiceRuntimeTest(unittest.TestCase):
         self.assertTrue(self.wait_until(lambda: self.voice.channel is not None))
         self.assertTrue(self.transmit(), "按住 PTT 应当发出话音")
 
+    def test_ptt_log_reports_microphone_and_queue_progress(self):
+        self.run_loops()
+        self.voice.set_frequency(118.0)
+        self.assertTrue(self.wait_until(lambda: self.voice.channel is not None))
+        with self.assertLogs("voice", level="INFO") as captured:
+            self.assertTrue(self.transmit())
+        summary = next(line for line in captured.output if "PTT up: " in line)
+        self.assertRegex(summary, r"mic reads [1-9]\d*, non-silent [1-9]\d*, ")
+        self.assertRegex(summary, r"queued [1-9]\d*, pending unavailable s")
+
     def test_retuning_moves_to_the_new_channel(self):
         self.run_loops()
         self.voice.set_frequency(118.0)
