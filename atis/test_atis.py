@@ -2441,7 +2441,7 @@ class WeatherRetryTest(unittest.TestCase):
             def __exit__(self, *exc):
                 return False
 
-        def fake(request, timeout=None):
+        def fake(request, timeout=None, context=None):
             self.calls.append(request.full_url)
             outcome = outcomes[min(len(self.calls) - 1, len(outcomes) - 1)]
             if isinstance(outcome, Exception):

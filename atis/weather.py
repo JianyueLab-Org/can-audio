@@ -6,9 +6,14 @@ can-fsd 自己在用的气象源（config.json 的 weather 项），所以和网
 """
 
 import logging
+import os
 import re
+import ssl
+import sys
 import time
 import urllib.request
+
+import certifi
 
 log = logging.getLogger("weather")
 
@@ -19,6 +24,19 @@ _USER_AGENT = "can-atis"
 # 不该让这个席位整整一个刷新周期（默认 300 秒）都没有天气。
 RETRIES = 1
 RETRY_DELAY = 1.0
+
+
+def _ca_bundle():
+    """返回随程序分发的 CA bundle，源码运行时回退到 certifi。"""
+    packaged_bundle = os.path.join(
+        getattr(sys, "_MEIPASS", ""), "certifi", "cacert.pem")
+    if os.path.isfile(packaged_bundle):
+        return packaged_bundle
+    return certifi.where()
+
+
+def _ssl_context():
+    return ssl.create_default_context(cafile=_ca_bundle())
 
 
 class WeatherError(Exception):
@@ -67,7 +85,8 @@ def fetch_metar(icao, url=None, timeout=15, retries=None):
     last_error = None
     for attempt in range(retries + 1):
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with urllib.request.urlopen(
+                    request, timeout=timeout, context=_ssl_context()) as response:
                 text = response.read().decode("utf-8", errors="replace")
             break
         except Exception as e:
