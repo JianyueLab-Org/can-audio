@@ -71,6 +71,7 @@ TEXT = {
     "main.refresh_weather": {"zh": "刷新天气", "en": "Refresh the weather"},
     "main.text_atis":       {"zh": "文字通播", "en": "Text ATIS"},
     "main.voice_script":    {"zh": "语音稿", "en": "Spoken script"},
+      "main.manual_text":     {"zh": "手动输入文本", "en": "Enter the text manually"},
     "main.start":           {"zh": "开始播出", "en": "Start broadcasting"},
     "main.stop":            {"zh": "停止播出", "en": "Stop broadcasting"},
     "main.idle":            {"zh": "未播出", "en": "Not broadcasting"},
@@ -108,12 +109,17 @@ TEXT = {
     "preset.title":         {"zh": "预设 - {name}", "en": "Preset — {name}"},
     "preset.name":          {"zh": "名称:", "en": "Name:"},
     "preset.template":      {"zh": "模板", "en": "Template"},
+      "preset.manual_text":   {"zh": "手动输入文本", "en": "Enter the text manually"},
+      "preset.manual_text_hint": {"zh": "勾选后隐藏模板、机场条件和 NOTAM，直接在主页面编辑两份稿子。",
+                                                 "en": "Hide the template, airport conditions and NOTAM, "
+                                                         "then edit both scripts on the main page."},
     "preset.variables":     {"zh": "可用变量: {names}", "en": "Variables: {names}"},
     "preset.vox_hint":      {"zh": "变量后面加 :VOX 表示在文字通播里也用语音说法，"
                                    "例如 [WX:VOX]。",
                              "en": "Adding :VOX to a variable uses its spoken form in the "
                                    "written ATIS too, e.g. [WX:VOX]."},
     "preset.conditions":    {"zh": "机场条件  [ARPT_COND]", "en": "Airport conditions  [ARPT_COND]"},
+      "preset.notams":        {"zh": "NOTAM  [NOTAMS]", "en": "NOTAM  [NOTAMS]"},
     "preset.transition":    {"zh": "过渡高度层  [TL]:", "en": "Transition level  [TL]:"},
     "preset.transition_hint": {"zh": "例如 3600 米", "en": "e.g. 3600 m"},
     "preset.unknown_vars":  {"zh": "模板里有认不出的变量: {names}",

@@ -137,6 +137,13 @@ class PresetClosingAndChineseExtraTest(unittest.TestCase):
         self.assertEqual(pr.closing, "")
         self.assertEqual(pr.chinese_extra, "")
 
+    def test_manual_text_survives_a_round_trip(self):
+        pr = Preset(manual_text=True, manual_atis="文字稿", manual_voice="语音稿")
+        back = Preset.from_dict(pr.to_dict())
+        self.assertTrue(back.manual_text)
+        self.assertEqual(back.manual_atis, "文字稿")
+        self.assertEqual(back.manual_voice, "语音稿")
+
 
 class SpokenFacilityAndClosingTest(unittest.TestCase):
 
@@ -1697,6 +1704,13 @@ class ScriptTest(unittest.TestCase):
         self.assertIsNone(script.render(station, self.preset, None))
         self.assertIsNone(script.render(station, None, self.metar))
         self.assertIsNone(script.render(None, self.preset, self.metar))
+
+    def test_manual_text_does_not_need_weather_or_template(self):
+        station = self.station()
+        preset = Preset(manual_text=True, manual_atis="人工文字稿",
+                        manual_voice="人工语音稿", template="[UNKNOWN]")
+        self.assertEqual(script.render(station, preset, None),
+                         ("人工文字稿", "人工语音稿"))
 
     def test_text_keeps_the_raw_groups(self):
         text, _ = script.render(self.station(), self.preset, self.metar)

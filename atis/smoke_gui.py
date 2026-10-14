@@ -122,6 +122,29 @@ def main():
             f"切回来没有恢复：{window.metar_label.text()!r}"
     check("METAR 行跟着席位走", the_metar_line_follows_the_selection)
 
+    def manual_text_can_be_edited_on_the_main_page():
+        station = window.current_station()
+        preset = station.presets[0]
+        previous = (preset.manual_text, preset.manual_atis, preset.manual_voice)
+        try:
+            preset.manual_text = True
+            preset.manual_atis = "手动文字稿"
+            preset.manual_voice = "手动语音稿"
+            window.regenerate()
+            assert not window.text_preview.isReadOnly(), "手动模式下文字通播仍是只读"
+            assert not window.voice_preview.isReadOnly(), "手动模式下语音稿仍是只读"
+            window.text_preview.setPlainText("新的文字稿")
+            window.voice_preview.setPlainText("新的语音稿")
+            assert preset.manual_atis == "新的文字稿"
+            assert preset.manual_voice == "新的语音稿"
+
+            dialog = gui.PresetDialog(preset, parent=window)
+            assert dialog.generated_fields.isHidden(), "手动模式下模板字段没有隐藏"
+        finally:
+            preset.manual_text, preset.manual_atis, preset.manual_voice = previous
+            window.regenerate()
+    check("手动模式可编辑主页面稿件", manual_text_can_be_edited_on_the_main_page)
+
     def the_top_bar_does_not_grow_with_the_window():
         """顶栏纵向要钉成 Fixed。
 

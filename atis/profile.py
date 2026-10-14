@@ -71,7 +71,8 @@ def language_label(value):
 class Preset:
     def __init__(self, name="默认", template=None, airport_conditions="",
                  notams="", transition_level="", chinese_runway="",
-                 closing="", chinese_extra=""):
+                 closing="", chinese_extra="", manual_text=False,
+                 manual_atis="", manual_voice=""):
         from template import DEFAULT_TEMPLATE
         self.name = name
         self.template = DEFAULT_TEMPLATE if template is None else template
@@ -89,6 +90,10 @@ class Preset:
         # 独立渲染的），跑道构型、放行频率、应答机模式这些注意事项在中文侧没有
         # 对应字段，整段写在这里，接在气象之后念。
         self.chinese_extra = chinese_extra
+        # 手动模式下，主页面的两份稿子就是预设内容，不再经过模板和天气渲染。
+        self.manual_text = bool(manual_text)
+        self.manual_atis = manual_atis
+        self.manual_voice = manual_voice
 
     def to_dict(self):
         return {
@@ -100,6 +105,9 @@ class Preset:
             "chinese_runway": self.chinese_runway,
             "closing": self.closing,
             "chinese_extra": self.chinese_extra,
+            "manual_text": self.manual_text,
+            "manual_atis": self.manual_atis,
+            "manual_voice": self.manual_voice,
         }
 
     @classmethod
@@ -115,6 +123,9 @@ class Preset:
             # 老配置没有这两项：空串 = 用内置收尾语、中文稿不加附言
             data.get("closing", ""),
             data.get("chinese_extra", ""),
+            data.get("manual_text", False),
+            data.get("manual_atis", ""),
+            data.get("manual_voice", ""),
         )
 
 
