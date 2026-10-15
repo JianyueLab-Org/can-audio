@@ -4,6 +4,8 @@ import ctypes.util
 import os
 import sys
 
+import certifi
+
 # build 号在这里固化。打包之后程序里没有 .git，运行时再问 git 只会得到"不是
 # 仓库"——所以打包时把 git 状态写成 buildinfo.json 一起打进去。
 sys.path.insert(0, os.path.dirname(os.path.abspath(SPEC)))
@@ -49,6 +51,7 @@ def find_opus():
 
 opus_path = find_opus()
 opus_binaries = [(opus_path, '.')] if opus_path else []
+certifi_data = [(certifi.where(), 'certifi')]
 
 a = Analysis(
     ['gui.py'],
@@ -56,7 +59,8 @@ a = Analysis(
     binaries=opus_binaries,
     # 窗口图标要随程序分发，否则打包后运行时取不到
     # 机场坐标表：席位位置要用，不带上就会落在 0/0
-    datas=[('favicon.ico', '.'), ('airports.json', '.'), ('buildinfo.json', '.')],
+        datas=[('favicon.ico', '.'), ('airports.json', '.'), ('buildinfo.json', '.')]
+                    + certifi_data,
     # pyttsx3 的驱动是运行时按名字加载的，静态分析找不到
     hiddenimports=[
         'pymumble_py3',
