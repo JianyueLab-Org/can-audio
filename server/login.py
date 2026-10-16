@@ -279,6 +279,7 @@ class ServerCallbackI(MumbleIce.ServerCallback):
 
 
 url = "https://ceruleanavi.net/api/v1/public/auth"
+USER_AGENT = "Mozilla/5.0 (compatible; CanATIS/1.0)"
 
 # 上游接口的三种结果。"验证不了"必须和"密码不对"分开：前者再试一次就好，
 # 后者再试多少遍都一样，而且会被 can-web 按 CAN 计进限流。
@@ -295,7 +296,11 @@ def verify(cid, password):
     print 出来，等于服务器日志里躺着全网成员的网站密码。仓库在
     xpc/fsdpilot.py 里对 #AP 做了 _redact()，服务端这边同样得守。
     """
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        # Cloudflare rejects requests using requests' default User-Agent.
+        "User-Agent": USER_AGENT,
+    }
     data = {"cid": str(cid), "password": str(password)}
     print(f"登录请求: cid={cid}")           # 密码不进日志
 
@@ -333,8 +338,14 @@ def verify(cid, password):
             # a working password.
             print(f"上游限流: cid={cid}")
             return VERIFY_UNREACHABLE
+        if response.status_code == 403:
+            # A 403 from the public route is the proxy/WAF, not its credential
+            # contract (wrong credentials are a 400). Do not report it as a
+            # password failure to the Mumble client.
+            print(f"上游拒绝访问: cid={cid}, status=403")
+            return VERIFY_UNREACHABLE
         # 接口明确说了不行（4xx）就不再试——重试只会把这个账号推向限流
-        print(f"登录失败: cid={cid}, {response.status_code}, {response.text}")
+        print(f"登录失败: cid={cid}, status={response.status_code}")
         return VERIFY_REJECTED
 
     print(f"验证不了 cid={cid}（上游没有响应）: {last_error}")

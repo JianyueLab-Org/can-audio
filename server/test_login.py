@@ -122,6 +122,14 @@ class TimeoutTest(UpstreamTestCase):
             self.assertIsInstance(kwargs["timeout"], (int, float))
             self.assertGreater(kwargs["timeout"], 0)
 
+    def test_every_request_uses_the_cloudflare_compatible_user_agent(self):
+        fake = self.upstream(Response(200))
+        login_module.verify("1000", "pw")
+        self.assertEqual(
+            fake.calls[0][1]["headers"]["User-Agent"],
+            "Mozilla/5.0 (compatible; CanATIS/1.0)",
+        )
+
     def test_a_timing_out_upstream_does_not_hang_the_caller(self):
         """上游超时时 authenticate 必须照常返回，不能挂在分发线程上。"""
         self.upstream(login_module.requests.exceptions.Timeout("超时"))
@@ -158,6 +166,12 @@ class RetryTest(UpstreamTestCase):
 
     def test_rate_limit_is_temporary_not_a_password_failure(self):
         fake = self.upstream(Response(429, '{"error":"rate_limited"}'))
+        self.assertEqual(login_module.verify("1000", "pw"),
+                         login_module.VERIFY_UNREACHABLE)
+        self.assertEqual(len(fake.calls), 1)
+
+    def test_cloudflare_forbidden_is_temporary_not_a_password_failure(self):
+        fake = self.upstream(Response(403, "<html>challenge</html>"))
         self.assertEqual(login_module.verify("1000", "pw"),
                          login_module.VERIFY_UNREACHABLE)
         self.assertEqual(len(fake.calls), 1)
