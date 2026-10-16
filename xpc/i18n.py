@@ -158,6 +158,9 @@ TEXT = {
     "msg.fsd_gone_voice_stays": {"zh": "网络已下线，语音保持连接；要重新上网络请断开后重新连接",
                                  "en": "The network connection went offline; voice stays up. "
                                        "Disconnect and reconnect to get back on the network"},
+    "msg.sim_gone_fsd": {"zh": "模拟器已断开，网络连接已关闭；模拟器恢复后请重新连接",
+                          "en": "The simulator disconnected; the network connection was "
+                               "closed. Reconnect after the simulator is ready"},
     "msg.text":             {"zh": "{sender}: {body}", "en": "{sender}: {body}"},
     "msg.text_private":     {"zh": "{sender} → {recipient}: {body}",
                              "en": "{sender} → {recipient}: {body}"},
@@ -202,11 +205,10 @@ TEXT = {
     "dialog.missing_body":  {"zh": "请填写 CAN ID 和密码。",
                              "en": "Enter your CAN ID and password."},
     "dialog.no_sim":        {"zh": "X-Plane 未连接", "en": "X-Plane not connected"},
-    "dialog.no_sim_body":   {"zh": "还没有从 X-Plane 收到数据。没有位置就无法把飞机"
-                                   "报到网络上。\n\n仍然继续连接吗？",
-                             "en": "No data from X-Plane yet. Without a position your "
-                                   "aircraft cannot be reported to the network.\n\n"
-                                   "Connect anyway?"},
+    "dialog.no_sim_body":   {"zh": "还没有从 X-Plane 收到数据。请先启动模拟器并进入飞行，"
+                                   "然后再连接网络。",
+                             "en": "No data from X-Plane yet. Start the simulator and "
+                                   "enter a flight before connecting to the network."},
     "dialog.observer":      {"zh": "观察员模式", "en": "Observer mode"},
     "dialog.observer_busy": {"zh": "连接期间不能切换观察员模式。先断开，再改。",
                              "en": "Observer mode cannot be switched while connected. "
