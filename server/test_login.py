@@ -156,6 +156,12 @@ class RetryTest(UpstreamTestCase):
                          login_module.VERIFY_REJECTED)
         self.assertEqual(len(fake.calls), 1)
 
+    def test_rate_limit_is_temporary_not_a_password_failure(self):
+        fake = self.upstream(Response(429, '{"error":"rate_limited"}'))
+        self.assertEqual(login_module.verify("1000", "pw"),
+                         login_module.VERIFY_UNREACHABLE)
+        self.assertEqual(len(fake.calls), 1)
+
     def test_it_gives_up_after_the_retries(self):
         fake = self.upstream(self.network_error())
         self.assertEqual(login_module.verify("1000", "pw"),
