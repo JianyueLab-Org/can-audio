@@ -325,6 +325,14 @@ def verify(cid, password):
             if attempt < HTTP_RETRIES:
                 time.sleep(HTTP_RETRY_DELAY)
             continue
+        if response.status_code == 429:
+            # can-api rate-limits FSD/ATIS credential checks. A valid password
+            # must not be reported as a credential failure while that limit is
+            # active; let Murmur return its temporary-authentication error so
+            # the client retries later instead of asking the operator to reset
+            # a working password.
+            print(f"上游限流: cid={cid}")
+            return VERIFY_UNREACHABLE
         # 接口明确说了不行（4xx）就不再试——重试只会把这个账号推向限流
         print(f"登录失败: cid={cid}, {response.status_code}, {response.text}")
         return VERIFY_REJECTED
