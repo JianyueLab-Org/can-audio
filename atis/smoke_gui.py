@@ -486,6 +486,44 @@ def main():
     settings_dialog = gui.SettingsDialog(window.settings, window)
     check("建立设置对话框", lambda: settings_dialog)
 
+    def custom_voice_host_is_saved_and_used():
+        import settings as settings_module
+        original_host = window.settings.mumble_host
+        station = window.current_station()
+        try:
+            assert settings_dialog.mumble_host_input.text() == original_host
+            settings_dialog.mumble_host_input.setText("  voice.example.net  ")
+            settings_dialog.save_and_close()
+            assert window.settings.mumble_host == "voice.example.net"
+            assert settings_module.Settings().mumble_host == "voice.example.net"
+            with mock.patch.object(window.settings, "connect_fsd", False), \
+                    mock.patch.object(gui, "Broadcaster") as broadcaster:
+                window.start_broadcast(station, "1000", "test-password")
+                assert broadcaster.call_args.args[0] == "voice.example.net"
+                broadcaster.return_value.start.assert_called_once()
+                window.stop_broadcast(station.callsign)
+        finally:
+            window.settings.mumble_host = original_host
+            window.settings.save_settings()
+    check("自定义语音地址保存并传给广播连接", custom_voice_host_is_saved_and_used)
+
+    def cancelling_keeps_the_voice_host():
+        original_host = window.settings.mumble_host
+        dialog = gui.SettingsDialog(window.settings, window)
+        dialog.mumble_host_input.setText("cancelled.example.net")
+        dialog.reject()
+        assert window.settings.mumble_host == original_host
+    check("取消设置不改变语音地址", cancelling_keeps_the_voice_host)
+
+    def blank_voice_host_restores_the_default():
+        import settings as settings_module
+        dialog = gui.SettingsDialog(window.settings, window)
+        dialog.mumble_host_input.setText("   ")
+        dialog.save_and_close()
+        assert window.settings.mumble_host == settings_module.DEFAULT_MUMBLE_HOST
+        assert settings_module.Settings().mumble_host == settings_module.DEFAULT_MUMBLE_HOST
+    check("语音地址留空恢复默认", blank_voice_host_restores_the_default)
+
     print("导入 vATIS 配置：")
 
     def import_vatis_profile():

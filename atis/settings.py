@@ -17,6 +17,7 @@ from i18n import t
 
 log = logging.getLogger("settings")
 
+DEFAULT_MUMBLE_HOST = "audio.ceruleanavi.net"
 DEFAULT_FSD_HOST = "fsd.ceruleanavi.net"
 DEFAULT_FSD_PORT = 6809
 
@@ -58,6 +59,7 @@ class Settings:
         self.config_file = "atis_settings.json"
         self.cid = ""
         self.metar_url = weather.DEFAULT_METAR_URL
+        self.mumble_host = DEFAULT_MUMBLE_HOST
         # FSD 服务端：席位靠它出现在网络上，气象也从它那里要。
         # 和语音服务器（audio.ceruleanavi.net:64738）不是同一台。
         self.fsd_host = DEFAULT_FSD_HOST
@@ -101,6 +103,7 @@ class Settings:
                     data = json.load(f)
                 self.cid = data.get("cid", "")
                 self.metar_url = data.get("metar_url") or weather.DEFAULT_METAR_URL
+                self.mumble_host = (data.get("mumble_host") or "").strip() or DEFAULT_MUMBLE_HOST
                 self.fsd_host = data.get("fsd_host") or DEFAULT_FSD_HOST
                 if (self.fsd_host or "").strip().lower() in WRONG_FSD_HOSTS:
                     log.warning("the FSD host %s in the settings is the voice server, "
@@ -147,6 +150,7 @@ class Settings:
                 json.dump({
                     "cid": self.cid,
                     "metar_url": self.metar_url,
+                    "mumble_host": self.mumble_host,
                     "fsd_host": self.fsd_host,
                     "fsd_port": self.fsd_port,
                     "real_name": self.real_name,
@@ -189,6 +193,15 @@ class SettingsDialog(QDialog):
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
+
+        voice_row = QHBoxLayout()
+        self.mumble_host_input = LineEdit()
+        self.mumble_host_input.setText(self.settings.mumble_host)
+        self.mumble_host_input.setPlaceholderText(DEFAULT_MUMBLE_HOST)
+        self.mumble_host_input.setToolTip(t("settings.mumble_host_tip"))
+        voice_row.addWidget(BodyLabel(t("settings.mumble_host")))
+        voice_row.addWidget(self.mumble_host_input)
+        layout.addLayout(voice_row)
 
         self.connect_fsd = CheckBox(t("settings.connect_fsd")
                                     + t("settings.connect_fsd_note"))
@@ -295,6 +308,8 @@ class SettingsDialog(QDialog):
         layout.addLayout(buttons)
 
     def save_and_close(self):
+        self.settings.mumble_host = (self.mumble_host_input.text().strip()
+                                     or DEFAULT_MUMBLE_HOST)
         self.settings.metar_url = (self.metar_input.text().strip()
                                    or weather.DEFAULT_METAR_URL)
         self.settings.metar_refresh = clamp_refresh(

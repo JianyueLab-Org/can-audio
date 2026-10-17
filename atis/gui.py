@@ -53,7 +53,6 @@ from settings import Settings, SettingsDialog
 log = logging.getLogger("gui")
 
 # 语音（Mumble）服务器。FSD 是另一台，地址在设置里（fsd.ceruleanavi.net:6809）。
-SERVER = "audio.ceruleanavi.net"
 
 # 外观在 theme.py 里，四个客户端共用一份——它们多半并排开着，长得不一样会很跳。
 # 这里只把用到的名字取出来，**不要在这个文件里再写死任何 #rrggbb**。
@@ -1140,7 +1139,7 @@ class AtisWindow(QMainWindow):
                 fsd.start()
 
         broadcaster = Broadcaster(
-            SERVER, cid, password, station,
+            self.settings.mumble_host, cid, password, station,
             datafeed_url=self.settings.datafeed_url,
             atis_range_nm=self.settings.atis_range_nm,
             on_state=lambda state, message, _c=callsign:

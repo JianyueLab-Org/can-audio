@@ -913,6 +913,29 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(self.module.Settings().fsd_host, "fsd.ceruleanavi.net")
         self.assertEqual(self.module.Settings().fsd_port, 6809)
 
+    def test_default_voice_host(self):
+        self.assertEqual(self.module.Settings().mumble_host,
+                         "audio.ceruleanavi.net")
+
+    def test_missing_or_blank_voice_host_uses_default(self):
+        for data in ({"cid": "1000"}, {"mumble_host": ""},
+                     {"mumble_host": "   "}, {"mumble_host": None}):
+            with self.subTest(data=data):
+                self.write(data)
+                self.assertEqual(self.module.Settings().mumble_host,
+                                 self.module.DEFAULT_MUMBLE_HOST)
+
+    def test_custom_voice_host_survives_a_round_trip(self):
+        for host in ("voice.example.net", "127.0.0.1", "::1"):
+            with self.subTest(host=host):
+                self.write({"mumble_host": f"  {host}  ",
+                            "fsd_host": "fsd.example.net"})
+                settings = self.module.Settings()
+                self.assertEqual(settings.mumble_host, host)
+                self.assertEqual(settings.fsd_host, "fsd.example.net")
+                settings.save_settings()
+                self.assertEqual(self.module.Settings().mumble_host, host)
+
     def test_migrates_the_voice_host_away(self):
         # 早期版本把语音服务器的地址填成了 FSD 地址，那台机器上没有 FSD。
         # 语音服务器换过两次域名，三个都得认：前两个还留在老配置里，最后
@@ -2525,6 +2548,29 @@ class RejectIsNotACrashTest(unittest.TestCase):
     释放了 ready_lock，异常剩下的唯一作用就是终止线程，而 run() 正常返回同样
     终止线程。
     """
+
+    def test_rejection_logs_the_node_and_identity_without_the_password(self):
+        from unittest import mock
+        broadcast = _load_broadcast()
+        client = broadcast.RejectAwareMumble.__new__(broadcast.RejectAwareMumble)
+        client.host = "hz.cn.audio.ceruleanavi.net"
+        client.port = 64738
+        client.user = "1005_atis127000_ZBAA_ATIS"
+        client.password = "secret-not-for-logs"
+        client.control_socket = mock.Mock()
+        client.control_socket.getpeername.return_value = ("192.0.2.10", 64738)
+        reject = broadcast.mumble_pb2.Reject()
+        reject.type = broadcast.mumble_pb2.Reject.WrongUserPW
+        reject.reason = "Wrong certificate or password for existing user"
+        with mock.patch.object(broadcast.pymumble.Mumble, "dispatch_control_message"), \
+                self.assertLogs("atis", level="WARNING") as captured:
+            client.dispatch_control_message(broadcast.PYMUMBLE_MSG_TYPES_REJECT,
+                                            reject.SerializeToString())
+        output = "\n".join(captured.output)
+        for expected in (client.host, client.user, "192.0.2.10", "station-v1",
+                         "authenticator registration"):
+            self.assertIn(expected, output)
+        self.assertNotIn(client.password, output)
 
     def test_rejection_does_not_reach_the_thread_excepthook(self):
         from unittest import mock

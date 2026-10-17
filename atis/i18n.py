@@ -271,6 +271,9 @@ TEXT = {
 
     # ---------- 设置对话框 ----------
     "settings.title":       {"zh": "设置", "en": "Settings"},
+      "settings.mumble_host": {"zh": "语音服务器:", "en": "Voice server:"},
+      "settings.mumble_host_tip": {"zh": "填写域名或 IP 地址；留空使用默认服务器，修改后下次启动广播时生效。",
+                                                 "en": "Enter a hostname or IP address. Leave blank for the default server. Changes apply the next time a broadcast starts."},
     "settings.connect_fsd": {"zh": "播出时同时登录 FSD", "en": "Log in to FSD while broadcasting"},
     "settings.fsd_host":    {"zh": "FSD 服务器:", "en": "FSD server:"},
     "settings.fsd_port":    {"zh": "端口:", "en": "Port:"},
