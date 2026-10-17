@@ -890,13 +890,31 @@ class Broadcaster:
                 return False
         return False
 
+    def _report_route_wait(self):
+        reason = self._router.blocked_reason
+        if reason and reason != getattr(self, "_last_route_reason", None):
+            self._last_route_reason = reason
+            keys = {
+                "not_ready": "voice.route_not_ready",
+                "invalid_radius": "voice.route_invalid_radius",
+                "feed_unavailable": "voice.route_feed_unavailable",
+                "station_unavailable": "voice.route_station_unavailable",
+                "no_receivers": "voice.route_no_receivers",
+            }
+            self._state('online', t(keys[reason]))
+
     def _transmit(self, pcm):
         """按 20ms 帧节流发送；中途有人讲话就让路。"""
         position, total = 0, len(pcm)
         generation = self._router.begin_cycle()
         if generation is None:
+            self._report_route_wait()
             return False
+        next_frame = time.monotonic()
+        announced = False
         while position < total and self.running and not self.stop_event.is_set():
+            if self._router.generation != generation:
+                return False
             if not self._channel_is_quiet():
                 self._state('online', t("voice.interrupted"))
                 self._router.discard()
@@ -914,12 +932,24 @@ class Broadcaster:
             if len(chunk) < FRAME_BYTES:
                 chunk += b'\x00' * (FRAME_BYTES - len(chunk))
             try:
-                if not self._router.enqueue(chunk, generation):
-                    return False
+                queued = self._router.enqueue(chunk, generation)
+                if not queued:
+                    self._report_route_wait()
+                    if self._router.blocked_reason != "no_receivers":
+                        return False
+                    announced = False
             except Exception as e:
                 self._state('error', t("voice.send_failed", error=e))
                 return False
+            if queued and not announced:
+                self._last_route_reason = None
+                self._state('online', t("voice.speaking", letter=self.station.letter))
+                announced = True
             position += FRAME_BYTES
+            next_frame = max(next_frame + FRAME_BYTES / (2.0 * TARGET_RATE),
+                             time.monotonic())
+            if self.stop_event.wait(max(0, next_frame - time.monotonic())):
+                return False
 
         # 等缓冲排空，免得下一轮的静默判断被自己的尾音干扰
         deadline = time.time() + 5
@@ -960,7 +990,6 @@ class Broadcaster:
 
             if not self._wait_for_quiet():
                 break
-            self._state('online', t("voice.speaking", letter=self.station.letter))
             spoken = self._transmit(pcm)
 
             if not self.running or self.stop_event.is_set():

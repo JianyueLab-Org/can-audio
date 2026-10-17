@@ -257,6 +257,20 @@ class GateFixture(RoutingTestCase):
 
 
 class GateTest(GateFixture):
+    def test_new_listener_preserves_current_cycle_and_buffer(self):
+        generation = self.router.begin_cycle()
+        self.assertTrue(self.router.enqueue(b"\x01\x00" * 960, generation))
+        self.feed.data["pilots"][1].update(latitude=35.0, longitude=139.0)
+        self.delta(12, channel=7)
+        self.assertEqual(self.router.generation, generation)
+        self.assertGreater(self.mumble.sound_output.get_buffer_size(), 0)
+        self.send()
+        from pymumble_py3 import mumble_pb2
+        target = mumble_pb2.VoiceTarget()
+        target.ParseFromString(self.mumble.control_socket.messages[0][1])
+        self.assertEqual(list(target.targets[0].session), [11, 12])
+        self.assertEqual(self.mumble.control_socket.audio, [2])
+
     def test_only_nonzero_whisper_and_registration_precedes_audio(self):
         self.assertTrue(self.router.enqueue(b"\x00" * 1920))
         self.send()
@@ -350,13 +364,14 @@ class GateTest(GateFixture):
         sender.join(2)
         self.assertEqual({thread for kind, body, thread in self.mumble.control_socket.messages}, {sender.ident})
 
-    def test_cycle_does_not_enqueue_tail_after_membership_changes(self):
+    def test_cycle_continues_after_membership_changes_with_old_tail_cleared(self):
         generation = self.router.begin_cycle()
         self.assertTrue(self.router.enqueue(b"\x00" * 1920, generation))
         self.delta(channel=8)
         self.delta(channel=7)
-        self.assertFalse(self.router.enqueue(b"\x00" * 1920, generation))
         self.assertEqual(self.mumble.sound_output.get_buffer_size(), 0)
+        self.assertEqual(self.router.generation, generation)
+        self.assertTrue(self.router.enqueue(b"\x00" * 1920, generation))
 
     def test_unrelated_membership_and_channel_churn_preserves_cycle(self):
         from pymumble_py3 import mumble_pb2
@@ -494,6 +509,31 @@ class RealStartupTest(RoutingTestCase):
 
 
 class DaemonConsumerTest(GateFixture):
+    def test_daemon_first_listener_receives_middle_not_start(self):
+        import mumble
+        broadcaster = mumble.ATISBroadcaster.__new__(mumble.ATISBroadcaster)
+        broadcaster.mumble = self.mumble
+        broadcaster._router = self.router
+        broadcaster.running = True
+        broadcaster.chunk_size = 1920
+        broadcaster.check_channel_silence = lambda: True
+        self.delta(channel=8)
+        frames = [bytes([value, 0]) * 960 for value in (1, 2, 3)]
+        sleeps = []
+
+        def tick(timeout):
+            sleeps.append(timeout)
+            if len(sleeps) == 1:
+                self.delta(channel=7)
+            self.send()
+
+        with mock.patch.object(mumble.time, "sleep", side_effect=tick), \
+                mock.patch.object(self.mumble.sound_output.encoder, "encode",
+                                  wraps=self.mumble.sound_output.encoder.encode) as encode:
+            self.assertTrue(broadcaster.broadcast_audio(b"".join(frames)))
+        self.assertEqual([call.args[0] for call in encode.call_args_list], frames[1:])
+        self.assertEqual(sleeps, [0.02] * 3)
+
     def test_daemon_failed_start_closes_event_loop(self):
         import mumble
         broadcaster = mumble.ATISBroadcaster.__new__(mumble.ATISBroadcaster)
