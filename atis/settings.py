@@ -7,6 +7,7 @@ from qfluentwidgets import (BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentI
                             LineEdit, PrimaryPushButton, PushButton)
 
 import applog
+import atisrouting
 import datafeed
 import i18n
 import netconfig
@@ -67,6 +68,7 @@ class Settings:
         # 这样通播和管制席位显示的等级一致；查不到就退回 OBS。
         self.rating = 0
         self.datafeed_url = datafeed.DEFAULT_DATAFEED_URL
+        self.atis_range_nm = atisrouting.DEFAULT_RANGE_NM
         # 全网通播配置的地址（can-web 的 /api/v1/atis/config），和上面那个
         # 数据源不是一回事：数据源说的是此刻谁在播，这个给的是配置本身。
         self.config_url = netconfig.DEFAULT_CONFIG_URL
@@ -126,6 +128,7 @@ class Settings:
                              netconfig.DEFAULT_CONFIG_URL, self.config_url)
                     self.config_url = netconfig.DEFAULT_CONFIG_URL
                 self.config_version = str(data.get("config_version") or "")
+                self.atis_range_nm = data.get("atis_range_nm", atisrouting.DEFAULT_RANGE_NM)
                 self.metar_refresh = clamp_refresh(
                     data.get("metar_refresh", DEFAULT_METAR_REFRESH))
                 self.compact = bool(data.get("compact", False))
@@ -150,6 +153,7 @@ class Settings:
                     "connect_fsd": self.connect_fsd,
                     "rating": self.rating,
                     "datafeed_url": self.datafeed_url,
+                    "atis_range_nm": self.atis_range_nm,
                     "config_url": self.config_url,
                     "config_version": self.config_version,
                     "metar_refresh": self.metar_refresh,

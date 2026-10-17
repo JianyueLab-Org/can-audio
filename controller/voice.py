@@ -14,6 +14,7 @@ whisper 那边 `id==1` 时只取第一个频道（mumble.py 里写死的），�
 """
 
 import logging
+import re
 import threading
 import time
 
@@ -1212,7 +1213,9 @@ class VoiceClient:
         except Exception as e:
             log.warning(f"playing the received audio raised: {e}")
 
-        self._forward_cross_couple(khz, soundchunk)
+        # ATIS whispers must not become unrestricted cross-coupled channel audio.
+        if not re.fullmatch(r"[0-9]+_atis[0-9]{6}(?:_[A-Z0-9]{4}_(?:[DA]_)?ATIS)?", user.get("name", "")):
+            self._forward_cross_couple(khz, soundchunk)
 
     def _forward_cross_couple(self, khz, soundchunk):
         """交叉耦合：在一个 XC 频率上收到的话音，转发到其它 XC 频率。"""

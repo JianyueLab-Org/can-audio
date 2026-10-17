@@ -17,6 +17,7 @@
 
 import json
 import os
+import math
 
 DEFAULT_INI = "/etc/mumble/mumble-server.ini"
 SECRETS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -110,6 +111,26 @@ def ice_secret(ini_path=None):
 def atis_account():
     """服务端那队通播机用的保留账号。不是秘密，缺省 900。"""
     return from_env("ATIS_CID") or from_file("atis_cid") or "900"
+
+
+def atis_datafeed_url():
+    return (from_env("ATIS_DATAFEED_URL") or from_file("atis_datafeed_url")
+            or "https://data.ceruleanavi.net/v1/data.json")
+
+
+def atis_range_nm():
+    value = from_env("ATIS_RANGE_NM")
+    if value is None:
+        value = from_file("atis_range_nm")
+    if value is None:
+        value = 100
+    try:
+        radius = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("ATIS_RANGE_NM must be a finite positive number") from None
+    if isinstance(value, bool) or not math.isfinite(radius) or radius <= 0:
+        raise ValueError("ATIS_RANGE_NM must be a finite positive number")
+    return radius
 
 
 def atis_password(required=False):

@@ -458,14 +458,11 @@ class MsfsWindow(QMainWindow):
         if not cid or not password:
             QMessageBox.warning(self, t("dialog.missing"), t("dialog.missing_body"))
             return
-        # 观察员本来就常常不开模拟器（他就是个话务员），这一句问了也白问
+        # 飞行员没有模拟器位置时不能登录 FSD：否则服务端会保留一条没有有效
+        # 位置的连接，模拟器随后退出也会继续重连。
         if not watching and not self.sim.connected:
-            answer = QMessageBox.question(
-                self, t("dialog.no_sim"), t("dialog.no_sim_body"),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if answer != QMessageBox.StandardButton.Yes:
-                return
+            QMessageBox.warning(self, t("dialog.no_sim"), t("dialog.no_sim_body"))
+            return
 
         # 存下来，下次开机不用重填。密码是例外：勾了"记住密码"才落盘，
         # 没勾的话它只活在内存里（settings.save() 会写空串）。
@@ -837,6 +834,18 @@ class MsfsWindow(QMainWindow):
             f"color: {theme.ON_COLOR if connected else theme.IDLE_COLOR};")
         self.add_message(t("msg.sim", message=message),
                          theme.ON_COLOR if connected else theme.ACTIVE_COLOR)
+        if not connected:
+            self.snapshot = None
+            fsd = self.fsd
+            self.fsd = None
+            if fsd:
+                fsd.stop()
+                self.ident_button.setEnabled(False)
+                self.controller_list.clear()
+                self.fsd_label.setText(t("net.disconnected"))
+                self.add_message(t("msg.sim_gone_fsd"), theme.ACTIVE_COLOR)
+            self.connect_button.setText(
+                t("connect.disconnect") if self.voice else t("connect.connect"))
 
     def on_fsd_status(self, state, message, source=None):
         if source is not None and source is not self.fsd:

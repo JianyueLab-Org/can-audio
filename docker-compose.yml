@@ -75,6 +75,8 @@ services:
       # 对**整份文件**做的，profile 没启用也照样展开，那样一来没配 ATIS 口令
       # 的机器连普通的 docker compose up -d 都起不来。
       ATIS_PASSWORD: ${ATIS_PASSWORD:-}
+      ATIS_RANGE_NM: ${ATIS_RANGE_NM:-100}
+      ATIS_DATAFEED_URL: ${ATIS_DATAFEED_URL:-https://data.ceruleanavi.net/v1/data.json}
 
 volumes:
   mumble-db:

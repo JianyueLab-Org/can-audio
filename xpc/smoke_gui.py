@@ -162,13 +162,13 @@ def main():
         assert window.fsd is None, "不该建立任何连接"
     check("拦下空账号", rejects_missing_credentials)
 
-    def asks_when_simulator_absent():
+    def rejects_when_simulator_absent():
         _dialogs.clear()
         window.cid_input.setText("1234")
         window.connect_all()          # X-Plane 未连接，替身里 connected 为假
-        assert _dialogs, "模拟器没连上时应当询问而不是直接连"
-        assert window.fsd is None, "选了否就不该连"
-    check("模拟器缺席时询问", asks_when_simulator_absent)
+        assert _dialogs and _dialogs[-1][0] == "warning", "模拟器没连上时应当直接拦下"
+        assert window.fsd is None, "模拟器没连上时不应建立 FSD 连接"
+    check("模拟器缺席时拒绝连接", rejects_when_simulator_absent)
 
     print("消息区：")
     check("收到文字消息", lambda: window.on_text_message(
@@ -219,6 +219,21 @@ def main():
 
     print("状态回调：")
     check("模拟器状态", lambda: window.on_sim_state(True, "已连接 X-Plane"))
+
+    def disconnects_fsd_when_simulator_goes_away():
+        class FakeFsd:
+            stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        fsd = FakeFsd()
+        window.fsd = fsd
+        window.on_sim_state(False, "模拟器断开")
+        assert fsd.stopped, "模拟器断开时应停止 FSD"
+        assert window.fsd is None, "模拟器断开时不应保留 FSD 引用"
+    check("模拟器断开时关闭网络", disconnects_fsd_when_simulator_goes_away)
+
     check("网络状态", lambda: window.on_fsd_status("online", "已上线"))
     check("语音状态", lambda: window.on_voice_status("online", "语音已连接"))
     check("频道切换", lambda: window.on_channel(121.5, "FREQ_121500"))

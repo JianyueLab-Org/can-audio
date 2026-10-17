@@ -1,8 +1,7 @@
 """把通播播到 Mumble 上。
 
-一个席位一条独立的 Mumble 连接，用户名 {cid}_atis{频率}——服务端
-server/login.py 认这个格式，并把频率的 6 位数字当成 Murmur 用户 id，所以同一
-个账号开多个不同频率的通播不会互相踢掉。
+一个席位一条独立的 Mumble 连接，用户名 {cid}_atis{频率6位}_{callsign}。
+server/login.py 按机场和通播类型分配 Murmur 用户 id，同频率的不同席位不冲突。
 
 这条连接不打开任何本地音频设备：通播只发合成出来的语音，不碰麦克风，也不该和
 管制端抢输入输出设备。
@@ -31,6 +30,7 @@ from pymumble_py3.constants import (
 )
 
 import mumblecompat
+import atisrouting
 from i18n import t
 
 # pymumble 用的 ssl.wrap_socket 在 Python 3.12 里已被删除，导入时先补上，
@@ -496,7 +496,9 @@ class Broadcaster:
     """一个席位的语音播出。on_state(state, message) 在后台线程调用。"""
 
     def __init__(self, server, cid, password, station, on_state=None,
-                 reconnect_limit=RECONNECT_LIMIT):
+                 reconnect_limit=RECONNECT_LIMIT,
+                 datafeed_url=atisrouting.DEFAULT_URL,
+                 atis_range_nm=atisrouting.DEFAULT_RANGE_NM):
         self.server = server
         self.cid = str(cid).strip()
         self.password = password
@@ -508,10 +510,12 @@ class Broadcaster:
         # 而不是有人按了停止播出。
         self.gave_up = False
 
-        self.user = f"{self.cid}_atis{str(station.frequency_khz).zfill(6)}"
+        self.user = f"{self.cid}_atis{station.frequency_khz:06d}_{station.callsign}"
         self.running = False
         self.stop_event = threading.Event()
         self.mumble = None
+        self._router = atisrouting.ATISRouter(station.callsign, station.frequency_khz,
+                                             datafeed_url, atis_range_nm)
         self.thread = None
 
         self._synth = Synthesizer()
@@ -654,7 +658,7 @@ class Broadcaster:
             name = user["name"]
         except Exception:
             name = ""
-        if name and name != self.user:
+        if name and name != self.user and self._router.hears(user):
             self._last_other_sound = time.time()
 
     def _connect(self):
@@ -676,6 +680,7 @@ class Broadcaster:
             self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_SOUNDRECEIVED, self._on_sound)
             self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_PERMISSIONDENIED,
                                                self._on_permission_denied)
+            self._router.attach(self.mumble)
             self.mumble.start()
         except Exception as e:
             self._state('error', t("voice.connect_failed", error=e))
@@ -845,6 +850,9 @@ class Broadcaster:
         log.warning("%s: %s", self.station.callsign, self._denial)
 
     def _disconnect(self):
+        router = getattr(self, "_router", None)
+        if router is not None:
+            router.close()
         if self.mumble:
             try:
                 self.mumble.stop()
@@ -873,9 +881,13 @@ class Broadcaster:
     def _transmit(self, pcm):
         """按 20ms 帧节流发送；中途有人讲话就让路。"""
         position, total = 0, len(pcm)
+        generation = self._router.begin_cycle()
+        if generation is None:
+            return False
         while position < total and self.running and not self.stop_event.is_set():
             if not self._channel_is_quiet():
                 self._state('online', t("voice.interrupted"))
+                self._router.discard()
                 return False
             try:
                 buffered = self.mumble.sound_output.get_buffer_size()
@@ -890,7 +902,8 @@ class Broadcaster:
             if len(chunk) < FRAME_BYTES:
                 chunk += b'\x00' * (FRAME_BYTES - len(chunk))
             try:
-                self.mumble.sound_output.add_sound(chunk)
+                if not self._router.enqueue(chunk, generation):
+                    return False
             except Exception as e:
                 self._state('error', t("voice.send_failed", error=e))
                 return False
@@ -899,6 +912,8 @@ class Broadcaster:
         # 等缓冲排空，免得下一轮的静默判断被自己的尾音干扰
         deadline = time.time() + 5
         while self.running and not self.stop_event.is_set() and time.time() < deadline:
+            if self._router.generation != generation:
+                return False
             try:
                 if self.mumble.sound_output.get_buffer_size() <= 0:
                     break
@@ -906,7 +921,7 @@ class Broadcaster:
                 break
             if self.stop_event.wait(0.05):
                 break
-        return position >= total
+        return position >= total and self._router.generation == generation
 
     def _loop(self):
         while self.running and not self.stop_event.is_set():
