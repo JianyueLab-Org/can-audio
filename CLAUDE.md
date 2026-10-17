@@ -387,7 +387,9 @@ Environment settings override the file. Defaults are 100 NM and `https://data.ce
 Nonfinite or nonpositive daemon radii are rejected. Compose passes both settings to its ATIS service.
 Recipients must be joined to, or listening to, the station frequency. Nearby ATIS peers are quiet listeners.
 Quiet detection drains received audio and ignores distant or unknown senders.
-ATIS uses nonzero VoiceTarget 2 only. Route changes, reconnects, and disable clear buffered tails.
+ATIS uses nonzero VoiceTarget 2 only. Receiver additions update the target without clearing audio or restarting the cycle.
+Receiver removals clear buffered tails but preserve the cycle; reconnects and disable invalidate it.
+With no eligible listeners, valid station/feed broadcasts advance at real-time speed without sending PCM, so new listeners join mid-script.
 Raw UserState listener deltas accumulate per session and reset on reconnect, user removal, and channel deletion.
 Target registration and audio send run on the Mumble thread under the same gate as PCM enqueue.
 Controller clients play ATIS but never cross-couple it. Ordinary radio cross-coupling is unchanged.

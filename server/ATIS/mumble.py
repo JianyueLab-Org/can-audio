@@ -355,8 +355,11 @@ class ATISBroadcaster(threading.Thread):
                 if len(chunk) < chunk_size:
                     chunk += b'\x00' * (chunk_size - len(chunk))
                 
-                if not self._router.enqueue(chunk, generation):
+                if self._router.generation != generation:
                     return False
+                if not self._router.enqueue(chunk, generation):
+                    if self._router.blocked_reason != "no_receivers":
+                        return False
                 position += chunk_size
                 time.sleep(0.02)
             else:

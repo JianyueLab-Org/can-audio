@@ -7,6 +7,7 @@ import re
 import threading
 import time
 import types
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
@@ -164,6 +165,7 @@ class FeedReader:
         self.stop_event = threading.Event()
         self._snapshot = None
         self._subscribers = set()
+        self._failure = None
         self.thread = threading.Thread(target=self._run, name="atis-feed", daemon=True)
 
     def snapshot(self):
@@ -172,14 +174,25 @@ class FeedReader:
 
     def refresh(self):
         data = None
+        failure = None
         try:
             data = fetch_feed(self.url)
             snapshot = FeedSnapshot(data)
             if not snapshot.fresh(time.time()):
                 snapshot = None
-        except Exception:
+                failure = "stale or invalid feed timestamp"
+        except Exception as error:
             snapshot = None
-            log.debug("routing feed unavailable")
+            failure = type(error).__name__
+            if isinstance(error, urllib.error.HTTPError):
+                failure += f" (HTTP {error.code})"
+            log.debug("routing feed unavailable", exc_info=True)
+        if failure != self._failure:
+            if failure:
+                log.warning("routing feed unavailable: %s", failure)
+            else:
+                log.info("routing feed recovered")
+            self._failure = failure
         with self.lock:
             self._snapshot = snapshot
             subscribers = tuple(self._subscribers)
@@ -251,6 +264,7 @@ class ATISRouter:
         self._programmed_key = None
         self.generation = 0
         self.mumble = None
+        self.blocked_reason = None
 
     def attach(self, mumble):
         if self.feed is None:
@@ -308,8 +322,7 @@ class ATISRouter:
                     output.clear_buffer()
                     return
                 key = self._route()
-                if key != self._queued_key:
-                    self._clear()
+                self._update_route(key)
                 self._program(key)
                 if key:
                     original_send()
@@ -322,6 +335,12 @@ class ATISRouter:
         self._queued_key = None
         self.generation += 1
 
+    def _update_route(self, key):
+        if set(self._queued_key or ()) - set(key):
+            if self._output is not None:
+                self._output.clear_buffer()
+        self._queued_key = key
+
     def _observe(self, kind, body):
         if kind not in (5, 6, 7, 8, 9):
             return
@@ -329,7 +348,6 @@ class ATISRouter:
         if kind == 5:
             self._synced = True
             return
-        previous_route = self._route()
         if kind == 9:
             message = mumble_pb2.UserState()
             message.ParseFromString(body)
@@ -364,10 +382,10 @@ class ATISRouter:
                     member["channel_id"] = 0
             for listening in self._listeners.values():
                 listening.discard(message.channel_id)
-        if self._route() != previous_route:
-            self._clear()
+        self._update_route(self._route())
 
     def _route(self, members=None):
+        self.blocked_reason = "not_ready"
         if (self._disabled or not self._synced or self.mumble is None
                 or getattr(self.mumble, "connected", None) != 2):
             return ()
@@ -375,12 +393,23 @@ class ATISRouter:
                    if channel.get("name") == f"FREQ_{self.frequency:06d}"]
         channel = matches[0] if len(matches) == 1 else None
         own = self.mumble.users.myself_session
-        if self._members.get(own, {}).get("channel_id") != channel:
+        if channel is None or self._members.get(own, {}).get("channel_id") != channel:
             return ()
-        recipients = select_sessions(self.feed.snapshot(), self.callsign, self.frequency,
+        snapshot, now = self.feed.snapshot(), time.time()
+        if self.radius is None:
+            self.blocked_reason = "invalid_radius"
+            return ()
+        if snapshot is None or not snapshot.fresh(now):
+            self.blocked_reason = "feed_unavailable"
+            return ()
+        if snapshot.station(self.callsign, self.frequency, now) is None:
+            self.blocked_reason = "station_unavailable"
+            return ()
+        recipients = select_sessions(snapshot, self.callsign, self.frequency,
                                      self._members if members is None else members,
                                      self._listeners, channel, own,
-                                     self.radius, time.time())
+                                     self.radius, now)
+        self.blocked_reason = None if recipients else "no_receivers"
         return tuple((session, self._members[session].get("name")) for session in recipients)
 
     def _program(self, key):
@@ -399,26 +428,21 @@ class ATISRouter:
     def begin_cycle(self):
         with self._lock:
             key = self._route()
-            if not key:
-                self._clear()
+            self._update_route(key)
+            if not key and self.blocked_reason != "no_receivers":
                 return None
-            if key != self._queued_key:
-                self._clear()
-                self._queued_key = key
             return self.generation
 
     def enqueue(self, pcm, generation=None):
         with self._lock:
             if self._output is None or not self._output.encoder_framesize:
+                self.blocked_reason = "not_ready"
                 self._clear()
                 return False
             key = self._route()
+            self._update_route(key)
             if not key:
-                self._clear()
                 return False
-            if key != self._queued_key:
-                self._clear()
-                self._queued_key = key
             if generation is not None and generation != self.generation:
                 self._clear()
                 return False

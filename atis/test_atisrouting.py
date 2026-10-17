@@ -128,6 +128,24 @@ class SelectionTest(RoutingTestCase):
 
 
 class FeedTest(RoutingTestCase):
+    def test_feed_failure_is_reported_once_and_recovery_is_logged(self):
+        reader = self.routing.FeedReader("https://synthetic.invalid/feed")
+        from urllib.error import HTTPError
+        failure = HTTPError(reader.url, 403, "Forbidden", None, None)
+        with mock.patch.object(self.routing.time, "time", return_value=NOW), \
+                mock.patch.object(self.routing, "fetch_feed", side_effect=failure), \
+                self.assertLogs("atisrouting", level="INFO") as captured:
+            reader.refresh()
+            reader.refresh()
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn("HTTP 403", captured.output[0])
+        with mock.patch.object(self.routing.time, "time", return_value=NOW), \
+                mock.patch.object(self.routing, "fetch_feed", return_value=fixture()), \
+                self.assertLogs("atisrouting", level="INFO") as recovered:
+            reader.refresh()
+        self.assertIn("routing feed recovered", recovered.output[0])
+        self.assertIsNotNone(reader.snapshot())
+
     def test_reader_is_shared_and_final_release_stops_it(self):
         with mock.patch.object(self.routing.time, "time", return_value=NOW), \
                 mock.patch.object(self.routing, "fetch_feed", return_value=fixture()) as fetch:
@@ -257,6 +275,38 @@ class GateFixture(RoutingTestCase):
 
 
 class GateTest(GateFixture):
+    def test_new_listener_joins_current_cycle_without_dropping_audio(self):
+        generation = self.router.begin_cycle()
+        frame = b"\x01\x00" * 960
+        self.assertTrue(self.router.enqueue(frame, generation))
+        self.feed.data["pilots"][1].update(latitude=35.0, longitude=139.0)
+        self.delta(12, channel=7)
+        self.assertEqual(self.router.generation, generation)
+        self.assertGreater(self.mumble.sound_output.get_buffer_size(), 0)
+        self.assertTrue(self.router.enqueue(frame, generation))
+        self.send()
+        from pymumble_py3 import mumble_pb2
+        target = mumble_pb2.VoiceTarget()
+        target.ParseFromString(self.mumble.control_socket.messages[0][1])
+        self.assertEqual(list(target.targets[0].session), [11, 12])
+        self.assertEqual(self.mumble.control_socket.audio, [2])
+
+    def test_blocked_reasons_distinguish_feed_station_and_receivers(self):
+        self.feed.data = None
+        self.assertIsNone(self.router.begin_cycle())
+        self.assertEqual(self.router.blocked_reason, "feed_unavailable")
+        self.feed.data = fixture()
+        self.feed.data["atis"] = []
+        self.assertIsNone(self.router.begin_cycle())
+        self.assertEqual(self.router.blocked_reason, "station_unavailable")
+        self.feed.data = fixture()
+        self.feed.data["pilots"] = []
+        self.assertIsNotNone(self.router.begin_cycle())
+        self.assertEqual(self.router.blocked_reason, "no_receivers")
+        self.feed.data = fixture()
+        self.assertIsNotNone(self.router.begin_cycle())
+        self.assertIsNone(self.router.blocked_reason)
+
     def test_only_nonzero_whisper_and_registration_precedes_audio(self):
         self.assertTrue(self.router.enqueue(b"\x00" * 1920))
         self.send()
@@ -350,13 +400,14 @@ class GateTest(GateFixture):
         sender.join(2)
         self.assertEqual({thread for kind, body, thread in self.mumble.control_socket.messages}, {sender.ident})
 
-    def test_cycle_does_not_enqueue_tail_after_membership_changes(self):
+    def test_cycle_continues_after_membership_changes_with_old_tail_cleared(self):
         generation = self.router.begin_cycle()
         self.assertTrue(self.router.enqueue(b"\x00" * 1920, generation))
         self.delta(channel=8)
         self.delta(channel=7)
-        self.assertFalse(self.router.enqueue(b"\x00" * 1920, generation))
         self.assertEqual(self.mumble.sound_output.get_buffer_size(), 0)
+        self.assertEqual(self.router.generation, generation)
+        self.assertTrue(self.router.enqueue(b"\x00" * 1920, generation))
 
     def test_unrelated_membership_and_channel_churn_preserves_cycle(self):
         from pymumble_py3 import mumble_pb2
@@ -501,6 +552,7 @@ class DesktopConsumerTest(GateFixture):
         broadcaster.running = True
         broadcaster.stop_event = threading.Event()
         broadcaster.mumble = self.mumble
+        broadcaster.station = types.SimpleNamespace(letter="A")
         broadcaster._state = lambda *args: None
         broadcaster._channel_is_quiet = lambda: True
         return broadcaster
@@ -517,6 +569,51 @@ class DesktopConsumerTest(GateFixture):
         self.assertFalse(broadcaster._transmit(b"\x00" * 1920))
         self.send()
         self.assertEqual(self.mumble.control_socket.audio, [])
+
+    def test_desktop_first_listener_receives_middle_not_start(self):
+        broadcaster = self.broadcaster()
+        self.delta(channel=8)
+        frames = [bytes([value, 0]) * 960 for value in (1, 2, 3)]
+        waits = []
+
+        def tick(timeout):
+            waits.append(timeout)
+            if len(waits) == 1:
+                self.delta(channel=7)
+            self.send()
+            return False
+
+        with mock.patch.object(broadcaster.stop_event, "wait", side_effect=tick), \
+                mock.patch.object(self.mumble.sound_output.encoder, "encode",
+                                  wraps=self.mumble.sound_output.encoder.encode) as encode:
+            self.assertTrue(broadcaster._transmit(b"".join(frames)))
+        self.assertEqual([call.args[0] for call in encode.call_args_list], frames[1:])
+        self.assertEqual(len(waits), 3)
+        self.assertTrue(all(0 < timeout <= 0.061 for timeout in waits))
+
+    def test_desktop_empty_frequency_keeps_time_without_sending(self):
+        broadcaster = self.broadcaster()
+        self.delta(channel=8)
+        with mock.patch.object(broadcaster.stop_event, "wait", return_value=False) as wait:
+            self.assertTrue(broadcaster._transmit(b"\x00" * 1920 * 3))
+        self.assertEqual(wait.call_count, 3)
+        self.send()
+        self.assertEqual(self.mumble.control_socket.audio, [])
+
+    def test_desktop_empty_route_reports_why_once_and_recovers(self):
+        broadcaster = self.broadcaster()
+        broadcaster.station = types.SimpleNamespace(letter="A")
+        broadcaster._state = mock.Mock()
+        self.feed.data = None
+        for attempt in range(3):
+            self.assertFalse(broadcaster._transmit(b"\x00" * 1920))
+        broadcaster._state.assert_called_once()
+        self.assertIn("feed", self.router.blocked_reason)
+        self.feed.data = fixture()
+        with mock.patch.object(broadcaster.stop_event, "wait", side_effect=lambda timeout: self.send() or False):
+            self.assertTrue(broadcaster._transmit(b"\x00" * 1920))
+        self.assertEqual(broadcaster._state.call_count, 2)
+        self.assertEqual(self.mumble.control_socket.audio, [2])
 
     def test_desktop_quiet_detection_drains_but_ignores_distant_audio(self):
         import broadcast
