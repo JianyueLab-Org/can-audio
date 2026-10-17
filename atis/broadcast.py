@@ -94,6 +94,18 @@ class RejectAwareMumble(pymumble.Mumble):
                 self.reject_reason = reject.reason or ""
                 log.warning("the server rejected the connection: type=%s reason=%r",
                             self.reject_type, self.reject_reason)
+                try:
+                    peer = self.control_socket.getpeername()
+                except Exception:
+                    peer = None
+                log.warning("voice authentication rejected: host=%s port=%s peer=%r "
+                            "username=%s identity=station-v1",
+                            self.host, self.port, peer, self.user)
+                if self.reject_type == "WrongUserPW":
+                    log.warning("WrongUserPW does not identify the failing authentication "
+                                "layer; check this node's CAN authenticator registration, "
+                                "station-v1 username support and upstream result; "
+                                "no credential retry or legacy-username fallback will be attempted")
             except Exception as e:
                 log.warning("could not parse the Reject message: %s", e)
         return super().dispatch_control_message(type, message)

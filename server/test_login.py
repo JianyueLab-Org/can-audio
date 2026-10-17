@@ -250,6 +250,29 @@ class AuthenticateTest(UpstreamTestCase):
     def authenticate(self, name, password):
         return self.auth.authenticate(name, password, [], "", False)
 
+    def test_station_authentication_logs_the_path_without_credentials(self):
+        name = "1005_atis127000_ZBAA_ATIS"
+        secret = "secret-not-for-auth-logs"
+        for status, expected in ((200, login_module.VERIFY_OK),
+                                 (400, login_module.VERIFY_REJECTED),
+                                 (429, login_module.VERIFY_UNREACHABLE)):
+            with self.subTest(status=status):
+                upstream = self.upstream(Response(status, secret))
+                with self.assertLogs("auth", level="INFO") as captured:
+                    result = self.authenticate(name, secret)
+                output = "\n".join(captured.output)
+                for fragment in ("authentication request", name, "kind=atis",
+                                 "cid=1005", f"status={status}",
+                                 f"upstream={expected}", "elapsed_ms="):
+                    self.assertIn(fragment, output)
+                self.assertNotIn(secret, output)
+                self.assertEqual(json.loads(upstream.calls[0][1]["data"])["cid"],
+                                 "1005")
+                self.assertEqual(result[0],
+                                 login_module.user_id_for(name) if status == 200
+                                 else login_module.AUTH_FAILED if status == 400
+                                 else login_module.AUTH_TEMPORARY_FAILURE)
+
     def test_a_good_login_returns_the_cid_as_the_user_id(self):
         self.upstream(Response(200))
         self.assertEqual(self.authenticate("1000", "pw"), (1000, "1000", []))

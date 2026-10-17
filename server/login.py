@@ -11,6 +11,7 @@ import sys
 import os
 import signal
 import time
+import logging
 import Ice
 import requests
 import json
@@ -18,6 +19,8 @@ import traceback
 import re
 
 import serverconf
+
+log = logging.getLogger("auth")
 
 try:
     import MumbleServer as MumbleIce          # Mumble 1.5+
@@ -180,6 +183,7 @@ class AuthenticatorI(MumbleIce.ServerAuthenticator):
 
     def authenticate(self, name, pw, certificates, certhash, certstrong, current=None):
         try:
+            log.info("authentication request: server_id=%s username=%s", SERVER_ID, name)
             print(f"认证用户: {name}")
             # 名字既不是纯数字也不是通播格式的，只有 MURMUR_LOCAL_ACCOUNTS
             # 里那几个才**放行**给 Murmur 自己的账号库（SuperUser 要能登进来，
@@ -190,14 +194,20 @@ class AuthenticatorI(MumbleIce.ServerAuthenticator):
                 user_id = user_id_for(name)
             except ValueError:
                 if name in MURMUR_LOCAL_ACCOUNTS:
+                    log.info("authentication delegated to local account database: username=%s", name)
                     return (AUTH_FALLTHROUGH, "", [])
+                log.warning("authentication refused: username=%s reason=invalid_identity", name)
                 return (AUTH_FAILED, "", [])
+            log.info("authentication identity resolved: username=%s user_id=%s kind=%s",
+                     name, user_id, "atis" if is_atis_name(name) else "member")
             if is_atis_name(name):
                 print(f"匹配到ATIS登录: {name}")
                 result = login_ATIS(name, pw)
             else:
                 result = login(name, pw)
 
+            log.info("authentication result: username=%s user_id=%s upstream=%s",
+                     name, user_id, result)
             if result == VERIFY_OK:
                 self.kick_previous_session(name)
                 return (user_id, name, [])
@@ -306,6 +316,7 @@ def verify(cid, password):
 
     last_error = None
     for attempt in range(HTTP_RETRIES + 1):
+        started = time.monotonic()
         try:
             response = requests.post(url, headers=headers,
                                      data=json.dumps(data),
@@ -317,6 +328,9 @@ def verify(cid, password):
                 time.sleep(HTTP_RETRY_DELAY)
             continue
 
+        log.info("credential verification response: cid=%s endpoint=%s status=%s "
+                 "attempt=%s elapsed_ms=%.0f", cid, url, response.status_code,
+                 attempt + 1, (time.monotonic() - started) * 1000)
         if response.status_code == 200:
             print(f"登录成功: cid={cid}")
             return VERIFY_OK
@@ -421,6 +435,10 @@ def watch_connection(server, context, interval=None):
 def main():
     global _shutting_down, _communicator
     exit_code = 0
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)-7s %(name)-12s %(message)s")
+    log.info("CAN authenticator starting: identity=station-v1 ice_proxy=%s "
+             "server_id=%s upstream=%s", ICE_PROXY, SERVER_ID, url)
 
     # 注册信号处理（确保主线程处理）
     signal.signal(signal.SIGINT, signal_handler)
@@ -485,6 +503,7 @@ def main():
         try:
             server.setAuthenticator(auth_prx, context)
             print("认证器已设置")
+            log.info("CAN authenticator registered: server_id=%s identity=station-v1", SERVER_ID)
 
             server.addCallback(callback_prx, context)
             print("服务器回调已注册")
