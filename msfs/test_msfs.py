@@ -28,7 +28,37 @@ except Exception:
 
 import aimatch
 import altitude as altitude_module
+import recovery
 import simlink
+
+
+class FsdRecoveryStateTest(unittest.TestCase):
+    def test_simconnect_recovery_requests_fsd_restart_after_an_unexpected_stop(self):
+        state = recovery.FsdRecovery()
+        state.connect_requested()
+
+        self.assertFalse(state.on_sim_state(False, observer=False))
+        self.assertTrue(state.on_sim_state(True, observer=False))
+        self.assertFalse(state.on_sim_state(True, observer=False))
+        self.assertTrue(state.consume_recovery())
+        self.assertFalse(state.consume_recovery())
+
+    def test_manual_disconnect_cancels_pending_recovery(self):
+        state = recovery.FsdRecovery()
+        state.connect_requested()
+        state.on_sim_state(False, observer=False)
+        state.on_sim_state(True, observer=False)
+        state.manual_disconnect()
+
+        self.assertFalse(state.consume_recovery())
+        self.assertFalse(state.on_sim_state(True, observer=False))
+
+    def test_observer_mode_never_requests_fsd_recovery(self):
+        state = recovery.FsdRecovery()
+        state.connect_requested()
+        state.on_sim_state(False, observer=True)
+
+        self.assertFalse(state.on_sim_state(True, observer=True))
 
 
 class SquawkTest(unittest.TestCase):

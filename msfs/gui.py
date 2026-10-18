@@ -55,6 +55,7 @@ import i18n
 import micgain
 import observer
 import ptt
+import recovery
 import theme
 import traffic as traffic_module
 import update
@@ -154,6 +155,7 @@ class MsfsWindow(QMainWindow):
         self.sim = simlink.SimLink(on_state=self.signals.sim_state.emit)
         self.fsd = None
         self.voice = None
+        self.fsd_recovery = recovery.FsdRecovery()
         self.snapshot = None
 
         # 他机：FSD 线程往表里写，注入循环每一帧把它积分到此刻、写进模拟器
@@ -479,25 +481,8 @@ class MsfsWindow(QMainWindow):
         # 观察员**永远不连 FSD**：网络上只能有机长那一架飞机。这里不看
         # connect_fsd，那个开关管的是普通连接。
         if self.settings.connect_fsd and not watching:
-            pilot = fsdpilot.FSDPilot(
-                host=self.settings.fsd_host, port=self.settings.fsd_port,
-                callsign=callsign, cid=cid, password=password,
-                real_name=self.settings.real_name or cid,
-                rating=self.settings.rating,
-                aircraft=self.settings.aircraft,
-                on_text=self.signals.text_message.emit,
-                on_controllers=self.signals.controllers.emit,
-                traffic=self.traffic)
-            pilot.on_status = lambda state, message, pilot=pilot: \
-                self.signals.fsd_status.emit(state, message, pilot)
-            pilot.on_text = lambda sender, recipient, message, pilot=pilot: \
-                self.signals.text_message.emit(sender, recipient, message) \
-                if pilot is self.fsd else None
-            pilot.on_controllers = lambda controllers, pilot=pilot: \
-                self.signals.controllers.emit(controllers) \
-                if pilot is self.fsd else None
-            self.fsd = pilot
-            self.fsd.start()
+            self.fsd_recovery.connect_requested()
+            self._start_fsd(callsign, cid, password)
 
         # 观察员只有语音这一条链路，connect_voice 关着也要连——否则点了"连接"
         # 之后什么都不会发生，界面上却写着已连接。
@@ -533,7 +518,27 @@ class MsfsWindow(QMainWindow):
             if self._sync_frequency() is None:
                 self.add_message(t("msg.observer_no_frequency"), theme.MUTED_COLOR)
 
+    def _start_fsd(self, callsign=None, cid=None, password=None):
+        """Start FSD without disturbing the voice or simulator links."""
+        callsign = callsign or self.settings.callsign
+        cid = cid or self.settings.cid
+        password = password if password is not None else self.settings.password
+        if self.fsd:
+            self.fsd.stop()
+        self.fsd = fsdpilot.FSDPilot(
+            host=self.settings.fsd_host, port=self.settings.fsd_port,
+            callsign=callsign, cid=cid, password=password,
+            real_name=self.settings.real_name or cid,
+            rating=self.settings.rating,
+            aircraft=self.settings.aircraft,
+            on_status=self.signals.fsd_status.emit,
+            on_text=self.signals.text_message.emit,
+            on_controllers=self.signals.controllers.emit,
+            traffic=self.traffic)
+        self.fsd.start()
+
     def disconnect_all(self):
+        self.fsd_recovery.manual_disconnect()
         self.ptt_watcher.stop()
         if self.fsd:
             self.fsd.stop()
@@ -563,7 +568,18 @@ class MsfsWindow(QMainWindow):
     # ---------- 定时 ----------
     def tick(self):
         """每 0.5 秒：把模拟器的数据分发到 FSD 和语音。"""
+        # FSDPilot keeps its public running flag for its reconnect loop. A first
+        # connection failure can end that worker without clearing the flag, so
+        # use the worker thread as the liveness source before recovery.
+        if (self.fsd and self.fsd.thread
+                and not self.fsd.thread.is_alive()):
+            log.warning("FSD worker exited; waiting for a fresh simulator snapshot")
+            self.fsd = None
+
         snapshot = self.sim.snapshot()
+        if self.fsd_recovery.consume_recovery() and not self.fsd:
+            self._start_fsd()
+            log.info("restarting FSD after SimConnect recovered")
         if snapshot:
             self.snapshot = snapshot
 
@@ -829,23 +845,24 @@ class MsfsWindow(QMainWindow):
 
     # ---------- 槽 ----------
     def on_sim_state(self, connected, message):
+        if self.fsd_recovery.on_sim_state(
+                connected, observer=self.observer_mode()):
+            log.info("SimConnect recovered; FSD restart is pending")
         self.sim_label.setText(t("sim.connected") if connected else t("sim.waiting"))
         self.sim_label.setStyleSheet(
             f"color: {theme.ON_COLOR if connected else theme.IDLE_COLOR};")
         self.add_message(t("msg.sim", message=message),
                          theme.ON_COLOR if connected else theme.ACTIVE_COLOR)
         if not connected:
+            # SimConnect and FSD are independent links. Keep FSD alive while the
+            # simulator reconnects so a healthy FSD session keeps receiving the
+            # latest snapshot, and a dead worker can be replaced on recovery.
             self.snapshot = None
-            fsd = self.fsd
-            self.fsd = None
-            if fsd:
-                fsd.stop()
-                self.ident_button.setEnabled(False)
-                self.controller_list.clear()
-                self.fsd_label.setText(t("net.disconnected"))
-                self.add_message(t("msg.sim_gone_fsd"), theme.ACTIVE_COLOR)
+            self.ident_button.setEnabled(False)
+            self.fsd_label.setText(t("net.disconnected"))
+            self.add_message(t("msg.sim_gone_fsd"), theme.ACTIVE_COLOR)
             self.connect_button.setText(
-                t("connect.disconnect") if self.voice else t("connect.connect"))
+                t("connect.disconnect") if self.voice or self.fsd else t("connect.connect"))
 
     def on_fsd_status(self, state, message, source=None):
         if source is not None and source is not self.fsd:
@@ -873,10 +890,12 @@ class MsfsWindow(QMainWindow):
             return
 
         if state == 'error':
-            # 首次登录失败这类不重试的错误。语音不受影响——两条链路互不依赖。
-            self.fsd = None
+            # 首次登录失败这类不重试的错误。保留连接意图，便于 SimConnect
+            # 恢复时重新建立 FSD；语音不受影响，两条链路互不依赖。
+            if self.fsd and not self.fsd.running:
+                self.fsd = None
             self.connect_button.setText(
-                t("connect.disconnect") if self.voice else t("connect.connect"))
+                t("connect.disconnect") if self.voice or self.fsd else t("connect.connect"))
 
     def on_voice_status(self, state, message, source=None):
         if source is not None and source is not self.voice:
