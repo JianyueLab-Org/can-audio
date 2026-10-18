@@ -194,6 +194,25 @@ class OnDutyTest(unittest.TestCase):
         self.stack.select(128500)
         self.assertEqual(self.stack.selected_khz, 121700)
 
+    def test_checked_duty_state_with_no_valid_frequency_has_no_primary(self):
+        self.stack.set_locked(set())
+        self.assertIsNone(self.stack.selected_khz)
+        self.stack.add("128.500")
+        self.assertIsNone(self.stack.selected_khz)
+        self.stack.select(128500)
+        self.assertIsNone(self.stack.selected_khz)
+
+    def test_manual_tx_off_is_remembered_for_duty_adoption(self):
+        radio = self.stack.get(118000)
+        self.stack.set_tx(118000, True)
+        self.stack.set_tx(118000, False)
+        self.assertTrue(radio.tx_manually_disabled)
+
+    def test_datafeed_shutdown_does_not_mark_tx_as_manual(self):
+        self.stack.set_tx(118000, True)
+        self.stack.set_transmit_allowed(False)
+        self.assertFalse(self.stack.get(118000).tx_manually_disabled)
+
     def test_the_locked_frequency_cannot_be_removed(self):
         self.stack.set_locked(118000)
         self.assertFalse(self.stack.remove(118000))
@@ -210,6 +229,7 @@ class OnDutyTest(unittest.TestCase):
         self.assertFalse(self.stack.is_locked(118000))
         self.assertTrue(self.stack.transmit_allowed,
                         "默认放行——没连数据源时不该把人锁死")
+        self.assertFalse(self.stack._duty_checked)
 
     def test_multiple_locked_frequencies_are_protected(self):
         self.stack.set_locked({118000, 121700})

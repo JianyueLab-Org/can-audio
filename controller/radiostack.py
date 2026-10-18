@@ -57,6 +57,7 @@ class Radio:
         self.xc = xc
         self.volume = volume            # 0-100，和主音量相乘
         self.muted = muted
+        self.tx_manually_disabled = False
 
         # 运行时状态，不持久化
         self.currently_rx = False
@@ -118,6 +119,7 @@ class RadioStack:
         self.transmit_allowed = True
         # 数据源上本人正在管的频率集合。它们不许删，也只有这些频率能作为主频率。
         self.locked_khz = set()
+        self._duty_checked = False
 
     # ---------- 查询 ----------
     def __iter__(self):
@@ -157,7 +159,7 @@ class RadioStack:
         radio = Radio(khz, callsign.strip().upper())
         self._radios.append(radio)
         self._radios.sort(key=lambda r: r.frequency_khz)
-        if self.selected_khz is None:
+        if self.selected_khz is None and not self._duty_checked:
             self.selected_khz = khz
         self._changed()
         return radio
@@ -183,20 +185,27 @@ class RadioStack:
         return changed
 
     def set_locked(self, khz):
-        """设置本人正在管的频率集合；None 表示解除全部值守锁。"""
+        """设置本人正在管的频率集合；None 表示尚未完成值守检查。"""
         if khz is None:
             locked = set()
+            duty_checked = False
         elif isinstance(khz, int):
             locked = {khz}
+            duty_checked = True
         else:
             locked = {int(value) for value in khz}
-        if locked == self.locked_khz:
+            duty_checked = True
+
+        if locked == self.locked_khz and duty_checked == self._duty_checked:
             return False
         self.locked_khz = locked
-        if locked and self.selected_khz not in locked:
+        self._duty_checked = duty_checked
+        if duty_checked and not locked:
+            self.selected_khz = None
+        elif locked and self.selected_khz not in locked:
             self.selected_khz = next(
                 (value for value in sorted(locked) if self.get(value)),
-                self.selected_khz,
+                None,
             )
         self._changed()
         return True
@@ -250,6 +259,7 @@ class RadioStack:
             log.info("not staffing a position on the datafeed, refusing to turn TX on")
             return radio
         radio.tx = value
+        radio.tx_manually_disabled = not value
         if value:
             radio.rx = True          # 不存在只发不收
         else:
@@ -285,8 +295,9 @@ class RadioStack:
         return self.set_xc(khz, not radio.xc) if radio else None
 
     def select(self, khz):
-        """选主频率；有值守席位时只能选择本人正在管的频率。"""
-        if self.get(khz) and (not self.locked_khz or self.is_locked(khz)):
+        """选主频率；完成值守检查后只能选择本人正在管的频率。"""
+        if (self.get(khz)
+                and (not self._duty_checked or self.is_locked(khz))):
             self.selected_khz = khz
             self._changed()
 

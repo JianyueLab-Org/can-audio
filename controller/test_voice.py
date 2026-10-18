@@ -1188,7 +1188,7 @@ class PrimaryChannelSelectionTest(unittest.TestCase):
             radio.rx = True
             radio.tx = True
         self.stack.select(126750)       # 手动选中的不是本人席位
-        self.stack.locked_khz = {118000, 121700}
+        self.stack.set_locked({118000, 121700})
 
     def tearDown(self):
         voice.CHANNEL_TIMEOUT = self._timeout
@@ -1234,7 +1234,7 @@ class PrimaryChannelFallbackTest(unittest.TestCase):
             radio.rx = True
             radio.tx = True
         self.stack.select(118000)          # 手动加的那个当上了主频率
-        self.stack.locked_khz = {118350}    # 数据源上正在值守的是 118.350
+        self.stack.set_locked({118350})  # 数据源上正在值守的是 118.350
 
     def tearDown(self):
         voice.CHANNEL_TIMEOUT = self._timeout

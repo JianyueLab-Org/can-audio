@@ -272,6 +272,18 @@ def main():
         window.stack.set_tx(125900, True)      # 复原，后面的用例还要用
     check("手动关掉的 TX 不会被刷回来", a_manual_tx_off_is_not_undone)
 
+    def invalid_position_is_receive_only():
+        window.on_datafeed(feed(controllers=[{
+            "cid": "1000", "callsign": "ZSPD_INVALID",
+            "frequency": "199.998", "facility": 5}]))
+        assert not window.stack.transmit_allowed
+        assert not window.stack.locked_khz
+        window.stack.set_tx(125900, True)
+        assert not window.stack.get(125900).tx
+        window.stack.set_locked({125900})
+        window.stack.set_transmit_allowed(True)
+    check("无有效频率的席位只收不发", invalid_position_is_receive_only)
+
     def does_not_add_it_twice():
         before = len(window.stack)
         window.on_datafeed(feed(controllers=[{

@@ -970,10 +970,14 @@ class ControllerWindow(QMainWindow):
             for khz in (datafeed.frequency_khz(entry),)
             if khz is not None
         }
-        dropped = self.stack.set_transmit_allowed(bool(entries))
+        duty_entries = [
+            entry for entry in entries
+            if datafeed.frequency_khz(entry) is not None
+        ]
+        dropped = self.stack.set_transmit_allowed(bool(duty_frequencies))
         self.stack.set_locked(duty_frequencies)
 
-        if not entries:
+        if not duty_entries:
             self.duty_label.setStyleSheet(f"color: {IDLE_COLOR};")
             self.duty_label.setText(t("duty.observer"))
             if dropped:
@@ -983,7 +987,7 @@ class ControllerWindow(QMainWindow):
                 self.status_label.setText(t("duty.tx_dropped"))
         else:
             callsigns = ", ".join(
-                str(entry.get("callsign", "")).strip() for entry in entries)
+                str(entry.get("callsign", "")).strip() for entry in duty_entries)
             self.duty_label.setStyleSheet(f"color: {ON_COLOR};")
             self.duty_label.setText(t("duty.on", callsign=callsigns))
 
@@ -996,7 +1000,14 @@ class ControllerWindow(QMainWindow):
             if khz is None or khz in self._user_removed:
                 continue
             callsign = str(entry.get("callsign", "")).strip()
-            if self.stack.get(khz):
+            radio = self.stack.get(khz)
+            if radio:
+                radio.callsign = callsign.upper()
+                if not radio.rx:
+                    radio.rx = True
+                if not radio.tx_manually_disabled:
+                    self.stack.set_tx(khz, True)
+                adopted.append((khz, callsign))
                 continue
             try:
                 self.stack.add(khz, callsign)
