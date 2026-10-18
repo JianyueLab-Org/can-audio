@@ -248,6 +248,20 @@ def main():
         assert window.stack.selected_khz == 125900, "自己的席位频率不是主频率"
     check("自己的频率默认 RX+TX", my_own_frequency_defaults_to_rx_and_tx)
 
+    def adopts_multiple_position_frequencies():
+        window.on_datafeed(feed(controllers=[
+            {"cid": "1000", "callsign": "ZSPD_TWR",
+             "frequency": "118.000", "facility": 5},
+            {"cid": "1000", "callsign": "ZSPD_APP",
+             "frequency": "121.700", "facility": 5},
+        ]))
+        for khz in (118000, 121700):
+            radio = window.stack.get(khz)
+            assert radio is not None, khz
+            assert radio.rx and radio.tx, khz
+        assert window.stack.selected_khz in {118000, 121700}
+    check("多个席位频率都自动加入", adopts_multiple_position_frequencies)
+
     def a_manual_tx_off_is_not_undone():
         """管制员自己把 TX 关掉之后，下一轮刷新不该又给他打开。"""
         window.stack.set_tx(125900, False)
@@ -257,6 +271,18 @@ def main():
         assert not window.stack.get(125900).tx, "刷新之后 TX 又被打开了"
         window.stack.set_tx(125900, True)      # 复原，后面的用例还要用
     check("手动关掉的 TX 不会被刷回来", a_manual_tx_off_is_not_undone)
+
+    def invalid_position_is_receive_only():
+        window.on_datafeed(feed(controllers=[{
+            "cid": "1000", "callsign": "ZSPD_INVALID",
+            "frequency": "199.998", "facility": 5}]))
+        assert not window.stack.transmit_allowed
+        assert not window.stack.locked_khz
+        window.stack.set_tx(125900, True)
+        assert not window.stack.get(125900).tx
+        window.stack.set_locked({125900})
+        window.stack.set_transmit_allowed(True)
+    check("无有效频率的席位只收不发", invalid_position_is_receive_only)
 
     def does_not_add_it_twice():
         before = len(window.stack)

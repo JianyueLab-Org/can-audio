@@ -1168,6 +1168,43 @@ class ReconnectLimitTest(unittest.TestCase):
         self.assertEqual([s for s, _ in states], [])
 
 
+class PrimaryChannelSelectionTest(unittest.TestCase):
+    """主频道只能从当前值守的多个席位中选择。"""
+
+    def setUp(self):
+        self._timeout = voice.CHANNEL_TIMEOUT
+        voice.CHANNEL_TIMEOUT = 0.3
+        self.client = VoiceClient("host", "1000", "pw")
+        self.server = FakeServer(latency=0.02)
+        self.server.strict_moves = True
+        self.client.mumble = self.server
+        self.client.connected = True
+        self.client.running = True
+
+        self.stack = radiostack.RadioStack()
+        for khz in (118000, 121700, 126750):
+            self.stack.add(khz)
+            radio = self.stack.get(khz)
+            radio.rx = True
+            radio.tx = True
+        self.stack.select(126750)       # 手动选中的不是本人席位
+        self.stack.set_locked({118000, 121700})
+
+    def tearDown(self):
+        voice.CHANNEL_TIMEOUT = self._timeout
+
+    def test_non_staffed_selection_is_not_joined_as_primary(self):
+        self.client.sync(self.stack)
+        primary = self.server.my_channel
+        allowed = {
+            self.server.by_name["FREQ_118000"]["channel_id"],
+            self.server.by_name["FREQ_121700"]["channel_id"],
+        }
+        self.assertIn(primary, allowed)
+        self.assertNotEqual(primary,
+                            self.server.by_name["FREQ_126750"]["channel_id"])
+
+
 class PrimaryChannelFallbackTest(unittest.TestCase):
     """选中的主频率进不去时，要退到正在值守的席位频率。
 
@@ -1197,7 +1234,7 @@ class PrimaryChannelFallbackTest(unittest.TestCase):
             radio.rx = True
             radio.tx = True
         self.stack.select(118000)          # 手动加的那个当上了主频率
-        self.stack.locked_khz = 118350     # 数据源上正在值守的是 118.350
+        self.stack.set_locked({118350})  # 数据源上正在值守的是 118.350
 
     def tearDown(self):
         voice.CHANNEL_TIMEOUT = self._timeout

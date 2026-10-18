@@ -76,6 +76,16 @@ class OnlinePositionsTest(unittest.TestCase):
 
 class ControllerLookupTest(unittest.TestCase):
 
+    def test_finds_all_my_positions(self):
+        data = feed(controllers=[
+            controller(1000, "ZSPD_TWR", "118.000"),
+            controller(1000, "ZSPD_APP", "121.700"),
+            controller(1001, "ZBAA_APP", "126.750"),
+        ])
+        positions = datafeed.controllers_for("1000", data)
+        self.assertEqual([entry["callsign"] for entry in positions],
+                         ["ZSPD_TWR", "ZSPD_APP"])
+
     def test_finds_my_position(self):
         data = feed(controllers=[controller(1000, "ZSPD_TWR", "118.000")])
         entry = datafeed.controller_for("1000", data)
