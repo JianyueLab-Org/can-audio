@@ -17,6 +17,8 @@ import types
 import unittest
 from unittest import mock
 
+import numpy as np
+
 for _name in ("opuslib", "opuslib.api", "opuslib.api.decoder",
               "opuslib.api.encoder", "opuslib.api.info", "opuslib.exceptions"):
     sys.modules.setdefault(_name, mock.MagicMock())
@@ -163,6 +165,26 @@ class CrossCoupleDuringPttTest(unittest.TestCase):
 
 class TransmitThreadTest(unittest.TestCase):
 
+    def test_ptt_summary_reports_microphone_and_queue_progress(self):
+        client = make_client()
+        client._tx_channels = [11]
+        client.input_stream = mock.Mock()
+        client.input_stream.read.return_value = b"\x01" * 1920
+
+        with self.assertLogs("voice", level="INFO") as captured:
+            client.start_transmit()
+            deadline = time.monotonic() + 2
+            while not client.mumble.sound_output.sent and time.monotonic() < deadline:
+                time.sleep(0.01)
+            client.stop_transmit()
+            client._tx_thread.join(timeout=2)
+
+        self.assertFalse(client._tx_thread.is_alive())
+        self.assertTrue(client.mumble.sound_output.sent)
+        summary = next(line for line in captured.output if "PTT ended" in line)
+        self.assertRegex(summary, r"mic reads [1-9]\d*, non-silent [1-9]\d*, ")
+        self.assertRegex(summary, r"queued [1-9]\d*, skipped offline 0, errors 0")
+
     def test_rapid_ptt_does_not_start_two_threads(self):
         client = make_client()
         client._tx_channels = [11]
@@ -187,7 +209,80 @@ class TransmitThreadTest(unittest.TestCase):
         self.assertFalse(client.transmitting, "没有 TX 频率时不该开始发话")
 
 
+class HalvingDenoiser:
+    def __init__(self, rate):
+        self.rate = rate
+        self.active = True
+        self.frames = 0
+
+    def process(self, samples):
+        self.frames += 1
+        return (np.asarray(samples, dtype=np.int16) // 2).astype(np.int16)
+
+    def close(self):
+        self.active = False
+
+
+class MicProcessingTest(unittest.TestCase):
+    """发送前的麦克风处理：降噪 → 基准 × 乘数 → 限幅器，不回绕。"""
+
+    def client(self, denoise=False):
+        client = make_client()
+        client._denoiser_factory = HalvingDenoiser
+        client.set_mic_denoise(denoise)
+        return client
+
+    def test_baseline_and_multiplier_multiply(self):
+        client = self.client()
+        client.set_mic_baseline(6.0206)          # ×2
+        client.set_mic_volume(150)               # ×1.5
+        out = client._process_mic(np.full(960, 1000, np.int16).tobytes())
+        self.assertTrue(np.all(np.abs(out.astype(np.int32) - 3000) <= 1))
+
+    def test_denoise_runs_before_the_gain(self):
+        client = self.client(denoise=True)
+        client.set_mic_baseline(6.0206)          # ×2
+        out = client._process_mic(np.full(960, 1000, np.int16).tobytes())
+        self.assertTrue(np.all(np.abs(out.astype(np.int32) - 1000) <= 1))
+
+    def test_denoise_off_skips_the_denoiser(self):
+        client = self.client(denoise=False)
+        out = client._process_mic(np.full(960, 1000, np.int16).tobytes())
+        self.assertTrue(np.all(out == 1000))
+
+    def test_loud_input_never_wraps(self):
+        client = self.client()
+        client.set_mic_volume(200)
+        out = client._process_mic(np.full(960, 30000, np.int16).tobytes())
+        self.assertTrue(np.all(out > 0), "int16 回绕会变成负数")
+
+    def test_baseline_is_clamped(self):
+        client = self.client()
+        client.set_mic_baseline(40)
+        self.assertEqual(client.mic_baseline_db, 20.0)
+        client.set_mic_baseline(-40)
+        self.assertEqual(client.mic_baseline_db, -12.0)
+
+
 class RxIndicatorTest(unittest.TestCase):
+
+    def test_atis_is_played_but_never_cross_coupled(self):
+        client = make_client()
+        class Users(dict):
+            myself = {"name": "1000", "channel_id": 7}
+        client.mumble.users = Users()
+        client.mumble.channels = {7: {"name": "FREQ_118000"}}
+        client._channel_to_khz = {7: 118000}
+        client._channel_ids = {118000: 7}
+        client._xc_targets = {7: 3}
+        client.output_stream = mock.MagicMock()
+        pcm = np.array([10, 20], dtype=np.int16).tobytes()
+        for name in ("900_atis118000", "900_atis118000_RJTT_ATIS"):
+            client._on_sound({"name": name, "channel_id": 7}, types.SimpleNamespace(pcm=pcm))
+        self.assertEqual(client.output_stream.write.call_count, 2)
+        self.assertEqual(client.mumble.sound_output.sent, [])
+        client._on_sound({"name": "1001", "channel_id": 7}, types.SimpleNamespace(pcm=pcm))
+        self.assertEqual(len(client.mumble.sound_output.sent), 1)
 
     def test_continuous_audio_never_reports_rx_end(self):
         """有人一直在讲话时，监控线程不该报 RX 结束——那会让指示灯闪。"""

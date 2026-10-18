@@ -69,6 +69,16 @@ DEFAULT_UPDATE_URL = "https://ceruleanavi.net/api/v1/clients/latest"
 _USER_AGENT = "Mozilla/5.0 (compatible; CanClient/1.0)"
 
 
+def is_safe_url(value):
+    """Return whether an update link is an absolute HTTPS URL without userinfo."""
+    try:
+        parsed = urllib.parse.urlsplit(str(value or "").strip())
+    except ValueError:
+        return False
+    return (parsed.scheme.lower() == "https" and bool(parsed.netloc)
+            and parsed.username is None and parsed.password is None)
+
+
 class Update:
     """一个可用的新版本。"""
 

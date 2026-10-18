@@ -123,6 +123,9 @@ class NoHardcodedUiStringTest(unittest.TestCase):
         """xplane.py 的 _state 消息经 on_sim_state 直接进消息区。"""
         self.assertEqual(self.offenders("xplane.py"), [])
 
+    def test_calibration_dialog_has_no_hardcoded_chinese(self):
+        self.assertEqual(self.offenders("calibration.py"), [])
+
 
 class LookupTest(unittest.TestCase):
 

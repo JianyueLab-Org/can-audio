@@ -19,6 +19,7 @@ import threading
 import time
 import types
 import unittest
+from unittest.mock import patch
 
 
 def _stub(name, **attrs):
@@ -36,6 +37,22 @@ _stub("tabulate", tabulate=lambda *a, **k: "")
 _stub("edge_tts", Communicate=object)
 
 import mumble as mumble_module
+
+
+class StationIdentityTest(unittest.TestCase):
+    def test_same_frequency_airports_have_distinct_login_names(self):
+        with patch.object(mumble_module.serverconf, "atis_account", return_value="1005"), \
+                patch.object(mumble_module.serverconf, "atis_password", return_value="secret"), \
+                patch.object(mumble_module.process, "process_single_atis_text", side_effect=lambda text, **kw: text):
+            stations = [mumble_module.ATISBroadcaster(callsign, "128.800", "test")
+                        for callsign in ("RJTT_ATIS", "RJOO_ATIS")]
+        try:
+            self.assertEqual([s.user for s in stations],
+                             ["1005_atis128800_RJTT_ATIS", "1005_atis128800_RJOO_ATIS"])
+            self.assertEqual([s.channel_name for s in stations], ["FREQ_128800"] * 2)
+        finally:
+            for station in stations:
+                station.loop.close()
 
 
 class FakeChannels:

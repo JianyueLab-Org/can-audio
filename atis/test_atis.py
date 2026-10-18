@@ -137,6 +137,13 @@ class PresetClosingAndChineseExtraTest(unittest.TestCase):
         self.assertEqual(pr.closing, "")
         self.assertEqual(pr.chinese_extra, "")
 
+    def test_manual_text_survives_a_round_trip(self):
+        pr = Preset(manual_text=True, manual_atis="文字稿", manual_voice="语音稿")
+        back = Preset.from_dict(pr.to_dict())
+        self.assertTrue(back.manual_text)
+        self.assertEqual(back.manual_atis, "文字稿")
+        self.assertEqual(back.manual_voice, "语音稿")
+
 
 class SpokenFacilityAndClosingTest(unittest.TestCase):
 
@@ -906,6 +913,29 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(self.module.Settings().fsd_host, "fsd.ceruleanavi.net")
         self.assertEqual(self.module.Settings().fsd_port, 6809)
 
+    def test_default_voice_host(self):
+        self.assertEqual(self.module.Settings().mumble_host,
+                         "audio.ceruleanavi.net")
+
+    def test_missing_or_blank_voice_host_uses_default(self):
+        for data in ({"cid": "1000"}, {"mumble_host": ""},
+                     {"mumble_host": "   "}, {"mumble_host": None}):
+            with self.subTest(data=data):
+                self.write(data)
+                self.assertEqual(self.module.Settings().mumble_host,
+                                 self.module.DEFAULT_MUMBLE_HOST)
+
+    def test_custom_voice_host_survives_a_round_trip(self):
+        for host in ("voice.example.net", "127.0.0.1", "::1"):
+            with self.subTest(host=host):
+                self.write({"mumble_host": f"  {host}  ",
+                            "fsd_host": "fsd.example.net"})
+                settings = self.module.Settings()
+                self.assertEqual(settings.mumble_host, host)
+                self.assertEqual(settings.fsd_host, "fsd.example.net")
+                settings.save_settings()
+                self.assertEqual(self.module.Settings().mumble_host, host)
+
     def test_migrates_the_voice_host_away(self):
         # 早期版本把语音服务器的地址填成了 FSD 地址，那台机器上没有 FSD。
         # 语音服务器换过两次域名，三个都得认：前两个还留在老配置里，最后
@@ -1634,31 +1664,28 @@ class BroadcastRulesTest(unittest.TestCase):
         self.assertIsNotNone(self.refuse())
 
     # ---------- 频率冲突 ----------
-    def test_same_frequency_is_refused(self):
-        """语音账号是 {cid}_atis{频率}，同频率再开一个会把先连上的踢掉。"""
+    def test_same_frequency_distinct_airports_can_broadcast(self):
         twin = Station("ZSSS", "虹桥", "127.850")     # 同频率，不同机场
         self.profile.add(twin)
-        title, message = self.refuse(broadcasting={twin.callsign})
-        self.assertEqual(title, "频率冲突")
-        self.assertIn(twin.callsign, message)
-        self.assertIn("踢掉", message)
+        self.assertIsNone(self.refuse(broadcasting={twin.callsign}))
 
     def test_a_different_frequency_is_fine(self):
         other = Station("ZSSS", "虹桥", "132.250")
         self.profile.add(other)
         self.assertIsNone(self.refuse(broadcasting={other.callsign}))
 
-    def test_itself_is_not_a_conflict(self):
-        """自己已经在播的话，调用方走的是停播那条路，不该报冲突。"""
-        self.assertIsNone(rules.frequency_conflict(
-            self.pudong, self.profile, {self.pudong.callsign}))
+    def test_duplicate_callsigns_are_still_refused(self):
+        with self.assertRaises(ValueError):
+            self.profile.add(Station("ZSPD", "Duplicate", "128.800"))
 
-    def test_conflict_names_the_other_station(self):
-        twin = Station("ZSSS", "虹桥", "127.850")
-        self.profile.add(twin)
-        found = rules.frequency_conflict(self.pudong, self.profile,
-                                         {twin.callsign})
-        self.assertIs(found, twin)
+    def test_same_frequency_broadcasters_use_distinct_usernames(self):
+        broadcast = _load_broadcast()
+        with mock.patch.object(broadcast, "Synthesizer"):
+            tokyo = broadcast.Broadcaster("host", "1000", "pw", Station("RJTT", "Tokyo", "128.800"))
+            osaka = broadcast.Broadcaster("host", "1000", "pw", Station("RJOO", "Osaka", "128.800"))
+        self.assertEqual(tokyo.user, "1000_atis128800_RJTT_ATIS")
+        self.assertEqual(osaka.user, "1000_atis128800_RJOO_ATIS")
+        self.assertNotEqual(tokyo.user, osaka.user)
 
     def test_credentials_are_checked_before_the_conflict(self):
         """先报最好改的那一条：没填账号时不该先弹频率冲突。"""
@@ -1697,6 +1724,13 @@ class ScriptTest(unittest.TestCase):
         self.assertIsNone(script.render(station, self.preset, None))
         self.assertIsNone(script.render(station, None, self.metar))
         self.assertIsNone(script.render(None, self.preset, self.metar))
+
+    def test_manual_text_does_not_need_weather_or_template(self):
+        station = self.station()
+        preset = Preset(manual_text=True, manual_atis="人工文字稿",
+                        manual_voice="人工语音稿", template="[UNKNOWN]")
+        self.assertEqual(script.render(station, preset, None),
+                         ("人工文字稿", "人工语音稿"))
 
     def test_text_keeps_the_raw_groups(self):
         text, _ = script.render(self.station(), self.preset, self.metar)
@@ -2441,7 +2475,7 @@ class WeatherRetryTest(unittest.TestCase):
             def __exit__(self, *exc):
                 return False
 
-        def fake(request, timeout=None):
+        def fake(request, timeout=None, context=None):
             self.calls.append(request.full_url)
             outcome = outcomes[min(len(self.calls) - 1, len(outcomes) - 1)]
             if isinstance(outcome, Exception):
@@ -2514,6 +2548,29 @@ class RejectIsNotACrashTest(unittest.TestCase):
     释放了 ready_lock，异常剩下的唯一作用就是终止线程，而 run() 正常返回同样
     终止线程。
     """
+
+    def test_rejection_logs_the_node_and_identity_without_the_password(self):
+        from unittest import mock
+        broadcast = _load_broadcast()
+        client = broadcast.RejectAwareMumble.__new__(broadcast.RejectAwareMumble)
+        client.host = "hz.cn.audio.ceruleanavi.net"
+        client.port = 64738
+        client.user = "1005_atis127000_ZBAA_ATIS"
+        client.password = "secret-not-for-logs"
+        client.control_socket = mock.Mock()
+        client.control_socket.getpeername.return_value = ("192.0.2.10", 64738)
+        reject = broadcast.mumble_pb2.Reject()
+        reject.type = broadcast.mumble_pb2.Reject.WrongUserPW
+        reject.reason = "Wrong certificate or password for existing user"
+        with mock.patch.object(broadcast.pymumble.Mumble, "dispatch_control_message"), \
+                self.assertLogs("atis", level="WARNING") as captured:
+            client.dispatch_control_message(broadcast.PYMUMBLE_MSG_TYPES_REJECT,
+                                            reject.SerializeToString())
+        output = "\n".join(captured.output)
+        for expected in (client.host, client.user, "192.0.2.10", "station-v1",
+                         "authenticator registration"):
+            self.assertIn(expected, output)
+        self.assertNotIn(client.password, output)
 
     def test_rejection_does_not_reach_the_thread_excepthook(self):
         from unittest import mock

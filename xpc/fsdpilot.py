@@ -6,6 +6,9 @@
     登录   $ID{呼号}:SERVER:{客户端ID}:{客户端名}:{主}:{次}:{CID}:{机器码}
            #AP{呼号}:SERVER:{CID}:{密码}:{等级}:{协议版本}:{模拟器}:{真实姓名}
     位置   @{应答机模式}:{呼号}:{squawk}:{等级}:{纬度}:{经度}:{高度}:{地速}:{PBH}:{气压差}
+    快速   ^{呼号}:{纬度}:{经度}:{真高}:{离地高}:{PBH}:{东}:{上}:{北}:{俯仰率}:{航向率}
+           :{坡度率}:{前轮角}      —— $SF 打开时 5 Hz。#SL 字段相同，5 秒一个；
+           #ST 没有六个速度段，停着的时候发
     计划   $FP{呼号}:SERVER:{规则}:{机型}:{真空速}:{起飞地}:{预计起飞}:{实际起飞}
            :{巡航高度}:{目的地}:{航路小时}:{航路分钟}:{燃油小时}:{燃油分钟}
            :{备降场}:{备注}:{航路}          —— 一共 17 段，少一段整包被拒
@@ -22,27 +25,63 @@ $ID 的第 9 个字段（challenge）留空，服务端就不会发起 VATSIM �
 
 import json
 import logging
+import math
 import socket
 import threading
 import time
 
 # _status() 的消息会直接进消息区，是界面文字，所以要过 i18n。日志那一半仍然
 # 是英文——分界线在"这句话最后到哪儿去"，不在它写在哪个模块里。
+from altitude import adjust_incoming_altitude
 from i18n import t
 
 log = logging.getLogger("fsd")
 
 DEFAULT_PORT = 6809
-PROTO_REVISION = 100          # ProtoRevisionClassic
+# ProtoRevisionVelocity。can-fsd 只把 ^ / #SL / #ST 转给 101 的客户端
+# （broadcast.go 的 broadcastRangedVelocity），报 100 的话 vPilot / xPilot
+# 这类客户端的飞机在我们这里五秒才动一下。101 在服务端另外只多一件事：
+# 5 海里内有别的 101 飞行员时发来 `$SF…:1` 叫我们发快速位置，6 海里外发
+# `$SF…:0` 叫停（handler.go 的 updateSendFast）。
+PROTO_REVISION = 101
 RATING_OBSERVER = 1
 POSITION_INTERVAL = 0.2       # 每秒 5 次，和 VATSIM 客户端一致
 SLOW_POSITION_INTERVAL = 5.0  # 停在地面上没动时降频
+# 快速位置的节奏，照 xPilot（networkmanager.cpp）：$SF 打开时每 200 ms 一个
+# `^`（停着就是 `#ST`）；不管开没开，每 5 秒一个 `#SL`（在动的时候）。
+# `@` 照旧按上面的节奏发：服务端只按 `@` 更新我们在邮局里的位置和 $SF 判定
+# （handlePilotPosition），快速位置只刷新空闲计时（handleFastPilotPosition）。
+FAST_POSITION_INTERVAL = 0.2
+SLOW_FAST_INTERVAL = 5.0
+# 自己的配置（灯光/起落架/襟翼）变了就向附近广播，最密每秒一次。放襟翼的
+# 那几秒里 flaps_pct 一直在变，不限速的话一次放襟翼就是几十个包。
+CONFIG_BROADCAST_INTERVAL = 1.0
+# 广播给附近所有飞行员的收件人（can-fsd docs/protocol.md 的 @94836）
+RANGED_ALL = "@94836"
+# 速度和角速度都小于这个值就算停着（xPilot 的
+# POSITIONAL_VELOCITY_ZERO_TOLERANCE，米每秒 / 弧度每秒）
+STOPPED_TOLERANCE = 0.005
 LOGIN_TIMEOUT = 10.0
-# 已经登录过之后掉线，最多再试这么多次；都失败就整个下线。和语音那边同一条
-# 策略（voice.RECONNECT_LIMIT），两条链路的行为要一致，不然"整个下线"就没有
-# 统一的含义。
-RECONNECT_LIMIT = 3
-RECONNECT_DELAY = 3.0         # 每次重连之间等一下，别贴着服务器猛敲
+# 掉线后重连按时间算，不按次数算。服务端要等旧连接死透才放出呼号
+# （postoffice.go 的 register 回 `$ER … 1 … Callsign already in use`）：
+# 读超时 90 秒（conn.go 的 readTimeout），空闲清理 60 秒、每 30 秒扫一次
+# （reaper.go）。三次 × 3 秒的老预算在这之前就用完了，飞机直接下线。
+RECONNECT_WINDOW = 150.0
+# 每次重试前等多久，逐次拉长，最后一档一直用到窗口用完
+RECONNECT_DELAYS = (3.0, 5.0, 10.0, 15.0, 20.0, 30.0)
+
+# 服务端拒绝登录的错误码（can-fsd internal/fsd/errors.go）。只有这两个值得
+# 再试：呼号被旧连接占着、服务器满了。其余（密码错、账号停用、等级太高、
+# 被督导踢过……）重试只会得到同一个答案，而认证失败按 CID 限流。
+ERR_CALLSIGN_IN_USE = "1"
+ERR_SERVER_FULL = "12"
+
+# 一次失败属于哪一类，决定 _run 要不要再试
+FAILURE_FATAL = "fatal"            # 服务端说这个人/这次登录不行，停
+FAILURE_IN_USE = "callsign-in-use"  # 呼号还被上一条连接占着，等它释放
+FAILURE_TRANSIENT = "transient"    # 网络断了、超时、服务器满——登录过就再试
+
+KNOTS_PER_MPS = 1.943844492
 # can-fsd 的 IsValidCallsign 上限（packet.go 的 MaxCallsignLength）
 MAX_CALLSIGN_LENGTH = 12
 
@@ -105,6 +144,56 @@ def unpack_pbh(packed):
         "heading": (packed >> 2 & mask) * ratio,
         "on_ground": bool(packed & 0x2),
     }
+
+
+def wire_rotation(snapshot):
+    """快照里的机体角速度 -> 快速位置包的三个角速度字段（弧度每秒）。
+
+    快照是抬头、右转、右坡为正（X-Plane 的 Q/R/P 方向）。包里的方向照 xPilot：
+    它发 `-Qrad`、`Rrad`、`-Prad`（xplane_adapter.cpp），也就是 MSFS 的
+    ROTATION VELOCITY BODY X/Y/Z 原样的方向——低头、右转、左坡为正。
+    PBH 的符号约定和这个无关，那是 pack_pbh 的事。
+    """
+    return (-math.radians(snapshot.get("pitch_rate", 0.0)),
+            math.radians(snapshot.get("heading_rate", 0.0)),
+            -math.radians(snapshot.get("bank_rate", 0.0)))
+
+
+def wire_altitude(snapshot):
+    """位置包里报的高度：网络高度（真高 + 温度误差），见 altitude.py。"""
+    return snapshot.get("network_altitude", snapshot["altitude"])
+
+
+def is_stopped(snapshot):
+    """xPilot 的 PositionalVelocityIsZero：速度和角速度都几乎为零。"""
+    velocity = (snapshot.get("velocity_east", 0.0), snapshot.get("velocity_up", 0.0),
+                snapshot.get("velocity_north", 0.0))
+    return all(abs(v) < STOPPED_TOLERANCE
+               for v in velocity + wire_rotation(snapshot))
+
+
+def fast_position_packet(kind, callsign, snapshot):
+    """拼一个 `^` / `#SL` / `#ST`。字段和精度照 xPilot 的 PDUFastPilotPosition。
+
+        0 呼号  1 纬度  2 经度  3 网络高度（英尺）  4 离地高（英尺）  5 PBH
+        6/7/8 速度 东/上/北（米每秒）  9/10/11 角速度（弧度每秒）  12 前轮角（度）
+
+    `#ST` 没有 6-11 那六段，一共 7 段；另外两种 13 段——和 can-fsd 的
+    minFields 一致，少一段服务端不转。
+    """
+    pbh = pack_pbh(snapshot["pitch"], snapshot["bank"], snapshot["heading"],
+                   snapshot.get("on_ground", False))
+    fields = [f"{kind}{callsign}",
+              f"{snapshot['latitude']:.6f}", f"{snapshot['longitude']:.6f}",
+              f"{float(wire_altitude(snapshot)):.2f}",
+              f"{float(snapshot.get('agl', 0.0)):.2f}", str(pbh)]
+    if kind != "#ST":
+        fields += [f"{snapshot.get('velocity_east', 0.0):.4f}",
+                   f"{snapshot.get('velocity_up', 0.0):.4f}",
+                   f"{snapshot.get('velocity_north', 0.0):.4f}"]
+        fields += [f"{value:.4f}" for value in wire_rotation(snapshot)]
+    fields.append(f"{snapshot.get('nose_wheel', 0.0):.2f}")
+    return ":".join(fields)
 
 
 def callsign_problem(callsign):
@@ -172,14 +261,15 @@ class FSDPilot:
         on_text(sender, recipient, message)
         on_controllers(list)          附近的管制席位
 
-    掉线相关的两条状态和语音那边一个意思：`reconnecting` 是暂时的，还在试；
-    `offline` 是 RECONNECT_LIMIT 次都失败、这条链路彻底完了，界面应当整个下线。
+    `reconnecting` 是暂时的，还在试；`offline` 是 RECONNECT_WINDOW 秒内都没
+    连回来，这条链路彻底完了；`error` 是不重试的失败（首连连不上、密码错）。
+    界面对后两者只收掉 FSD 这一条，语音不动。
     """
 
     def __init__(self, host, callsign, cid, password, real_name="",
                  port=DEFAULT_PORT, rating=RATING_OBSERVER, aircraft="",
                  on_status=None, on_text=None, on_controllers=None,
-                 traffic=None, reconnect_limit=RECONNECT_LIMIT):
+                 traffic=None, reconnect_window=RECONNECT_WINDOW):
         self.host = host
         self.port = int(port or DEFAULT_PORT)
         self.callsign = (callsign or "").strip().upper()
@@ -214,9 +304,14 @@ class FSDPilot:
         self._sock = None
         self._buffer = b""
         self._logged_in = False
-        # 掉线后最多重连几次，用尽就整个下线
-        self.reconnect_limit = int(reconnect_limit)
+        # 掉线后最多重试多少秒，用完就下线
+        self.reconnect_window = float(reconnect_window)
         self.gave_up = False
+        # 最近一次失败的类别（FAILURE_*），_run 据此决定要不要再试
+        self._failure = FAILURE_TRANSIENT
+        # 发送失败的那个异常。非 None 表示这条 socket 已经坏了、已经被关掉，
+        # 收包那边应当当作掉线处理。
+        self._broken = None
         # 登录成功过之后，失败就先当"可以重连"。这个标记让 _status 把中途的
         # error 翻成 reconnecting——否则界面收到一次 error 就把整条连接当没了，
         # 而我们其实马上就要再试。
@@ -227,7 +322,11 @@ class FSDPilot:
         self._squawk = 2000
         self._xpdr_mode = XPDR_STANDBY
         self._ident_until = 0.0
+        # 服务端的 $SF：附近有别的 101 飞行员，要 5 Hz 的快速位置
+        self.send_fast = False
         self.controllers = {}       # 呼号 -> {frequency, ...}
+        # 最近一次广播出去的配置。None 表示下一次要发全量。
+        self._config_sent = None
 
     # ---------- 对外 ----------
     def start(self):
@@ -350,36 +449,61 @@ class FSDPilot:
         return ":".join(fields)
 
     def _send(self, packet):
-        if not self._sock:
+        sock = self._sock
+        if not sock:
             return False
         try:
-            self._sock.sendall((packet + "\r\n").encode("utf-8", errors="replace"))
+            sock.sendall((packet + "\r\n").encode("utf-8", errors="replace"))
             log.debug("→ %s", self._redact(packet))
             return True
         except Exception as e:
-            self._status('error', t("fsd.send_failed", error=e))
+            self._send_failed(sock, e)
             return False
 
-    def _run(self):
-        """连接 → 收发 → 掉线重连，最多 reconnect_limit 次。
+    def _send_failed(self, sock, error):
+        """发不出去说明连接已经坏了：把 socket 关掉，让收包那边走正常的掉线重连。
 
-        **首次连不上不重试。** 那多半是呼号被占、密码不对或者地址填错——重试三
-        次只会把同一条错误刷三遍，还可能触发服务端对认证失败的限流。只有"登录
-        成功过之后掉的线"才重连：那种是服务器重启或者网络抖动，重连是对的。
-
-        次数用尽后报 offline 并结束，界面据此整个下线，而不是留一条谁也说不清
-        状态的连接。
+        以前这里只报一条 error（重连期间被翻成 reconnecting），socket 原样留着，
+        什么都不会去重连——界面停在"重连中"，飞机在网上一动不动。shutdown 会
+        叫醒正卡在 recv() 里的连接线程（它读到 EOF 或报错），不管 _send 是从
+        哪条线程调的。
         """
-        attempts = 0
+        if self._broken is None:
+            self._broken = error
+            log.warning("FSD send failed (%s, errno %s): %s; closing the socket",
+                        type(error).__name__, getattr(error, "errno", None), error)
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+
+    def _run(self):
+        """连接 → 收发 → 掉线重连，最多重试 reconnect_window 秒。
+
+        失败按类别处理（_failure）：
+
+        - **FAILURE_FATAL**：密码错、账号停用、被督导踢过……重试只会得到同一个
+          答案，还会撞上服务端按 CID 的认证失败限流。立即停。
+        - **FAILURE_IN_USE**：呼号还被上一条连接占着。服务端要等旧连接超时
+          （最长约 90 秒）才放出来，所以**首连也等**——客户端崩了或断网后重开，
+          头一次登录撞上的正是自己的旧连接。
+        - **FAILURE_TRANSIENT**：连不上、超时、连接断了。首连就这样多半是地址
+          填错，不重试；登录过之后才重试（服务器重启、网络抖动）。
+
+        重试的间隔逐次拉长（RECONNECT_DELAYS），从第一次失败算起超过
+        reconnect_window 秒还没连回来就报 offline 并结束。
+        """
         established_once = False
+        attempt = 0
+        retry_since = None
 
         while self.running and not self.stop_event.is_set():
-            connected = False
+            self._failure = FAILURE_TRANSIENT
             try:
-                connected = self._connect()
-                if connected:
-                    attempts = 0
+                if self._connect():
                     established_once = True
+                    attempt = 0
+                    retry_since = None
                     # 从这一刻起，掉线是可以重连的
                     self._retryable = True
                     self._loop()
@@ -388,28 +512,54 @@ class FSDPilot:
             finally:
                 self._close()
 
-            if not established_once:
-                return                  # 首次就没连上，原因已经报过了
             if not self.running or self.stop_event.is_set():
                 return                  # 用户自己断的
+            failure = self._failure
+            if failure == FAILURE_FATAL:
+                return                  # 原因已经报过了，而且是终态
+            if failure == FAILURE_TRANSIENT and not established_once:
+                return                  # 首次就没连上，原因已经报过了
 
-            attempts += 1
-            if attempts > self.reconnect_limit:
+            now = time.monotonic()
+            if retry_since is None:
+                retry_since = now
+            waited = now - retry_since
+            if waited >= self.reconnect_window:
                 self.gave_up = True
                 self._retryable = False
+                log.warning("could not get back onto FSD within %.0f s "
+                            "(last failure: %s), giving up",
+                            self.reconnect_window, failure)
                 self._status('offline',
-                             t("fsd.give_up", limit=self.reconnect_limit))
+                             t("fsd.give_up", seconds=int(self.reconnect_window)))
                 return
 
-            self._status('reconnecting',
-                         t("fsd.reconnecting", attempt=attempts,
-                           limit=self.reconnect_limit))
-            if self.stop_event.wait(RECONNECT_DELAY):
+            delay = RECONNECT_DELAYS[min(attempt, len(RECONNECT_DELAYS) - 1)]
+            delay = min(delay, self.reconnect_window - waited)
+            attempt += 1
+            log.info("FSD retry %d in %.0f s (%s, %.0f of %.0f s used)",
+                     attempt, delay, failure, waited, self.reconnect_window)
+            # 已经登录过的话 _retryable 本来就是真；首连撞上呼号被占时
+            # $ER 那里已经置真。两种情况下这条都是 reconnecting。
+            self._retryable = True
+            if failure == FAILURE_IN_USE:
+                message = t("fsd.callsign_busy", callsign=self.callsign,
+                            delay=int(round(delay)))
+            else:
+                message = t("fsd.reconnecting", attempt=attempt,
+                            delay=int(round(delay)))
+            self._status('reconnecting', message)
+            if self.stop_event.wait(delay):
                 return
 
     def _connect(self):
+        self._broken = None
+        # $SF 是按连接给的，重连之后等服务端重新判
+        self.send_fast = False
         problem = callsign_problem(self.callsign)
         if problem:
+            self._failure = FAILURE_FATAL
+            self._retryable = False
             self._status('error', problem)
             return False
 
@@ -459,11 +609,27 @@ class FSDPilot:
         return False
 
     def _loop(self):
-        next_position = 0.0
+        # 登录后先报 `@`，再报一个快速位置（停着就是 #ST），和 xPilot 一样：
+        # 服务端靠 `@` 知道我们在哪、该转给谁；别的 101 客户端从这一刻起就按
+        # 快速位置画我们，不等第一个 $SF
+        now = time.time()
+        next_position = now + self._send_position()
+        next_fast = 0.0
+        next_slow = now + SLOW_FAST_INTERVAL
+        next_config = now
+        self._config_sent = None
+        self._send_fast_position(slow=False)
         while self.running and not self.stop_event.is_set():
-            packet = self._read_packet(timeout=0.2)
+            # 收包的等待不能盖过下一次该发的时刻，否则 200 ms 的节奏会被拖成
+            # 400 ms
+            due = min(next_position, next_slow,
+                      next_fast if self.send_fast else float("inf"))
+            timeout = max(0.01, min(0.2, due - time.time()))
+            packet = self._read_packet(timeout=timeout) if self._broken is None else ""
             if packet == "":
-                self._status('error', t("fsd.dropped"))
+                broken = self._broken
+                self._status('error', t("fsd.send_failed", error=broken)
+                             if broken is not None else t("fsd.dropped"))
                 return
             if packet and self._handle_packet(packet) is False:
                 return
@@ -472,6 +638,15 @@ class FSDPilot:
             if now >= next_position:
                 interval = self._send_position()
                 next_position = now + interval
+            if self.send_fast and now >= next_fast:
+                self._send_fast_position(slow=False)
+                next_fast = now + FAST_POSITION_INTERVAL
+            if now >= next_slow:
+                self._send_fast_position(slow=True)
+                next_slow = now + SLOW_FAST_INTERVAL
+            if now >= next_config:
+                self._broadcast_config()
+                next_config = now + CONFIG_BROADCAST_INTERVAL
 
     def _send_position(self):
         """发一个位置包，返回下一次的间隔。"""
@@ -488,19 +663,57 @@ class FSDPilot:
 
         pbh = pack_pbh(snapshot["pitch"], snapshot["bank"], snapshot["heading"],
                        snapshot.get("on_ground", False))
-        # 最后一个字段是气压修正量：高度字段报的是真高，加上它才是应答机报的
-        # 气压高度。老代码这里写死 0，于是管制端看到的高度就是真高，和座舱
-        # 高度表能差一千英尺。取不到就还是 0，退回原来的行为。
+        # 第 7 段是网络高度，最后一段是修正量（气压高度 − 网络高度），两者
+        # 相加是应答机报的气压高度。见 altitude.py。
         self._send(
             f"@{mode}:{self.callsign}:{squawk:04d}:{self.rating}:"
             f"{snapshot['latitude']:.5f}:{snapshot['longitude']:.5f}:"
-            f"{snapshot['altitude']}:{snapshot['groundspeed']}:{pbh}:"
+            f"{wire_altitude(snapshot)}:{snapshot['groundspeed']}:{pbh}:"
             f"{snapshot.get('pressure_delta', 0)}")
 
         # 停在地面上没动就降频，省得刷屏
         if snapshot.get("on_ground") and snapshot.get("groundspeed", 0) < 1:
             return SLOW_POSITION_INTERVAL
         return POSITION_INTERVAL
+
+    def _send_fast_position(self, slow):
+        """发一个快速位置包，返回发出的包头（`^` / `#SL` / `#ST`），没发返回 None。
+
+        slow=False 是 200 ms 那一拍：在动发 `^`，停着发 `#ST`。
+        slow=True 是 5 秒那一拍：在动才发 `#SL`，停着什么都不发（`@` 照发）。
+        """
+        with self._lock:
+            snapshot = self._position
+        if not snapshot:
+            return None
+        stopped = is_stopped(snapshot)
+        if slow:
+            if stopped:
+                return None
+            kind = "#SL"
+        else:
+            kind = "#ST" if stopped else "^"
+        self._send(fast_position_packet(kind, self.callsign, snapshot))
+        return kind
+
+    def _set_send_fast(self, enabled):
+        """服务端的 $SF。关掉时补一个包，让别人手里的速度是对的。
+
+        xPilot 关掉时总是补一个 `#ST`；在动的飞机收到零速度会停住，等下一个
+        `#SL` 再被误差速度拽走，所以在动的时候补 `#SL`。
+        """
+        if enabled == self.send_fast:
+            return
+        self.send_fast = enabled
+        log.info("fast position updates %s", "on" if enabled else "off")
+        if not enabled:
+            self._send_fast_position(slow=True) or self._send_stopped()
+
+    def _send_stopped(self):
+        with self._lock:
+            snapshot = self._position
+        if snapshot:
+            self._send(fast_position_packet("#ST", self.callsign, snapshot))
 
     def _read_packet(self, timeout=1):
         """读一个包。超时返回 None，连接关闭返回 ""，空行跳过。"""
@@ -511,9 +724,14 @@ class FSDPilot:
                     chunk = self._sock.recv(4096)
                 except socket.timeout:
                     return None
-                except Exception:
+                except Exception as e:
+                    # 类型和 errno 要进日志：EOF、对端重置、内核放弃重传是三种
+                    # 完全不同的掉线，原来这里一声不吭，日志里只剩一句"断开了"。
+                    log.info("FSD receive failed: %s (errno %s): %s",
+                             type(e).__name__, getattr(e, "errno", None), e)
                     return ""
                 if not chunk:
+                    log.info("FSD receive: the server closed the connection (EOF)")
                     return ""
                 self._buffer += chunk
 
@@ -532,6 +750,17 @@ class FSDPilot:
             code = fields[2] if len(fields) > 2 else "?"
             message = fields[4] if len(fields) > 4 else packet
             if not self._logged_in:
+                if code == ERR_CALLSIGN_IN_USE:
+                    # 首连也要等：撞上的多半是自己上一条还没死透的连接
+                    self._failure = FAILURE_IN_USE
+                    self._retryable = True
+                elif code == ERR_SERVER_FULL:
+                    self._failure = FAILURE_TRANSIENT
+                else:
+                    # 终态：不能被翻成 reconnecting，界面要知道这条连接没了
+                    self._failure = FAILURE_FATAL
+                    self._retryable = False
+                log.info("login refused with code %s (%s)", code, self._failure)
                 self._status('error', t("fsd.rejected", code=code, message=message))
                 return False
             log.warning("the server returned an error (%s): %s", code, message)
@@ -564,6 +793,24 @@ class FSDPilot:
             self._note_traffic(fields)
             return True
 
+        # 快速位置。字段个数下限和 can-fsd 的 minFields 一致（^ / #SL 13 段，
+        # #ST 7 段），它不够数的包服务端本来就不会转。
+        if head.startswith("^") and len(fields) >= 13:
+            self._note_fast_traffic(head[1:], fields, stopped=False)
+            return True
+        if head.startswith("#SL") and len(fields) >= 13:
+            self._note_fast_traffic(head[3:], fields, stopped=False)
+            return True
+        if head.startswith("#ST") and len(fields) >= 7:
+            self._note_fast_traffic(head[3:], fields, stopped=True)
+            return True
+
+        if head.startswith("$SF"):
+            # $SFSERVER:{呼号}:{1|0}（handler.go 的 sendSendFast）
+            if len(fields) >= 3 and fields[1].upper() == self.callsign:
+                self._set_send_fast(fields[2].strip() == "1")
+            return True
+
         if head.startswith("#SB") and len(fields) >= 3:
             self._handle_plane_info(head[3:], fields)
             return True
@@ -579,27 +826,30 @@ class FSDPilot:
                 self._logged_in = True
             elif (fields[2] == "ACC" and len(fields) > 3
                     and self.traffic is not None):
-                # 对方回的配置 JSON。正文里有冒号，得把后面的段拼回去。
+                # 本客户端早先版本的回答：$CR 加不包 "config" 的 JSON。标准的
+                # 回答走 $CQ，见 _handle_config_query。正文里有冒号，得把后面
+                # 的段拼回去。
                 try:
                     config = json.loads(":".join(fields[3:]))
                 except ValueError:
                     config = None
+                if isinstance(config, dict) and isinstance(config.get("config"), dict):
+                    config = config["config"]
                 if isinstance(config, dict):
                     self.traffic.set_config(head[3:], config)
             return True
 
         if head.startswith("$CQ") and len(fields) >= 3:
             sender, recipient, query = head[3:], fields[1], fields[2]
-            if recipient == self.callsign:
+            if query == "ACC" and recipient in (self.callsign, RANGED_ALL):
+                self._handle_config_query(sender, recipient, ":".join(fields[3:]))
+            elif recipient == self.callsign:
                 if query == "CAPS":
-                    self._send(f"$CR{self.callsign}:{sender}:CAPS:ATCINFO=0:MODELDESC=1")
+                    # ACCONFIG=1：xPilot/vPilot 只向报了它的客户端要 ACC
+                    self._send(f"$CR{self.callsign}:{sender}:CAPS:"
+                               "ATCINFO=0:MODELDESC=1:ACCONFIG=1")
                 elif query == "RN":
                     self._send(f"$CR{self.callsign}:{sender}:RN:{self.real_name}::{self.rating}")
-                elif query == "ACC":
-                    # 回配置 JSON（灯光/襟翼/起落架），对面拿去驱动动画。
-                    # 以前这里回的是机型码——和请求方期望的负载完全对不上，
-                    # 结果就是所有他机永远全程关灯。
-                    self._send(f"$CR{self.callsign}:{sender}:ACC:{self._config_json()}")
             return True
 
         if head.startswith("$PI") and len(fields) >= 3:
@@ -634,33 +884,154 @@ class FSDPilot:
                 latitude=float(fields[4]), longitude=float(fields[5]),
                 # int(float(...))：有的客户端把高度/地速写成带小数点的，
                 # 直接 int() 会抛 ValueError，整个包被丢，那架飞机就是隐形的
-                altitude=int(float(fields[6])), groundspeed=int(float(fields[7])),
+                altitude=int(self._adjust_altitude(float(fields[6]))),
+                groundspeed=int(float(fields[7])),
                 pitch=attitude["pitch"], bank=attitude["bank"],
                 heading=attitude["heading"], on_ground=attitude["on_ground"],
                 squawk=int(fields[2]), mode=fields[0][1:] or "S")
         except (IndexError, ValueError) as e:
             log.debug("could not parse the position packet %s: %s", fields[:2], e)
 
+    def _note_fast_traffic(self, callsign, fields, stopped):
+        """别人的快速位置包（`^` / `#SL` / `#ST`）。
+
+        字段（can-fsd docs/protocol.md "Fast Pilot Position"）：
+
+            0 呼号  1 纬度  2 经度  3 真高（英尺，带小数）  4 离地高（英尺）
+            5 PBH  6/7/8 位置速度 X/Y/Z（米每秒）  9/10/11 角速度 X/Y/Z
+            （弧度每秒）  12 前轮角（度）
+
+        X 是向东、Y 是向上、Z 是向北——xPilot 发的是 local_vx、local_vy、
+        -local_vz（X-Plane 的 +Z 朝南），vPilot 取 MSFS 的 VELOCITY WORLD
+        X/Y/Z，同一个方向。角速度按 wire_rotation() 的方向换回抬头/右转/
+        右坡为正、度每秒。`#ST` 是停着的飞机，没有六个速度段，速度就是零，
+        前轮角在第 6 段。包里没有应答机和地速：地速由水平速度算，应答机沿用
+        `@` 包带来的。
+        """
+        if self.traffic is None:
+            return
+        if callsign == self.callsign:
+            return
+        try:
+            attitude = unpack_pbh(int(fields[5]) & 0xFFFFFFFF)
+            agl = float(fields[4])
+            if stopped:
+                east = up = north = 0.0
+                rotation = (0.0, 0.0, 0.0)
+                nose_wheel = float(fields[6])
+            else:
+                east, up, north = float(fields[6]), float(fields[7]), float(fields[8])
+                rotation = (-math.degrees(float(fields[9])),
+                            math.degrees(float(fields[10])),
+                            -math.degrees(float(fields[11])))
+                nose_wheel = float(fields[12])
+            self.traffic.update_position(
+                callsign,
+                latitude=float(fields[1]), longitude=float(fields[2]),
+                altitude=self._adjust_altitude(float(fields[3])),
+                groundspeed=int(round(math.hypot(north, east) * KNOTS_PER_MPS)),
+                pitch=attitude["pitch"], bank=attitude["bank"],
+                heading=attitude["heading"], on_ground=attitude["on_ground"],
+                velocity=(east, up, north), rotation=rotation,
+                agl=agl, nose_wheel=nose_wheel)
+        except (IndexError, ValueError) as e:
+            log.debug("could not parse the fast position packet %s: %s",
+                      fields[:1], e)
+
+    def _adjust_altitude(self, altitude):
+        """他机高度按本机温度误差修正后再进运动模型。没有本机快照时不改。"""
+        with self._lock:
+            own = self._position
+        if not own:
+            return altitude
+        return adjust_incoming_altitude(altitude, own.get("network_altitude"),
+                                        own.get("temperature_error", 0))
+
     def request_plane_info(self, callsign):
         """问对方的机型，用于模型匹配。"""
         return self._send(f"#SB{self.callsign}:{callsign}:PIR")
 
     def request_config(self, callsign):
-        """问对方的配置（灯光/襟翼/起落架），用于动画。TrafficTable 定期触发。"""
-        return self._send(f"$CQ{self.callsign}:{callsign}:ACC")
+        """问对方的配置（灯光/襟翼/起落架），用于动画。TrafficTable 定期触发。
 
-    def _config_json(self):
-        """把自己的快照攒成 ACC 回复的 JSON，键名和 TrafficTable.set_config 对齐。"""
+        格式照 can-fsd docs/protocol.md 的 ACC：请求体是 {"request":"full"}，
+        xPilot/vPilot 不带它的请求不答。
+        """
+        return self._send(f'$CQ{self.callsign}:{callsign}:ACC:{{"request":"full"}}')
+
+    def _handle_config_query(self, sender, recipient, body):
+        """$CQ … ACC：别人要我们的配置，或者别人发来他的配置。
+
+        标准格式里请求和回答都走 $CQ：请求体是 {"request":"full"}，回答和
+        广播是 {"config":{...}}。本客户端早先的版本请求不带正文、回答走
+        $CR 且不包 "config"——对它们照旧那样答，那边才解析得了。
+        """
+        try:
+            payload = json.loads(body) if body.strip() else None
+        except ValueError:
+            log.debug("unreadable ACC payload from %s: %r", sender, body)
+            return
+        if isinstance(payload, dict) and isinstance(payload.get("config"), dict):
+            if self.traffic is not None:
+                self.traffic.set_config(sender, payload["config"])
+            return
+        if recipient != self.callsign:
+            return
+        if payload is None:
+            self._send(f"$CR{self.callsign}:{sender}:ACC:"
+                       f"{self._wire_json(self._config())}")
+        elif isinstance(payload, dict) and payload.get("request") == "full":
+            self._send(f"$CQ{self.callsign}:{sender}:ACC:"
+                       f"{self._wire_json({'config': self._config(full=True)})}")
+
+    def _config(self, full=False):
+        """自己的配置，键名照 protocol.md 的 ACC，和 TrafficTable.set_config 对齐。
+
+        没有快照（还没连上模拟器）返回 None。
+        """
         with self._lock:
-            snapshot = dict(self._position) if self._position else {}
+            snapshot = dict(self._position) if self._position else None
+        if snapshot is None:
+            return None
         lights = snapshot.get("lights") or {}
-        return json.dumps({
-            "gear_down": bool(snapshot.get("gear_down", True)),
-            "flaps_pct": round(float(snapshot.get("flaps", 0.0)) * 100.0, 1),
-            "spoilers_out": bool(snapshot.get("spoilers", False)),
+        config = {
             "lights": {key: bool(value) for key, value in lights.items()},
-            "engines": {"1": {"on": bool(snapshot.get("engines_on", True))}},
-        }, separators=(",", ":"))
+            "engines": {"1": {"on": bool(snapshot.get("engines_on", True)),
+                              "is_reversing": False}},
+            "gear_down": bool(snapshot.get("gear_down", True)),
+            "flaps_pct": int(round(float(snapshot.get("flaps", 0.0)) * 100.0)),
+            "spoilers_out": bool(snapshot.get("spoilers", False)),
+            "on_ground": bool(snapshot.get("on_ground", False)),
+        }
+        if full:
+            config = {"is_full_data": True, **config}
+        return config
+
+    @staticmethod
+    def _wire_json(value):
+        return json.dumps(value if value is not None else {}, separators=(",", ":"))
+
+    def _broadcast_config(self):
+        """配置变了就向附近广播（$CQ…:@94836:ACC），只带变了的键。
+
+        xPilot 就是这样把开灯、放襟翼推给别人的；只靠对方每 10 秒来问一次的话，
+        着陆灯要晚十秒才亮。连上后的第一次发全量。
+        """
+        config = self._config()
+        if config is None:
+            return
+        last = self._config_sent
+        if last is None:
+            changed = {"is_full_data": True, **config}
+        else:
+            changed = {key: value for key, value in config.items()
+                       if last.get(key) != value}
+            if not changed:
+                return
+            changed = {"is_full_data": False, **changed}
+        self._config_sent = config
+        self._send(f"$CQ{self.callsign}:{RANGED_ALL}:ACC:"
+                   f"{self._wire_json({'config': changed})}")
 
     def _handle_plane_info(self, sender, fields):
         """#SB。别人问我们机型要答，别人报机型要记下来。"""

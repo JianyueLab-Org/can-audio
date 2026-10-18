@@ -62,10 +62,15 @@ def voice_for(station, preset, metar, english):
 def render(station, preset, metar):
     """渲染一份稿子，返回 (文字通播, 语音稿)。
 
-    席位、预设、天气缺任何一样都返回 None——调用方据此显示"还没有天气数据"
-    或者干脆不推送，而不是推一份缺了半截的稿子出去。
+    手动预设不需要天气，只返回用户在主页面编辑的两份稿子。自动预设在席位、
+    预设、天气缺任何一样时返回 None——调用方据此显示"还没有天气数据"或者
+    干脆不推送，而不是推一份缺了半截的稿子出去。
     """
-    if station is None or preset is None or metar is None:
+    if preset is None:
+        return None
+    if getattr(preset, "manual_text", False):
+        return preset.manual_atis, preset.manual_voice
+    if station is None or metar is None:
         return None
     context = build_context(station, preset, metar)
     text, voice = template_module.render(preset.template, context,

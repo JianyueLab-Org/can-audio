@@ -14,6 +14,7 @@ whisper 那边 `id==1` 时只取第一个频道（mumble.py 里写死的），�
 """
 
 import logging
+import re
 import threading
 import time
 
@@ -34,6 +35,8 @@ from pymumble_py3.constants import (
     PYMUMBLE_MSG_TYPES_VOICETARGET,
 )
 
+import denoise
+import micgain
 import mumblecompat
 import radiostack
 from i18n import t
@@ -308,6 +311,13 @@ class VoiceClient:
         self._stream_lock = threading.Lock()
 
         self.mic_volume = 100
+        # 发送链路：降噪 → × 校准基准（dB）× 会话乘数（mic_volume）→ 限幅。
+        # 降噪器和限幅器按采样率懒建，跨 PTT 保留状态。
+        self.mic_baseline_db = 0.0
+        self.mic_denoise = True
+        self._denoiser_factory = denoise.Denoiser
+        self._denoiser = None
+        self._mic_limiter = None
         self.speaker_volume = 100
         self.transmitting = False
 
@@ -738,6 +748,13 @@ class VoiceClient:
 
     def set_mic_volume(self, percent):
         self.mic_volume = max(0, min(200, int(percent)))
+
+    def set_mic_baseline(self, db):
+        self.mic_baseline_db = max(micgain.MIN_GAIN_DB,
+                                   min(micgain.MAX_GAIN_DB, float(db)))
+
+    def set_mic_denoise(self, enabled):
+        self.mic_denoise = bool(enabled)
 
     def set_speaker_volume(self, percent):
         self.speaker_volume = max(0, min(200, int(percent)))
@@ -1196,7 +1213,9 @@ class VoiceClient:
         except Exception as e:
             log.warning(f"playing the received audio raised: {e}")
 
-        self._forward_cross_couple(khz, soundchunk)
+        # ATIS whispers must not become unrestricted cross-coupled channel audio.
+        if not re.fullmatch(r"[0-9]+_atis[0-9]{6}(?:_[A-Z0-9]{4}_(?:[DA]_)?ATIS)?", user.get("name", "")):
+            self._forward_cross_couple(khz, soundchunk)
 
     def _forward_cross_couple(self, khz, soundchunk):
         """交叉耦合：在一个 XC 频率上收到的话音，转发到其它 XC 频率。"""
@@ -1252,6 +1271,11 @@ class VoiceClient:
         if previous and previous.is_alive() and previous is not threading.current_thread():
             previous.join(timeout=1)
 
+        myself = getattr(self.mumble.users, "myself", None)
+        log.info("PTT started: target %s, channels %s, joined channel %s, input device %s, rate %s Hz",
+             PTT_TARGET_ID, self._tx_channels,
+             myself.get("channel_id") if myself else None,
+             self._input_device, self.RATE)
         self.transmitting = True
         if self.on_tx:
             self.on_tx(True)
@@ -1265,7 +1289,25 @@ class VoiceClient:
         if self.on_tx:
             self.on_tx(False)
 
+    def _process_mic(self, data):
+        """一帧麦克风 PCM → 要发出去的 int16。"""
+        samples = np.frombuffer(data, dtype=np.int16)
+        if self.mic_denoise:
+            if self._denoiser is None or self._denoiser.rate != self.RATE:
+                if self._denoiser is not None:
+                    self._denoiser.close()
+                self._denoiser = self._denoiser_factory(self.RATE)
+            samples = self._denoiser.process(samples)
+        if self._mic_limiter is None or self._mic_limiter.rate != self.RATE:
+            self._mic_limiter = micgain.Limiter(self.RATE)
+        return micgain.apply_gain(samples, self.mic_baseline_db, self.mic_volume,
+                                  self._mic_limiter)
+
     def _transmit_loop(self):
+        started = time.monotonic()
+        reads = queued = audible = skipped = errors = 0
+        peak = 0
+        exit_reason = "PTT released"
         try:
             with self._audio_lock:
                 self.mumble.sound_output.target = PTT_TARGET_ID
@@ -1277,27 +1319,49 @@ class VoiceClient:
                 with self._stream_lock:
                     stream = self.input_stream
                     if not stream:
+                        exit_reason = "input stream missing"
                         break
                     data = stream.read(self.CHUNK, exception_on_overflow=False)
                 if data:
-                    audio = np.frombuffer(data, dtype=np.int16)
-                    audio = np.clip(audio * (self.mic_volume / 100.0),
-                                    np.iinfo(np.int16).min,
-                                    np.iinfo(np.int16).max).astype(np.int16)
+                    reads += 1
+                    audio = self._process_mic(data)
+                    if audio.size:
+                        peak = max(peak, int(np.max(np.abs(audio.astype(np.int32)))))
+                        audible += bool(np.any(audio))
                     # 断线期间不要往外灌音频，否则会在缓冲里堆积
                     if not self.connected:
+                        skipped += 1
                         continue
                     with self._audio_lock:
                         # 交叉耦合可能刚把 target 切走，每次都重新确认
                         self.mumble.sound_output.target = PTT_TARGET_ID
                         self.mumble.sound_output.add_sound(audio.tobytes())
+                        queued += 1
             except Exception as e:
+                errors += 1
                 log.warning(f"recording raised: {e}")
                 time.sleep(0.1)
             time.sleep(0.001)
 
+        if not self.running:
+            exit_reason = "voice stopped"
+        try:
+            output = self.mumble.sound_output
+            pending_seconds = output.get_buffer_size()
+            encoder_ready = bool(output.encoder) if hasattr(output, "encoder") else None
+            mumble_alive = self.mumble.is_alive()
+        except Exception as e:
+            pending_seconds = encoder_ready = mumble_alive = None
+            log.debug("could not inspect the outgoing audio queue: %s", e)
         try:
             with self._audio_lock:
                 self.mumble.sound_output.target = 0
         except Exception:
             pass
+        log.info("PTT ended (%s): %.1f s, mic reads %d, non-silent %d, peak %d/32768, "
+                 "queued %d, skipped offline %d, errors %d, pending %s s, "
+                 "encoder ready %s, Mumble thread alive %s",
+                 exit_reason, time.monotonic() - started, reads, audible, peak,
+                 queued, skipped, errors,
+                 f"{pending_seconds:.3f}" if pending_seconds is not None else "unavailable",
+                 encoder_ready, mumble_alive)

@@ -89,15 +89,19 @@ DEFAULT_TYPE = "B738"
 class Model:
     """CSL 包里的一个模型。"""
 
-    __slots__ = ("name", "path", "icao", "airline", "livery", "package")
+    __slots__ = ("name", "path", "icao", "airline", "livery", "package",
+                 "vert_offset")
 
-    def __init__(self, name, path, package="", icao="", airline="", livery=""):
+    def __init__(self, name, path, package="", icao="", airline="", livery="",
+                 vert_offset=None):
         self.name = name
         self.path = path
         self.package = package
         self.icao = icao.upper()
         self.airline = airline.upper()
         self.livery = livery.upper()
+        # xsb_aircraft.txt 里写明的垂直偏移（米）。None = 没写，从 .obj 算
+        self.vert_offset = vert_offset
 
     def __repr__(self):
         return f"<Model {self.name} {self.icao}/{self.airline or '-'}>"
@@ -141,6 +145,11 @@ def parse_package(directory):
             if parts[1].upper() == "SOLID" and not current.path:
                 relative = " ".join(parts[3:]).replace("\\", "/")
                 current.path = os.path.normpath(os.path.join(directory, relative))
+        elif keyword == "VERT_OFFSET" and current is not None and len(parts) > 1:
+            current.vert_offset = _float_or_none(parts[1])
+        elif keyword == "OFFSET" and current is not None and len(parts) > 3:
+            # PilotEdge 的写法，只有第三个参数是垂直偏移（XPMP2 同样只认它）
+            current.vert_offset = _float_or_none(parts[3])
         elif keyword == "ICAO" and current is not None and len(parts) > 1:
             current.icao = parts[1].upper()
         elif keyword == "AIRLINE" and current is not None and len(parts) > 2:
@@ -156,6 +165,154 @@ def parse_package(directory):
              os.path.basename(directory), len(usable), len(models),
              len(models) - len(usable))
     return usable
+
+
+def _float_or_none(text):
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+# .obj 路径 -> 算出来的垂直偏移。一个模型只读一次文件。
+_obj_offsets = {}
+
+
+def obj_vert_offset(path):
+    """从 OBJ8 文件的顶点算垂直偏移（米），XPMP2 的 FetchVertOfsFromObjFile。
+
+    CSL 模型的原点通常在机身中间，不在轮子底下，按真高画轮子就陷在地里。
+    最低的顶点（VT/VLINE 的 y）取反就是要抬的高度。min 和 max 都从 0 起算、
+    min > 0 时取 -max，这些都照抄 XPMP2——它自己的注释也说不明白为什么，但
+    所有 CSL 包是对着它调的。读不了、不是 OBJ8 就返回 0。
+    """
+    if path in _obj_offsets:
+        return _obj_offsets[path]
+    low = high = 0.0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for number, line in enumerate(f, 1):
+                if number == 2:
+                    try:
+                        if int(line.split()[0]) < 800:
+                            break
+                    except (ValueError, IndexError):
+                        break
+                if len(line) < 20 or line[0] != "V" or line[1] not in "TL":
+                    continue
+                parts = line.split()
+                if len(parts) < 7 or parts[0] not in ("VT", "VLINE"):
+                    continue
+                try:
+                    y = float(parts[2])
+                except ValueError:
+                    continue
+                if y < low:
+                    low = y
+                elif y > high:
+                    high = y
+    except OSError as e:
+        log.debug("could not read %s for its vertical offset: %s", path, e)
+    offset = -low if low < 0.0 else -high
+    _obj_offsets[path] = offset
+    return offset
+
+
+# Bluebell 等从 World Traffic 转来的 CSL 用 cjs/world_traffic/* 驱动灯光和舵面，
+# 插件只注册 libxplanemp/controls/*，不换名的话这些灯永远不跟我们的值走。
+# 表抄自 XPMP2 的 Resources/Obj8DataRefs.txt，只留插件注册了的目标。
+# wolrd 的拼写错误是模型里真实存在的，XPMP2 同样照抄。
+OBJ_DATAREF_REPLACEMENTS = (
+    ("cjs/world_traffic/hstab_ratio", "libxplanemp/controls/yoke_pitch_ratio"),
+    ("cjs/world_traffic/rudder_ratio", "libxplanemp/controls/yoke_heading_ratio"),
+    ("cjs/world_traffic/aileron_ratio", "libxplanemp/controls/yoke_roll_ratio"),
+    ("cjs/world_traffic/roll_spoiler_ratio_L", "libxplanemp/controls/spoiler_ratio"),
+    ("cjs/world_traffic/roll_spoiler_ratio_R", "libxplanemp/controls/spoiler_ratio"),
+    ("cjs/world_traffic/flaperon_ratio_L", "libxplanemp/controls/flap_ratio"),
+    ("cjs/world_traffic/flaperon_ratio_R", "libxplanemp/controls/flap_ratio"),
+    ("cjs/world_traffic/tef_ratio", "libxplanemp/controls/flap_ratio"),
+    ("cjs/world_traffic/speed_brake_ratio", "libxplanemp/controls/speed_brake_ratio"),
+    ("cjs/world_traffic/main_gear_retraction_ratio", "libxplanemp/controls/gear_ratio"),
+    ("cjs/world_traffic/nose_gear_retraction_ratio", "libxplanemp/controls/gear_ratio"),
+    ("cjs/world_traffic/nose_gear_steering_angle", "libxplanemp/controls/nws_ratio"),
+    ("cjs/wolrd_traffic/landing_lights_on", "libxplanemp/controls/landing_lites_on"),
+    ("cjs/world_traffic/landing_lights_on", "libxplanemp/controls/landing_lites_on"),
+    ("cjs/world_traffic/wing_landing_lights_on", "libxplanemp/controls/landing_lites_on"),
+    ("cjs/world_traffic/taxi_lights_on", "libxplanemp/controls/taxi_lites_on"),
+    ("cjs/world_traffic/nav_lights_on", "libxplanemp/controls/nav_lites_on"),
+    ("cjs/world_traffic/beacon_lights_on", "libxplanemp/controls/beacon_lites_on"),
+    ("cjs/world_traffic/strobe_lights_on", "libxplanemp/controls/strobe_lites_on"),
+)
+# 换过名的副本和原件放在同一个目录（OBJ 里的贴图是相对路径），文件名加这个后缀
+REWRITTEN_SUFFIX = ".xpc.obj"
+# 副本第 4 行的标记。表改了就改这个号，旧副本会重写。
+REWRITE_MARK = "# XPC for CAN dataref rewrite v1"
+
+# 原件路径 -> 实际交给插件的路径。一个模型只处理一次。
+_drawn_paths = {}
+
+
+def _rewrite_line(line):
+    """换一行里的 dataref。和 XPMP2 一样：每行最多换一处，先匹配的算。"""
+    if "/" not in line:
+        return line
+    for old, new in OBJ_DATAREF_REPLACEMENTS:
+        if old in line:
+            return line.replace(old, new, 1)
+    return line
+
+
+def obj_for_drawing(path):
+    """插件该加载的 .obj：需要换 dataref 的给换过名的副本，否则原样。
+
+    XPMP2 的 CSLObj::CopyAndReplace。副本写不出来（目录只读等）就用原件，
+    模型照样画，只是灯和舵面不动。
+    """
+    if not path:
+        return path
+    if path in _drawn_paths:
+        return _drawn_paths[path]
+    result = path
+    try:
+        with open(path, "r", encoding="utf-8", errors="surrogateescape",
+                  newline="") as f:
+            lines = f.readlines()
+        rewritten = [_rewrite_line(line) for line in lines]
+        if rewritten != lines:
+            copy = os.path.splitext(path)[0] + REWRITTEN_SUFFIX
+            if not _copy_is_current(copy, path):
+                rewritten.insert(min(3, len(rewritten)), REWRITE_MARK + "\n")
+                with open(copy, "w", encoding="utf-8", errors="surrogateescape",
+                          newline="") as f:
+                    f.writelines(rewritten)
+                log.info("rewrote the animation datarefs of %s into %s",
+                         os.path.basename(path), os.path.basename(copy))
+            result = copy
+    except OSError as e:
+        log.warning("could not rewrite the datarefs of %s, its lights and "
+                    "surfaces will not animate: %s", path, e)
+    _drawn_paths[path] = result
+    return result
+
+
+def _copy_is_current(copy, original):
+    try:
+        if os.path.getmtime(copy) < os.path.getmtime(original):
+            return False
+        with open(copy, "r", encoding="utf-8", errors="replace") as f:
+            head = [f.readline() for _ in range(4)]
+    except OSError:
+        return False
+    return head[-1].rstrip("\r\n") == REWRITE_MARK
+
+
+def vert_offset(model):
+    """画这个模型时要往上抬多少米：xsb_aircraft.txt 写了就用，没写就从 .obj 算。"""
+    if model.vert_offset is not None:
+        return model.vert_offset
+    if not model.path:
+        return 0.0
+    return obj_vert_offset(model.path)
 
 
 def find_packages(root):

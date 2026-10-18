@@ -14,6 +14,8 @@
 
 import contextlib
 import io
+
+import json
 import sys
 import threading
 import time
@@ -120,6 +122,14 @@ class TimeoutTest(UpstreamTestCase):
             self.assertIsInstance(kwargs["timeout"], (int, float))
             self.assertGreater(kwargs["timeout"], 0)
 
+    def test_every_request_uses_the_cloudflare_compatible_user_agent(self):
+        fake = self.upstream(Response(200))
+        login_module.verify("1000", "pw")
+        self.assertEqual(
+            fake.calls[0][1]["headers"]["User-Agent"],
+            "Mozilla/5.0 (compatible; CanATIS/1.0)",
+        )
+
     def test_a_timing_out_upstream_does_not_hang_the_caller(self):
         """上游超时时 authenticate 必须照常返回，不能挂在分发线程上。"""
         self.upstream(login_module.requests.exceptions.Timeout("超时"))
@@ -152,6 +162,18 @@ class RetryTest(UpstreamTestCase):
         fake = self.upstream(Response(400, '{"error":"bad"}'))
         self.assertEqual(login_module.verify("1000", "pw"),
                          login_module.VERIFY_REJECTED)
+        self.assertEqual(len(fake.calls), 1)
+
+    def test_rate_limit_is_temporary_not_a_password_failure(self):
+        fake = self.upstream(Response(429, '{"error":"rate_limited"}'))
+        self.assertEqual(login_module.verify("1000", "pw"),
+                         login_module.VERIFY_UNREACHABLE)
+        self.assertEqual(len(fake.calls), 1)
+
+    def test_cloudflare_forbidden_is_temporary_not_a_password_failure(self):
+        fake = self.upstream(Response(403, "<html>challenge</html>"))
+        self.assertEqual(login_module.verify("1000", "pw"),
+                         login_module.VERIFY_UNREACHABLE)
         self.assertEqual(len(fake.calls), 1)
 
     def test_it_gives_up_after_the_retries(self):
@@ -228,6 +250,29 @@ class AuthenticateTest(UpstreamTestCase):
     def authenticate(self, name, password):
         return self.auth.authenticate(name, password, [], "", False)
 
+    def test_station_authentication_logs_the_path_without_credentials(self):
+        name = "1005_atis127000_ZBAA_ATIS"
+        secret = "secret-not-for-auth-logs"
+        for status, expected in ((200, login_module.VERIFY_OK),
+                                 (400, login_module.VERIFY_REJECTED),
+                                 (429, login_module.VERIFY_UNREACHABLE)):
+            with self.subTest(status=status):
+                upstream = self.upstream(Response(status, secret))
+                with self.assertLogs("auth", level="INFO") as captured:
+                    result = self.authenticate(name, secret)
+                output = "\n".join(captured.output)
+                for fragment in ("authentication request", name, "kind=atis",
+                                 "cid=1005", f"status={status}",
+                                 f"upstream={expected}", "elapsed_ms="):
+                    self.assertIn(fragment, output)
+                self.assertNotIn(secret, output)
+                self.assertEqual(json.loads(upstream.calls[0][1]["data"])["cid"],
+                                 "1005")
+                self.assertEqual(result[0],
+                                 login_module.user_id_for(name) if status == 200
+                                 else login_module.AUTH_FAILED if status == 400
+                                 else login_module.AUTH_TEMPORARY_FAILURE)
+
     def test_a_good_login_returns_the_cid_as_the_user_id(self):
         self.upstream(Response(200))
         self.assertEqual(self.authenticate("1000", "pw"), (1000, "1000", []))
@@ -267,6 +312,38 @@ class AuthenticateTest(UpstreamTestCase):
         user_id, name, _ = self.authenticate("1005_atis118000", "pw")
         self.assertEqual(user_id, 118000)
         self.assertEqual(name, "1005_atis118000")
+
+    def test_same_frequency_stations_have_distinct_authenticated_ids(self):
+        upstream = self.upstream(Response(200))
+        names = ["1005_atis128800_RJTT_ATIS", "1005_atis128800_RJOO_ATIS"]
+        first = self.authenticate(names[0], "pw")
+        second = self.authenticate(names[1], "pw")
+        self.assertGreater(first[0], 0)
+        self.assertGreater(second[0], 0)
+        self.assertNotEqual(first[0], second[0])
+        for user_id, name, _ in (first, second):
+            self.assertEqual(self.auth.nameToId(name), user_id)
+        self.assertEqual(self.kicked, names)
+        for _, request in upstream.calls:
+            self.assertEqual(json.loads(request["data"])["cid"], "1005")
+
+    def test_same_frequency_station_does_not_kick_another_callsign(self):
+        self.upstream(Response(200))
+        auth = login_module.AuthenticatorI(types.SimpleNamespace(), None)
+        tokyo = "1005_atis128800_RJTT_ATIS"
+        osaka = "1005_atis128800_RJOO_ATIS"
+        first = auth.authenticate(tokyo, "pw", [], "", False)
+        auth.online_users[tokyo] = 42
+        kicked = []
+        auth.server.kickUserAsync = lambda *args: kicked.append(args)
+        second = auth.authenticate(osaka, "pw", [], "", False)
+        self.assertNotEqual(first[0], second[0])
+        self.assertEqual(kicked, [])
+
+    def test_station_identity_still_requires_member_credentials(self):
+        self.upstream(Response(400))
+        result = self.authenticate("1005_atis128800_RJTT_ATIS", "wrong")
+        self.assertEqual(result[0], login_module.AUTH_FAILED)
 
     def test_there_is_no_shortcut_for_any_account(self):
         """保留账号的旁路已经去掉了，谁都得去问上游。
@@ -379,6 +456,23 @@ class UserIdAgreementTest(unittest.TestCase):
 
     def test_an_atis_account_is_its_frequency(self):
         self.assertEqual(self.auth.nameToId("1000_atis118000"), 118000)
+
+    def test_station_ids_do_not_collide_with_legacy_or_each_other(self):
+        names = [f"1000_atis128800_{airport}{kind}_ATIS"
+                 for airport in ("0000", "RJTT", "RJOO", "ZZZZ")
+                 for kind in ("", "_D", "_A")]
+        ids = [login_module.user_id_for(name) for name in names]
+        self.assertEqual(len(set(ids)), len(names))
+        self.assertTrue(all(0 < user_id <= 2**31 - 1 for user_id in ids))
+        self.assertNotIn(128800, ids)
+        self.assertNotIn(1000, ids)
+        for user_id in ids:
+            with self.assertRaises(ValueError):
+                login_module.user_id_for(str(user_id))
+
+    def test_reconnecting_a_callsign_preserves_its_id(self):
+        self.assertEqual(login_module.user_id_for("1000_atis128800_RJTT_ATIS"),
+                         login_module.user_id_for("1001_atis128900_RJTT_ATIS"))
 
     def test_it_agrees_with_authenticate(self):
         for name in ("1000", "1005_atis127800", "900_atis118000"):

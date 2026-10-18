@@ -9,6 +9,7 @@ xpc/test_xpc.py 覆盖，这里只测换掉的那一层：SimConnect 的单位�
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import sys
@@ -26,6 +27,7 @@ except Exception:
         sys.modules.setdefault(_name, mock.MagicMock())
 
 import aimatch
+import altitude as altitude_module
 import recovery
 import simlink
 
@@ -197,69 +199,221 @@ class SnapshotTest(unittest.TestCase):
         self.assertTrue(lights["strobe_on"])
         self.assertFalse(lights["beacon_on"])
 
+    def test_logo_light_reported(self):
+        """以前没读 LIGHT LOGO，别人看我们的 Logo 灯永远是关的。"""
+        self.assertFalse(self.link.snapshot()["lights"]["logo_on"])
+        self.link.values["light_logo"] = 1
+        self.assertTrue(self.link.snapshot()["lights"]["logo_on"])
+
     def test_no_values_means_no_snapshot(self):
         self.assertIsNone(simlink.SimLink().snapshot())
+
+    def test_snapshot_expires_after_simulator_stops(self):
+        self.link.last_update = time.time() - simlink.STALE_AFTER - 0.1
+        self.assertIsNone(self.link.snapshot())
 
     def test_field_names_match_the_xplane_client(self):
         """和 xpc 共用 fsdpilot/voice，字段名对不上就会静默出错。"""
         required = {"latitude", "longitude", "altitude", "groundspeed",
                     "pitch", "bank", "heading", "squawk", "xpdr_mode",
-                    "com1", "com2", "com1_power", "on_ground", "pressure_delta"}
+                    "com1", "com2", "com1_power", "on_ground", "pressure_delta",
+                    "network_altitude", "pressure_altitude", "temperature_error",
+                    "agl", "velocity_east", "velocity_up", "velocity_north",
+                    "pitch_rate", "heading_rate", "bank_rate", "nose_wheel"}
         self.assertTrue(required.issubset(self.link.snapshot()))
+
+    def test_world_velocity_is_converted_to_metres_per_second(self):
+        # VELOCITY WORLD X/Y/Z：东/上/北，RequestList.py 按 Feet per second 要
+        self.link.values.update({"velocity_east": 100.0, "velocity_up": -10.0,
+                                 "velocity_north": 50.0})
+        snapshot = self.link.snapshot()
+        self.assertAlmostEqual(snapshot["velocity_east"], 30.48)
+        self.assertAlmostEqual(snapshot["velocity_up"], -3.048)
+        self.assertAlmostEqual(snapshot["velocity_north"], 15.24)
+
+    def test_rotation_rates_follow_the_attitude_signs(self):
+        """ROTATION VELOCITY BODY X/Z 和 PITCH/BANK 一样是低头、左坡为正，翻过来。"""
+        import math
+        self.link.values.update({"pitch_rate": math.radians(-1.0),
+                                 "heading_rate": math.radians(3.0),
+                                 "bank_rate": math.radians(2.0)})
+        snapshot = self.link.snapshot()
+        self.assertAlmostEqual(snapshot["pitch_rate"], 1.0)
+        self.assertAlmostEqual(snapshot["heading_rate"], 3.0)
+        self.assertAlmostEqual(snapshot["bank_rate"], -2.0)
+
+    def test_the_xplane_client_reports_the_same_velocity_fields(self):
+        """fsdpilot 是分叉的一对，快速位置包从两边的快照里取同样的键。"""
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "xpc", "xplane.py")
+        if not os.path.exists(path):
+            self.skipTest("边上没有 xpc 目录")
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+        for name in ("velocity_east", "velocity_up", "velocity_north",
+                     "pitch_rate", "heading_rate", "bank_rate", "nose_wheel"):
+            self.assertIn(f'"{name}":', source, name)
+
+
+class AltitudeFieldParityTest(unittest.TestCase):
+    """两边的 snapshot() 都带同样的高度字段，fsdpilot 和状态栏从它们取值。"""
+
+    FIELDS = ("altitude", "network_altitude", "pressure_altitude",
+              "temperature_error", "pressure_delta")
+
+    def test_both_clients_report_the_altitude_fields(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "xpc", "xplane.py")
+        if not os.path.exists(path):
+            self.skipTest("边上没有 xpc 目录")
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+        link = simlink.SimLink()
+        link.values = {"latitude": 31.0, "longitude": 121.0}
+        snapshot = link.snapshot()
+        for name in self.FIELDS:
+            self.assertIn(f'"{name}":', source, name)
+            self.assertIn(name, snapshot, name)
+
+
+class UnitOverrideTest(unittest.TestCase):
+    """RequestList.py 给 ROTATION VELOCITY BODY 写的单位是 Feet per second。"""
+
+    def test_the_rotation_rates_are_requested_in_radians_per_second(self):
+        class FakeRequest:
+            def __init__(self, datum):
+                self.definitions = [(datum, b"Feet per second")]
+
+        requests = {name: FakeRequest(name.replace("_", " ").encode())
+                    for name in simlink.UNIT_OVERRIDES}
+        fake = type("R", (), {"find": lambda _, name: requests.get(name)})()
+        simlink.override_units(fake)
+        for name in ("ROTATION_VELOCITY_BODY_X", "ROTATION_VELOCITY_BODY_Y",
+                     "ROTATION_VELOCITY_BODY_Z"):
+            datum, unit = requests[name].definitions[0]
+            self.assertEqual(unit, b"Radians per second")
+            self.assertEqual(datum, name.replace("_", " ").encode())
+
+    def test_pressure_altitude_is_requested_in_feet(self):
+        """RequestList.py 给 PRESSURE_ALTITUDE 写的单位是 Meters。"""
+        class FakeRequest:
+            def __init__(self):
+                self.definitions = [(b"PRESSURE ALTITUDE", b"Meters")]
+
+        request = FakeRequest()
+        fake = type("R", (), {"find": lambda _, name: request
+                              if name == "PRESSURE_ALTITUDE" else None})()
+        with self.assertLogs("sim", "WARNING"):      # 其余几个在假对象里找不到
+            simlink.override_units(fake)
+        self.assertEqual(request.definitions[0], (b"PRESSURE ALTITUDE", b"Feet"))
+
+    def test_every_override_is_a_simvar_we_read(self):
+        self.assertTrue(set(simlink.UNIT_OVERRIDES) <= set(simlink.SIMVARS.values()))
+
+    def test_a_missing_request_is_logged_not_raised(self):
+        fake = type("R", (), {"find": lambda _, name: None})()
+        with self.assertLogs("sim", "WARNING"):
+            simlink.override_units(fake)
 
 
 class PressureAltitudeTest(unittest.TestCase):
-    """位置包最后一个字段：气压高度减真高。
+    """网络高度、气压高度和修正量（altitude.msfs_altitudes，照 xPilot）。
 
-    实报的现象是"座舱高度表 35000，服务器上 34000"，差了一千英尺。原因不是
-    单位错了，是两个高度本来就不是一回事：PLANE_ALTITUDE 是真高，高度表读的
-    是按窗口里那个气压算出来的指示高度。以前这个字段写死 0，管制端于是直接
-    拿真高当高度显示。
+    网络高度 = isa_altitude(PRESSURE ALTITUDE, SEA LEVEL PRESSURE)，
+    温度误差 = 网络高度 − PLANE ALTITUDE，修正量 = 气压高度 − 网络高度。
     """
 
-    def test_standard_setting_means_indicated_is_pressure_altitude(self):
-        # 拨 29.92 时指示高度就是气压高度，差值只剩指示高度和真高之差
-        self.assertEqual(
-            simlink.pressure_delta(35000.0, 29.92, 34000), 1000)
+    def _link(self, **values):
+        link = simlink.SimLink()
+        link.values = {"latitude": 31.0, "longitude": 121.0, **values}
+        return link.snapshot()
 
-    def test_no_difference_reports_zero(self):
-        self.assertEqual(simlink.pressure_delta(3000.0, 29.92, 3000), 0)
+    def test_standard_atmosphere(self):
+        snapshot = self._link(altitude=38000.0, pressure_altitude=38000.0,
+                              sea_level_pressure=1013.25)
+        self.assertEqual(snapshot["altitude"], 38000)
+        self.assertEqual(snapshot["network_altitude"], 38000)
+        self.assertEqual(snapshot["pressure_altitude"], 38000)
+        self.assertEqual(snapshot["temperature_error"], 0)
+        self.assertEqual(snapshot["pressure_delta"], 0)
 
-    def test_low_pressure_day(self):
-        # 拨 28.92（比标准低一寸），气压高度比指示高度高一千英尺
-        self.assertEqual(
-            simlink.pressure_delta(35000.0, 28.92, 35000), 1000)
+    def test_warm_atmosphere_sends_the_altimeter_altitude(self):
+        """FL380、标准海压、比 ISA 暖：真高 39700，位置包报 38000。"""
+        snapshot = self._link(altitude=39700.0, pressure_altitude=38000.0,
+                              sea_level_pressure=1013.25)
+        self.assertEqual(snapshot["altitude"], 39700)
+        self.assertEqual(snapshot["network_altitude"], 38000)
+        self.assertEqual(snapshot["temperature_error"], -1700)
+        self.assertEqual(snapshot["pressure_delta"], 0)
 
     def test_high_pressure_day(self):
-        self.assertEqual(
-            simlink.pressure_delta(0.0, 30.92, 0), -1000)
+        """海压 1030：FL380 在 ISA 温度下真高约 38334，修正量是负的。"""
+        true_altitude = altitude_module.isa_altitude(38000.0, 1030.0)
+        snapshot = self._link(altitude=true_altitude, pressure_altitude=38000.0,
+                              sea_level_pressure=1030.0)
+        self.assertEqual(snapshot["network_altitude"], round(true_altitude))
+        self.assertEqual(snapshot["temperature_error"], 0)
+        self.assertEqual(snapshot["pressure_altitude"], 38000)
+        self.assertAlmostEqual(snapshot["pressure_delta"], -334, delta=1)
+        self.assertEqual(snapshot["network_altitude"] + snapshot["pressure_delta"],
+                         38000)
 
-    def test_missing_readings_do_not_correct(self):
-        """读不到就退回修正前的行为，不能瞎猜。"""
-        self.assertEqual(simlink.pressure_delta(None, 29.92, 35000), 0)
-        self.assertEqual(simlink.pressure_delta(35000.0, None, 35000), 0)
+    def test_is_the_same_quantity_as_xplane_12(self):
+        """X-Plane 12 的 elevation + altimeter_temperature_error 也是拨海压时的读数。"""
+        true_altitude, pressure, sea_level = 36500.0, 35000.0, 1003.0
+        msfs = altitude_module.msfs_altitudes(true_altitude, sea_level, pressure)
+        error = altitude_module.isa_altitude(pressure, sea_level) - true_altitude
+        xp12 = altitude_module.xplane_altitudes(true_altitude, sea_level,
+                                                pressure, error)
+        for a, b in zip(msfs, xp12):
+            self.assertAlmostEqual(a, b, places=6)
 
-    def test_a_nonsense_barometer_does_not_correct(self):
-        """SimVar 读不到时会是 0，(29.92-0)*1000 会把飞机在雷达上挪三万英尺。"""
-        self.assertEqual(simlink.pressure_delta(35000.0, 0.0, 35000), 0)
-        self.assertEqual(simlink.pressure_delta(35000.0, 99.0, 35000), 0)
-
-    def test_snapshot_carries_it(self):
-        link = simlink.SimLink()
-        link.values = {
-            "latitude": 31.0, "longitude": 121.0,
-            "altitude": 34000.0,
-            "indicated_altitude": 35000.0, "baro_setting": 29.92,
-        }
-        self.assertEqual(link.snapshot()["pressure_delta"], 1000)
-
-    def test_snapshot_without_the_new_simvars_still_works(self):
-        """老的 Python-SimConnect 取不到这两个值时不能连整份数据一起丢。"""
-        link = simlink.SimLink()
-        link.values = {"latitude": 31.0, "longitude": 121.0, "altitude": 34000.0}
-        snapshot = link.snapshot()
-        self.assertEqual(snapshot["altitude"], 34000)
+    def test_without_pressure_altitude_nothing_is_corrected(self):
+        snapshot = self._link(altitude=34000.0, sea_level_pressure=1013.25)
+        self.assertEqual(snapshot["network_altitude"], 34000)
+        self.assertEqual(snapshot["pressure_altitude"], 34000)
         self.assertEqual(snapshot["pressure_delta"], 0)
+
+    def test_without_sea_level_pressure_the_sim_pressure_altitude_is_kept(self):
+        snapshot = self._link(altitude=34000.0, pressure_altitude=35000.0)
+        self.assertEqual(snapshot["network_altitude"], 34000)
+        self.assertEqual(snapshot["pressure_altitude"], 35000)
+        self.assertEqual(snapshot["temperature_error"], 0)
+        self.assertEqual(snapshot["pressure_delta"], 1000)
+
+    def test_pressure_altitude_read_in_metres_is_ignored(self):
+        """RequestList.py 的默认单位是 Meters：38000 ft 读成 11582。"""
+        snapshot = self._link(altitude=38000.0, pressure_altitude=11582.4,
+                              sea_level_pressure=1013.25)
+        self.assertEqual(snapshot["network_altitude"], 38000)
+        self.assertEqual(snapshot["pressure_altitude"], 38000)
+        self.assertEqual(snapshot["pressure_delta"], 0)
+
+    def test_nothing_reads_the_default_altimeter(self):
+        """INDICATED ALTITUDE / KOHLSMAN 是默认 1 号高度表，Fenix、PMDG 不驱动它。"""
+        for simvar in simlink.SIMVARS.values():
+            self.assertNotIn("INDICATED_ALTITUDE", simvar)
+            self.assertNotIn("KOHLSMAN", simvar)
+
+    def test_the_old_kollsman_formula_was_off_by_a_hundred_and_sixty_feet(self):
+        """实报：修正生效的地方差 100–200 ft。
+
+        Fenix 拨 STD 飞 FL380，海压 1030 hPa（30.42 inHg），ISA 温度。默认 1 号
+        高度表没人拨，停在 QNH 30.42，读数是拨海压时的高度。旧公式
+        indicated + (29.92 − Kollsman) × 1000 按 1000 ft/inHg 线性换算，
+        在 FL380 少算 165 ft。新路径直接读 PRESSURE ALTITUDE。
+        """
+        sea_level = 1030.0
+        kollsman = sea_level / altitude_module.INHG_TO_HPA
+        true_altitude = altitude_module.isa_altitude(38000.0, sea_level)
+        indicated = true_altitude          # 默认高度表拨在海压上
+        old = indicated + (29.92 - kollsman) * 1000.0
+        self.assertTrue(100 <= 38000 - old <= 200, 38000 - old)
+        snapshot = self._link(altitude=true_altitude, pressure_altitude=38000.0,
+                              sea_level_pressure=sea_level)
+        self.assertEqual(snapshot["pressure_altitude"], 38000)
+        self.assertEqual(snapshot["network_altitude"] + snapshot["pressure_delta"],
+                         38000)
 
 
 class TransponderModeTest(unittest.TestCase):
@@ -1176,6 +1330,999 @@ class InjectorTest(unittest.TestCase):
                       "万一模拟器其实建出来了，号码回来时要补删")
 
 
+class TakeControlTest(unittest.TestCase):
+    """建好的 AI 飞机要冻结并释放 AI 控制，否则两次写入之间 MSFS 自己推它。
+
+    实测 v2.2.12：他机"一卡卡，然后抽搐"——AI 的飞行模型在两次
+    SetDataOnSimObject 之间把飞机往别处带，下一次写入再拽回来。
+    """
+
+    def setUp(self):
+        import ctypes
+        import inject
+        self.inject = inject
+        self.ctypes = ctypes
+
+    def _fake(self, map_result=0, transmit_result=0):
+        """照 Python-SimConnect 的形状做的替身，记下每一次 DLL 调用。
+
+        dispatch 跳板在构造时就包好（SimConnect.py:140），收消息走跳板。
+        """
+        ctypes = self.ctypes
+        calls = []
+        packets = iter(range(500, 10000))
+
+        class Dll:
+            @staticmethod
+            def DispatchProc(func):
+                return ("trampoline", func)
+
+            @staticmethod
+            def AddToDataDefinition(*args):
+                return 0
+
+            @staticmethod
+            def MapClientEventToSimEvent(handle, event_id, name):
+                calls.append(("map", event_id, name))
+                if isinstance(map_result, Exception):
+                    raise map_result
+                return map_result
+
+            @staticmethod
+            def TransmitClientEvent(handle, object_id, event_id, data, group, flags):
+                calls.append(("transmit", object_id, event_id, data, group, flags))
+                return transmit_result
+
+            @staticmethod
+            def AIReleaseControl(handle, object_id, request_id):
+                calls.append(("release", object_id, request_id))
+                return 0
+
+            @staticmethod
+            def AICreateNonATCAircraft(handle, title, tail, init, request_id):
+                calls.append(("create", title, request_id))
+                return 0
+
+            @staticmethod
+            def AIRemoveObject(handle, object_id, request_id):
+                calls.append(("remove", object_id))
+                return 0
+
+            @staticmethod
+            def SetDataOnSimObject(*args):
+                calls.append(("move", args[2]))
+                return 0
+
+            @staticmethod
+            def GetLastSentPacketID(handle, pointer):
+                pointer._obj.value = next(packets)
+                return 0
+
+        class Sim:
+            def __init__(self):
+                self.dll = Dll()
+                self.hSimConnect = "handle"
+                self.my_dispatch_proc = self.original
+                self.my_dispatch_proc_rd = self.dll.DispatchProc(self.my_dispatch_proc)
+
+            def original(self, pData, cbData, pContext):
+                pass
+
+            def deliver(self, message):
+                return self.my_dispatch_proc_rd[1](ctypes.pointer(message), 0, None)
+
+        class Assigned(ctypes.Structure):
+            _fields_ = [("dwID", ctypes.c_uint32),
+                        ("dwRequestID", ctypes.c_uint32),
+                        ("dwObjectID", ctypes.c_uint32)]
+
+        class Init(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_double) for name in
+                        ("Latitude", "Longitude", "Altitude", "Pitch", "Bank",
+                         "Heading")] + [("OnGround", ctypes.c_uint32),
+                                        ("Airspeed", ctypes.c_uint32)]
+
+        class Enums:
+            SIMCONNECT_RECV_ID = type("R", (), {
+                "SIMCONNECT_RECV_ID_ASSIGNED_OBJECT_ID": 12,
+                "SIMCONNECT_RECV_ID_EXCEPTION": 9})()
+            SIMCONNECT_RECV_ASSIGNED_OBJECT_ID = Assigned
+            SIMCONNECT_DATA_INITPOSITION = Init
+            SIMCONNECT_DATATYPE = type("T", (), {"SIMCONNECT_DATATYPE_FLOAT64": 4})()
+            SIMCONNECT_UNUSED = 0xFFFFFFFF
+
+        sim = Sim()
+        injector = self.inject.TrafficInjector(sim=None)
+        injector.sim = sim
+        injector._enums = Enums
+        injector._install_dispatch()
+        injector._define_position()
+        injector._map_freeze_events()
+        injector.available = True
+        self.Assigned = Assigned
+        return injector, sim, calls
+
+    def _entry(self, model):
+        return {"callsign": "CES2345", "latitude": 31.2, "longitude": 121.5,
+                "altitude": 5000.0, "pitch": 2.0, "bank": 0.0, "heading": 90.0,
+                "groundspeed": 200, "on_ground": False, "model": model,
+                "equipment": "B738"}
+
+    def _assign(self, injector, sim, calls, object_id):
+        request_id = [c for c in calls if c[0] == "create"][-1][2]
+        sim.deliver(self.Assigned(dwID=12, dwRequestID=request_id,
+                                  dwObjectID=object_id))
+
+    def _control(self, calls, object_id):
+        return [c for c in calls
+                if c[0] in ("transmit", "release") and c[1] == object_id]
+
+    def test_lights_are_switched_on_change_only(self):
+        """他机的灯走 *_SET 事件发给那一架；第一次全发，之后变了才发。"""
+        injector, sim, calls = self._fake()
+        injector._map_light_events()
+        events = {key: event_id for key, event_id, _ in injector._light_events}
+        self.assertEqual(set(events), {key for key, _ in self.inject.LIGHT_EVENTS})
+
+        entry = self._entry("738")
+        entry["lights"] = {"landing_on": True, "beacon_on": True}
+        injector.sync([entry])
+        self._assign(injector, sim, calls, 4242)
+        del calls[:]
+        injector.sync([entry])
+        lights = {c[2]: c[3] for c in calls
+                  if c[0] == "transmit" and c[2] in events.values()}
+        self.assertEqual(len(lights), len(events), "第一次每盏灯都要发")
+        self.assertEqual(lights[events["landing_on"]], 1)
+        self.assertEqual(lights[events["taxi_on"]], 0)
+
+        del calls[:]
+        injector.sync([entry])
+        self.assertEqual([c for c in calls if c[0] == "transmit"], [])
+
+        entry["lights"] = {"landing_on": False, "beacon_on": True}
+        injector.sync([entry])
+        switched = [c for c in calls if c[0] == "transmit"]
+        self.assertEqual([(c[1], c[2], c[3]) for c in switched],
+                         [(4242, events["landing_on"], 0)])
+
+    def test_the_freeze_events_are_mapped_once_at_setup(self):
+        injector, sim, calls = self._fake()
+        maps = [c for c in calls if c[0] == "map"]
+        self.assertEqual([c[2] for c in maps], list(self.inject.FREEZE_EVENTS))
+        self.assertEqual(len({c[1] for c in maps}), 3, "三个事件要三个不同的号")
+        injector.sync([self._entry("738")])
+        self._assign(injector, sim, calls, 4242)
+        injector.sync([self._entry("738")])
+        self.assertEqual(len([c for c in calls if c[0] == "map"]), 3,
+                         "映射只在建注入器时做一次")
+
+    def test_an_assigned_object_is_frozen_and_released_once(self):
+        injector, sim, calls = self._fake()
+        injector.sync([self._entry("738")])
+        self._assign(injector, sim, calls, 4242)
+        injector.sync([self._entry("738")])
+        injector.sync([self._entry("738")])
+
+        control = self._control(calls, 4242)
+        releases = [c for c in control if c[0] == "release"]
+        transmits = [c for c in control if c[0] == "transmit"]
+        self.assertEqual(len(releases), 1, "AIReleaseControl 每个对象只发一次")
+        event_ids = {c[1] for c in calls if c[0] == "map"}
+        self.assertEqual({c[2] for c in transmits}, event_ids)
+        self.assertEqual(len(transmits), 3, "三个冻结事件每个对象各一次")
+        for _, object_id, _, data, group, flags in transmits:
+            self.assertEqual(object_id, 4242)
+            self.assertEqual(data, 1, "dwData=1 是冻上")
+            self.assertEqual(group, self.inject.GROUP_PRIORITY_HIGHEST)
+            self.assertEqual(flags, self.inject.EVENT_FLAG_GROUPID_IS_PRIORITY)
+        self.assertTrue(injector.aircraft["CES2345"]["frozen"])
+        # 冻结要在第一次写位置之前
+        first_move = next(i for i, c in enumerate(calls) if c[0] == "move")
+        last_control = max(i for i, c in enumerate(calls)
+                           if c in control)
+        self.assertLess(last_control, first_move)
+
+    def test_a_model_change_freezes_the_new_object_too(self):
+        injector, sim, calls = self._fake()
+        injector.sync([self._entry("通用模型")])
+        self._assign(injector, sim, calls, 4242)
+        injector.sync([self._entry("通用模型")])
+        # #SB 回来了，换模型 = 删了重建
+        injector.sync([self._entry("738 Air China")])
+        self.assertIn(("remove", 4242), calls)
+        self._assign(injector, sim, calls, 5151)
+        injector.sync([self._entry("738 Air China")])
+        self.assertEqual(len(self._control(calls, 4242)), 4)
+        self.assertEqual(len(self._control(calls, 5151)), 4,
+                         "重建出来的新对象没有被冻结")
+
+    def test_a_refused_call_is_logged_once_per_object(self):
+        injector, sim, calls = self._fake(transmit_result=-2147467259)
+        with self.assertLogs("inject", level="WARNING") as logs:
+            injector.sync([self._entry("738")])
+            self._assign(injector, sim, calls, 4242)
+            injector.sync([self._entry("738")])
+            injector.sync([self._entry("738")])
+        lines = [line for line in logs.output if "off AI control" in line]
+        self.assertEqual(len(lines), 1, logs.output)
+        self.assertIn("0x80004005", lines[0])
+        self.assertFalse(injector.aircraft["CES2345"]["frozen"])
+
+    def test_a_raised_hresult_is_caught(self):
+        # 包里 restype 是 ctypes.HRESULT：失败在 Windows 上是抛 OSError
+        injector, sim, calls = self._fake(map_result=OSError("-2147467259"))
+        self.assertEqual(injector._freeze_events, ())
+        injector.sync([self._entry("738")])
+        with self.assertLogs("inject", level="WARNING") as logs:
+            self._assign(injector, sim, calls, 4242)
+            injector.sync([self._entry("738")])
+        self.assertTrue(any("not frozen" in line for line in logs.output),
+                        logs.output)
+        # 冻结不了也照样释放 AI、照样写位置
+        self.assertIn("release", [c[0] for c in self._control(calls, 4242)])
+        self.assertIn(("move", 4242), calls)
+
+    def test_a_refused_freeze_names_the_aircraft(self):
+        injector, sim, calls = self._fake()
+        injector.sync([self._entry("738")])
+        self._assign(injector, sim, calls, 4242)
+        injector.sync([self._entry("738")])
+        packet = next(send_id for send_id, (_, _, what)
+                      in injector._control_packets.items()
+                      if what == "FREEZE_ALTITUDE_SET")
+        exceptions = type("X", (), {
+            "SIMCONNECT_EXCEPTION_CREATE_OBJECT_FAILED": 22,
+            "SIMCONNECT_EXCEPTION_OBJECT_OUTSIDE_REALITY_BUBBLE": 30,
+            "SIMCONNECT_EXCEPTION_OBJECT_CONTAINER": 31,
+        })
+        injector._enums.SIMCONNECT_EXCEPTION = exceptions
+        body = type("B", (), {"dwException": 3, "UNKNOWN_SENDID": packet})()
+        with self.assertLogs("inject", level="WARNING") as logs:
+            injector._note_exception(body)
+        self.assertIn("FREEZE_ALTITUDE_SET", logs.output[0])
+        self.assertIn("CES2345", logs.output[0])
+
+    def test_constants_match_the_simconnect_package(self):
+        try:
+            from SimConnect import Enum as sc_enum
+        except Exception:
+            self.skipTest("SimConnect package not installed")
+        self.assertEqual(self.inject.GROUP_PRIORITY_HIGHEST,
+                         sc_enum.SIMCONNECT_GROUP_PRIORITY_HIGHEST.value)
+        self.assertEqual(
+            self.inject.EVENT_FLAG_GROUPID_IS_PRIORITY,
+            int(sc_enum.SIMCONNECT_EVENT_FLAG.SIMCONNECT_EVENT_FLAG_GROUPID_IS_PRIORITY))
+        # 包自己的 EXCEPTION 结构体里，真正的 dwSendID 落在 UNKNOWN_SENDID 上
+        fields = [name for name, _ in sc_enum.SIMCONNECT_RECV_EXCEPTION._fields_]
+        self.assertEqual(fields[fields.index("dwException") + 1], "UNKNOWN_SENDID")
+
+
+class InjectionLoopTest(unittest.TestCase):
+    """写入频率：原来 Qt 定时器 5 Hz，MSFS 画面上一卡一卡。"""
+
+    def setUp(self):
+        import inject
+        self.inject = inject
+
+    def test_runs_off_the_calling_thread_at_the_target_rate(self):
+        import threading
+        seen = []
+        loop = self.inject.InjectionLoop(
+            lambda: seen.append((threading.current_thread(), time.perf_counter())))
+        loop.start()
+        time.sleep(1.0)
+        loop.stop()
+        threads = {thread for thread, _ in seen}
+        self.assertNotIn(threading.current_thread(), threads)
+        self.assertEqual(len(threads), 1, "应当是同一条常驻线程")
+        rate = (len(seen) - 1) / (seen[-1][1] - seen[0][1])
+        self.assertGreater(rate, self.inject.FRAME_RATE * 0.75, f"{rate:.1f} Hz")
+        self.assertLess(rate, self.inject.FRAME_RATE * 1.25, f"{rate:.1f} Hz")
+
+    def test_stop_is_final_and_restart_works(self):
+        calls = []
+        loop = self.inject.InjectionLoop(lambda: calls.append(1))
+        loop.start()
+        time.sleep(0.1)
+        loop.stop()
+        self.assertFalse(loop.running)
+        count = len(calls)
+        time.sleep(0.15)
+        self.assertEqual(len(calls), count, "stop() 之后还在跑")
+        loop.start()
+        time.sleep(0.1)
+        loop.stop()
+        self.assertGreater(len(calls), count, "停了之后再也起不来")
+
+    def test_a_failing_step_does_not_kill_the_loop(self):
+        calls = []
+
+        def step():
+            calls.append(1)
+            raise RuntimeError("boom")
+
+        loop = self.inject.InjectionLoop(step)
+        with self.assertLogs("inject", level="WARNING"):
+            loop.start()
+            time.sleep(0.15)
+            loop.stop()
+        self.assertGreater(len(calls), 1)
+
+
+def _frame_fake(inject, on_frame=None, fail=None):
+    """带 Frame / 地面请求 / 装饰字段的 Python-SimConnect 替身。
+
+    和 TakeControlTest 的一样，dispatch 跳板在构造时就包好（SimConnect.py:140），
+    收消息走跳板。fail 是 {DLL 函数名: 返回值或异常}。
+    """
+    import ctypes
+    import threading as threading_module
+
+    fail = fail or {}
+    calls = []
+    packets = iter(range(500, 100000))
+    lock = threading_module.Lock()
+
+    def record(entry):
+        with lock:
+            calls.append(entry)
+
+    def result(name):
+        value = fail.get(name, 0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    class Dll:
+        @staticmethod
+        def DispatchProc(func):
+            return ("trampoline", func)
+
+        @staticmethod
+        def AddToDataDefinition(handle, definition, name, unit, kind, epsilon, datum):
+            record(("define", definition, name, unit))
+            if name in fail:
+                return fail[name]
+            return 0
+
+        @staticmethod
+        def MapClientEventToSimEvent(handle, event_id, name):
+            return 0
+
+        @staticmethod
+        def SubscribeToSystemEvent(handle, event_id, name):
+            record(("subscribe", event_id, name))
+            return result("SubscribeToSystemEvent")
+
+        @staticmethod
+        def TransmitClientEvent(*args):
+            return 0
+
+        @staticmethod
+        def AIReleaseControl(*args):
+            return 0
+
+        @staticmethod
+        def AICreateNonATCAircraft(handle, title, tail, init, request_id):
+            record(("create", title, request_id, init.Altitude))
+            return 0
+
+        @staticmethod
+        def AIRemoveObject(handle, object_id, request_id):
+            record(("remove", object_id))
+            return 0
+
+        @staticmethod
+        def RequestDataOnSimObject(handle, request_id, definition, object_id,
+                                   period, flags, origin, interval, limit):
+            record(("request", request_id, definition, object_id, period,
+                    interval))
+            return result("RequestDataOnSimObject")
+
+        @staticmethod
+        def SetDataOnSimObject(handle, definition, object_id, flags, count,
+                               size, values):
+            record(("set", definition, object_id, list(values),
+                    threading_module.current_thread()))
+            if definition in fail:
+                value = fail[definition]
+                if isinstance(value, Exception):
+                    raise value
+                return value
+            return 0
+
+        @staticmethod
+        def GetLastSentPacketID(handle, pointer):
+            pointer._obj.value = next(packets)
+            return 0
+
+    class Sim:
+        def __init__(self):
+            self.dll = Dll()
+            self.hSimConnect = "handle"
+            self.forwarded = []
+            self.my_dispatch_proc = self.original
+            self.my_dispatch_proc_rd = self.dll.DispatchProc(self.my_dispatch_proc)
+
+        def original(self, pData, cbData, pContext):
+            self.forwarded.append(pData.contents.dwID)
+
+        def deliver(self, message):
+            return self.my_dispatch_proc_rd[1](
+                ctypes.cast(ctypes.pointer(message),
+                            ctypes.POINTER(Header)), 0, None)
+
+    class Header(ctypes.Structure):
+        _fields_ = [("dwID", ctypes.c_uint32)]
+
+    class Assigned(ctypes.Structure):
+        _fields_ = [("dwID", ctypes.c_uint32),
+                    ("dwRequestID", ctypes.c_uint32),
+                    ("dwObjectID", ctypes.c_uint32)]
+
+    class Event(ctypes.Structure):
+        _fields_ = [("dwID", ctypes.c_uint32), ("uGroupID", ctypes.c_uint32),
+                    ("uEventID", ctypes.c_uint32), ("dwData", ctypes.c_uint32)]
+
+    class ObjectData(ctypes.Structure):
+        # 真结构体的 dwData 是 DWORD * 8192，数据区从 40 字节处开始；这里只要
+        # "从 dwData 的偏移读 double" 这个语义
+        _fields_ = [("dwID", ctypes.c_uint32), ("dwRequestID", ctypes.c_uint32),
+                    ("dwObjectID", ctypes.c_uint32), ("dwDefineID", ctypes.c_uint32),
+                    ("dwFlags", ctypes.c_uint32), ("dwentrynumber", ctypes.c_uint32),
+                    ("dwoutof", ctypes.c_uint32), ("dwDefineCount", ctypes.c_uint32),
+                    ("dwData", ctypes.c_double * 2)]
+
+    class Init(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_double) for name in
+                    ("Latitude", "Longitude", "Altitude", "Pitch", "Bank",
+                     "Heading")] + [("OnGround", ctypes.c_uint32),
+                                    ("Airspeed", ctypes.c_uint32)]
+
+    class Enums:
+        SIMCONNECT_RECV_ID = type("R", (), {
+            "SIMCONNECT_RECV_ID_EXCEPTION": 1,
+            "SIMCONNECT_RECV_ID_EVENT_FRAME": 7,
+            "SIMCONNECT_RECV_ID_SIMOBJECT_DATA": 8,
+            "SIMCONNECT_RECV_ID_ASSIGNED_OBJECT_ID": 12})()
+        SIMCONNECT_RECV_ASSIGNED_OBJECT_ID = Assigned
+        SIMCONNECT_RECV_EVENT = Event
+        SIMCONNECT_RECV_SIMOBJECT_DATA = ObjectData
+        SIMCONNECT_DATA_INITPOSITION = Init
+        SIMCONNECT_DATATYPE = type("T", (), {"SIMCONNECT_DATATYPE_FLOAT64": 4})()
+        SIMCONNECT_UNUSED = 0xFFFFFFFF
+        SIMCONNECT_EXCEPTION = type("X", (), {
+            "SIMCONNECT_EXCEPTION_CREATE_OBJECT_FAILED": 22,
+            "SIMCONNECT_EXCEPTION_OBJECT_OUTSIDE_REALITY_BUBBLE": 30,
+            "SIMCONNECT_EXCEPTION_OBJECT_CONTAINER": 31,
+        })
+
+    sim = Sim()
+    injector = inject.TrafficInjector(sim=None)
+    injector.sim = sim
+    injector.on_frame = on_frame
+    injector._enums = Enums
+    # _setup() 的顺序，只是不去 import 真的 SimConnect
+    injector._install_dispatch()
+    injector._define_position()
+    injector._map_freeze_events()
+    injector._define_ground()
+    injector._define_surfaces()
+    injector._subscribe_frames()
+    injector.available = True
+    types = type("Types", (), {"Assigned": Assigned, "Event": Event,
+                               "ObjectData": ObjectData})
+    return injector, sim, calls, types
+
+
+def _traffic_entry(**overrides):
+    entry = {"callsign": "CES2345", "latitude": 31.2, "longitude": 121.5,
+             "altitude": 5000.0, "pitch": 2.0, "bank": 0.0, "heading": 90.0,
+             "groundspeed": 200, "on_ground": False, "model": "738",
+             "equipment": "B738", "agl": None, "nose_wheel": 0.0,
+             "gear_down": None, "flaps": 0.0}
+    entry.update(overrides)
+    return entry
+
+
+def _assign(sim, calls, types, object_id):
+    request_id = [c for c in calls if c[0] == "create"][-1][2]
+    sim.deliver(types.Assigned(dwID=12, dwRequestID=request_id,
+                               dwObjectID=object_id))
+
+
+class FrameEventTest(unittest.TestCase):
+    """注入跟着模拟器的 Frame 事件走，Frame 不来时退回 30 Hz 定时器。"""
+
+    def setUp(self):
+        import inject
+        self.inject = inject
+
+    def test_setup_subscribes_to_the_frame_event(self):
+        injector, sim, calls, _ = _frame_fake(self.inject)
+        self.assertIn(("subscribe", self.inject.FRAME_EVENT_ID, b"Frame"), calls)
+        self.assertTrue(injector.frames_subscribed)
+
+    def test_a_failed_subscription_is_logged_and_injection_still_works(self):
+        with self.assertLogs("inject", level="WARNING") as logs:
+            injector, sim, calls, types = _frame_fake(
+                self.inject, fail={"SubscribeToSystemEvent": OSError("-2147467259")})
+        self.assertFalse(injector.frames_subscribed)
+        self.assertTrue(any("Frame event" in line for line in logs.output))
+        injector.sync([_traffic_entry()])
+        _assign(sim, calls, types, 4242)
+        injector.sync([_traffic_entry()])
+        self.assertTrue([c for c in calls if c[0] == "set" and c[2] == 4242])
+
+    def test_a_frame_event_reaches_on_frame_through_the_trampoline(self):
+        frames = []
+        injector, sim, calls, types = _frame_fake(
+            self.inject, on_frame=lambda: frames.append(1))
+        sim.deliver(types.Event(dwID=7, uEventID=self.inject.FRAME_EVENT_ID))
+        self.assertEqual(frames, [1])
+        self.assertEqual(sim.forwarded, [],
+                         "自己订的 Frame 不该交给包的处理（它只会打一条坏掉的 DEBUG）")
+        # 别人的帧事件照样交回去
+        sim.deliver(types.Event(dwID=7, uEventID=3))
+        self.assertEqual(frames, [1])
+        self.assertEqual(sim.forwarded, [7])
+
+    def test_frames_drive_the_writes_on_the_loop_thread(self):
+        import threading
+        loop = None
+        injector, sim, calls, types = _frame_fake(
+            self.inject, on_frame=lambda: loop.frame())
+        injector.sync([_traffic_entry()])
+        _assign(sim, calls, types, 4242)
+        injector.sync([_traffic_entry()])
+        before = len(calls)
+        loop = self.inject.InjectionLoop(lambda: injector.sync([_traffic_entry()]))
+        with self.assertLogs("inject", level="INFO") as logs:
+            loop.start()
+            dispatch_frames = 0
+            for _ in range(30):             # 50 fps，0.6 s
+                sim.deliver(types.Event(dwID=7, uEventID=self.inject.FRAME_EVENT_ID))
+                dispatch_frames += 1
+                time.sleep(0.02)
+            mode = loop.mode
+            loop.stop()
+        self.assertEqual(mode, "frame")
+        self.assertTrue(any("follows the simulator's frames" in line
+                            for line in logs.output), logs.output)
+        writes = [c for c in calls[before:] if c[0] == "set" and c[2] == 4242
+                  and c[1] == injector.definition_id]
+        self.assertGreater(len(writes), dispatch_frames * 0.6,
+                           f"{len(writes)} writes for {dispatch_frames} frames")
+        self.assertLessEqual(len(writes), dispatch_frames + 3)
+        threads = {c[4] for c in writes}
+        self.assertNotIn(threading.current_thread(), threads,
+                         "写入不该在 dispatch 线程（这里是测试线程）上做")
+
+    def test_the_timer_takes_over_without_frames_and_hands_back(self):
+        steps = []
+        loop = self.inject.InjectionLoop(lambda: steps.append(time.perf_counter()),
+                                         frame_timeout=0.1)
+        with self.assertLogs("inject", level="INFO") as logs:
+            loop.start()
+            time.sleep(0.3)
+            self.assertEqual(loop.mode, "timer")
+            timer_steps = len(steps)
+            for _ in range(15):
+                loop.frame()
+                time.sleep(0.02)
+            self.assertEqual(loop.mode, "frame")
+            time.sleep(0.4)                 # Frame 停了（暂停）
+            self.assertEqual(loop.mode, "timer")
+            loop.stop()
+        self.assertGreater(timer_steps, 5, "没有 Frame 时定时器没有接手")
+        modes = [line for line in logs.output if "traffic injection" in line]
+        self.assertEqual(len(modes), 3, modes)
+        self.assertIn("timer", modes[0])
+        self.assertIn("frames", modes[1])
+        self.assertIn("timer", modes[2])
+
+    def test_frames_above_the_cap_are_thinned(self):
+        steps = []
+        loop = self.inject.InjectionLoop(lambda: steps.append(1),
+                                         max_frame_rate=60.0)
+        loop.start()
+        start = time.perf_counter()
+        frames = 0
+        while time.perf_counter() - start < 0.5:
+            loop.frame()
+            frames += 1
+            time.sleep(0.004)               # ~200 fps
+        loop.stop()
+        self.assertGreater(frames, 60)
+        self.assertLess(len(steps), 60 * 0.5 * 1.25 + 3,
+                        f"{len(steps)} steps for {frames} frames")
+
+    def test_stop_wakes_a_loop_waiting_for_a_frame_and_is_final(self):
+        steps = []
+        loop = self.inject.InjectionLoop(lambda: steps.append(1),
+                                         frame_timeout=5.0)
+        loop.frame()
+        loop.start()
+        time.sleep(0.05)
+        self.assertEqual(loop.mode, "frame")
+        began = time.perf_counter()
+        loop.stop()
+        self.assertLess(time.perf_counter() - began, 0.5,
+                        "stop() 等满了 Frame 超时")
+        self.assertFalse(loop.running)
+        count = len(steps)
+        for _ in range(5):
+            loop.frame()                    # 断开之后模拟器照样发 Frame
+            time.sleep(0.01)
+        self.assertEqual(len(steps), count, "停了之后 Frame 又把循环叫醒了")
+
+
+class GroundRequestTest(unittest.TestCase):
+    """每个注入对象向模拟器要地面标高和模型离地高度。"""
+
+    def setUp(self):
+        import inject
+        self.inject = inject
+
+    def _claimed(self, fail=None):
+        injector, sim, calls, types = _frame_fake(self.inject, fail=fail)
+        injector.sync([_traffic_entry()])
+        _assign(sim, calls, types, 4242)
+        injector.sync([_traffic_entry()])
+        return injector, sim, calls, types
+
+    def _requests(self, calls, object_id):
+        return [c for c in calls if c[0] == "request" and c[3] == object_id]
+
+    def test_definitions_are_separate_from_the_position(self):
+        injector, sim, calls, _ = _frame_fake(self.inject)
+        defined = {}
+        for _, definition, name, _unit in [c for c in calls if c[0] == "define"]:
+            defined.setdefault(definition, []).append(name)
+        position = defined.pop(injector.definition_id)
+        self.assertEqual(len(position), len(self.inject._Definition.FIELDS))
+        for definition, names in defined.items():
+            self.assertEqual(len(names), 1,
+                             f"定义 {definition} 里不止一个字段：{names}")
+        names = {n[0] for n in defined.values()}
+        self.assertIn(b"GROUND ALTITUDE", names)
+        self.assertIn(b"STATIC CG TO GROUND", names)
+        for _, name, _ in self.inject.SURFACE_FIELDS:
+            self.assertIn(name, names)
+            self.assertNotIn(name, position)
+
+    def test_a_claimed_object_asks_for_its_ground(self):
+        injector, sim, calls, _ = self._claimed()
+        requests = self._requests(calls, 4242)
+        ground = [c for c in requests if c[2] == injector.definition_id
+                  + self.inject.GROUND_DEFINITION_OFFSET]
+        height = [c for c in requests if c[2] == injector.definition_id
+                  + self.inject.HEIGHT_DEFINITION_OFFSET]
+        self.assertEqual(len(ground), 1)
+        self.assertEqual(ground[0][4], self.inject.PERIOD_SIM_FRAME)
+        self.assertEqual(ground[0][5], self.inject.GROUND_INTERVAL)
+        self.assertEqual(len(height), 1)
+        self.assertEqual(height[0][4], self.inject.PERIOD_ONCE)
+        injector.sync([_traffic_entry()])
+        self.assertEqual(len(self._requests(calls, 4242)), 2, "每个对象只要一次")
+
+    def _reply(self, sim, types, calls, kind_offset, injector, value, object_id=4242):
+        definition = injector.definition_id + kind_offset
+        request_id = next(c[1] for c in calls if c[0] == "request"
+                          and c[2] == definition and c[3] == object_id)
+        message = types.ObjectData(dwID=8, dwRequestID=request_id,
+                                   dwObjectID=object_id)
+        message.dwData[0] = value
+        sim.deliver(message)
+
+    def test_replies_are_consumed_and_clamp_an_aircraft_on_the_ground(self):
+        injector, sim, calls, types = self._claimed()
+        sim.forwarded.clear()               # ASSIGNED_OBJECT_ID 是要交回去的
+        with self.assertLogs("inject", level="INFO") as logs:
+            self._reply(sim, types, calls, self.inject.GROUND_DEFINITION_OFFSET,
+                        injector, 120.0)
+        self.assertTrue(any("reports the ground" in line for line in logs.output))
+        self._reply(sim, types, calls, self.inject.HEIGHT_DEFINITION_OFFSET,
+                    injector, 8.0)
+        self.assertEqual(sim.forwarded, [], "自己要的数据不该交给包的处理")
+        # 别人的 SIMOBJECT_DATA 照样交回去
+        sim.deliver(types.ObjectData(dwID=8, dwRequestID=3, dwObjectID=1))
+        self.assertEqual(sim.forwarded, [8])
+
+        mark = len(calls)
+        injector.sync([_traffic_entry(altitude=150.0, agl=7.0, on_ground=True)])
+        move = [c for c in calls[mark:] if c[0] == "set"
+                and c[1] == injector.definition_id][0]
+        self.assertAlmostEqual(move[3][2], 128.0, places=3,
+                               msg="在地面的飞机要落在本地地面 + 模型离地高度")
+
+    def test_no_ground_reply_writes_the_reported_altitude(self):
+        injector, sim, calls, types = self._claimed()
+        mark = len(calls)
+        injector.sync([_traffic_entry(altitude=150.0, agl=7.0, on_ground=True)])
+        move = [c for c in calls[mark:] if c[0] == "set"
+                and c[1] == injector.definition_id][0]
+        self.assertEqual(move[3][2], 150.0)
+
+    def test_an_implausible_ground_is_ignored_and_logged_once(self):
+        injector, sim, calls, types = self._claimed()
+        # 冻住的对象万一报 0：高原机场上会把飞机往下拽几千英尺
+        self._reply(sim, types, calls, self.inject.GROUND_DEFINITION_OFFSET,
+                    injector, 0.0)
+        with self.assertLogs("inject", level="WARNING") as logs:
+            for _ in range(3):
+                mark = len(calls)
+                injector.sync([_traffic_entry(altitude=6900.0, agl=8.0,
+                                              on_ground=True)])
+        move = [c for c in calls[mark:] if c[0] == "set"
+                and c[1] == injector.definition_id][0]
+        self.assertEqual(move[3][2], 6900.0)
+        self.assertEqual(len([l for l in logs.output if "not using it" in l]), 1)
+
+    def test_removal_stops_the_request_and_forgets_the_ground(self):
+        injector, sim, calls, types = self._claimed()
+        self._reply(sim, types, calls, self.inject.GROUND_DEFINITION_OFFSET,
+                    injector, 120.0)
+        injector.sync([])
+        never = [c for c in self._requests(calls, 4242)
+                 if c[4] == self.inject.PERIOD_NEVER]
+        self.assertEqual(len(never), 1)
+        self.assertLess(calls.index(never[0]), calls.index(("remove", 4242)),
+                        "要先停请求再删对象")
+        self.assertNotIn(4242, injector._ground)
+        self.assertEqual(injector._data_requests, {})
+
+    def test_a_refused_ground_request_names_the_aircraft(self):
+        injector, sim, calls, types = self._claimed()
+        packet = next(send_id for send_id, (_, _, what)
+                      in injector._control_packets.items()
+                      if what == "the ground elevation request")
+        body = type("B", (), {"dwException": 15, "UNKNOWN_SENDID": packet})()
+        with self.assertLogs("inject", level="WARNING") as logs:
+            injector._note_exception(body)
+        self.assertIn("ground elevation request", logs.output[0])
+        self.assertIn("CES2345", logs.output[0])
+
+    def test_a_request_that_raises_does_not_stop_the_aircraft(self):
+        with self.assertLogs("inject", level="WARNING") as logs:
+            injector, sim, calls, types = self._claimed(
+                fail={"RequestDataOnSimObject": OSError("-2147467259")})
+        self.assertTrue(any("could not request" in line for line in logs.output))
+        self.assertEqual(injector._data_requests, {})
+        mark = len(calls)
+        injector.sync([_traffic_entry()])
+        self.assertTrue([c for c in calls[mark:] if c[0] == "set"
+                         and c[1] == injector.definition_id])
+
+    def test_an_undefinable_ground_disables_the_requests(self):
+        with self.assertLogs("inject", level="WARNING"):
+            injector, sim, calls, types = self._claimed(
+                fail={b"GROUND ALTITUDE": -2147467259})
+        self.assertFalse(injector._ground_ready)
+        self.assertEqual(self._requests(calls, 4242), [])
+
+
+class SurfaceWriteTest(unittest.TestCase):
+    """起落架/襟翼/前轮：各自一个定义，被拒只丢那一个字段。"""
+
+    def setUp(self):
+        import inject
+        self.inject = inject
+
+    def _claimed(self, fail=None):
+        injector, sim, calls, types = _frame_fake(self.inject, fail=fail)
+        injector.sync([_traffic_entry()])
+        _assign(sim, calls, types, 4242)
+        return injector, sim, calls, types
+
+    def _definition(self, injector, key):
+        index = [k for k, _, _ in self.inject.SURFACE_FIELDS].index(key)
+        return injector.definition_id + self.inject.SURFACE_DEFINITION_OFFSET + index
+
+    def _writes(self, calls, definition, since=0):
+        return [c[3][0] for c in calls[since:] if c[0] == "set" and c[1] == definition]
+
+    def test_values_are_written_only_when_they_change(self):
+        injector, sim, calls, types = self._claimed()
+        gear = self._definition(injector, "gear")
+        flaps = self._definition(injector, "flaps_left")
+        for _ in range(3):
+            injector.sync([_traffic_entry(gear_down=True, flaps=0.25)])
+        self.assertEqual(self._writes(calls, gear), [1.0])
+        self.assertEqual(self._writes(calls, flaps), [0.25])
+        injector.sync([_traffic_entry(gear_down=False, flaps=0.25)])
+        self.assertEqual(self._writes(calls, gear), [1.0, 0.0])
+
+    def test_engines_follow_the_senders_config(self):
+        """AI 飞机建出来引擎就在转；对方关着车就把燃烧标志写 0，引擎声才停。"""
+        injector, sim, calls, types = self._claimed()
+        engines = [self._definition(injector, f"engine_{i}") for i in range(1, 5)]
+        injector.sync([_traffic_entry()])
+        self.assertEqual([self._writes(calls, d) for d in engines], [[1.0]] * 4,
+                         "没收到配置时按开车处理")
+        mark = len(calls)
+        injector.sync([_traffic_entry(engines_on=False)])
+        injector.sync([_traffic_entry(engines_on=False)])
+        self.assertEqual([self._writes(calls, d, mark) for d in engines], [[0.0]] * 4)
+        mark = len(calls)
+        injector.sync([_traffic_entry(engines_on=True)])
+        self.assertEqual([self._writes(calls, d, mark) for d in engines], [[1.0]] * 4)
+
+    def test_unknown_gear_on_the_ground_is_down(self):
+        injector, sim, calls, types = self._claimed()
+        injector.sync([_traffic_entry(on_ground=True, gear_down=None)])
+        self.assertEqual(self._writes(calls, self._definition(injector, "gear")),
+                         [1.0])
+
+    def test_a_refused_field_is_dropped_and_the_position_keeps_moving(self):
+        injector, sim, calls, types = self._claimed()
+        injector.sync([_traffic_entry(on_ground=True, nose_wheel=30.0)])
+        wheel = self._definition(injector, "nose_wheel")
+        self.assertEqual(self._writes(calls, wheel), [0.5])
+        packet = next(p for p, key in injector._surface_packets.items()
+                      if key == "nose_wheel")
+        body = type("B", (), {"dwException": 20, "UNKNOWN_SENDID": packet})()
+        with self.assertLogs("inject", level="WARNING") as logs:
+            injector._note_exception(body)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("GEAR CENTER STEER ANGLE", logs.output[0])
+        mark = len(calls)
+        injector.sync([_traffic_entry(on_ground=True, nose_wheel=-30.0)])
+        self.assertEqual(self._writes(calls, wheel, mark), [], "被拒过的字段又写了")
+        self.assertTrue([c for c in calls[mark:] if c[0] == "set"
+                         and c[1] == injector.definition_id],
+                        "装饰字段被拒不该拖累位置写入")
+
+    def test_a_raising_write_is_logged_once(self):
+        flaps = self._definition(self.inject.TrafficInjector(sim=None),
+                                 "flaps_right")
+        injector2, sim2, calls2, types2 = _frame_fake(
+            self.inject, fail={flaps: OSError("-2147467259")})
+        injector2.sync([_traffic_entry()])
+        _assign(sim2, calls2, types2, 4242)
+        with self.assertLogs("inject", level="WARNING") as logs:
+            for flap in (0.1, 0.2, 0.3):
+                injector2.sync([_traffic_entry(flaps=flap)])
+        self.assertEqual(len([l for l in logs.output
+                              if "TRAILING EDGE FLAPS RIGHT" in l]), 1)
+        self.assertEqual(len(self._writes(calls2, flaps)), 1)
+        self.assertEqual(len(self._writes(
+            calls2, self._definition(injector2, "flaps_left"))), 3)
+
+
+class GroundClampTest(unittest.TestCase):
+    """地面贴合的纯函数（xPilot 的 PerformGroundClamping）。"""
+
+    def setUp(self):
+        import inject
+        self.inject = inject
+
+    def _run(self, clamp, seconds, dt=1 / 60, start=0.0, **sample):
+        now = start
+        altitude = None
+        while now < start + seconds - 1e-9:
+            now += dt
+            altitude = clamp.update(now, dt, **sample)
+        return now, altitude
+
+    def test_on_the_ground_sits_on_local_ground_plus_model_height(self):
+        self.assertEqual(self.inject.ground_target_offset(
+            150.0, 7.0, 120.0, True, False, 8.0), -22.0)
+        clamp = self.inject.GroundClamp()
+        # 第一次拿到地面直接到位
+        self.assertAlmostEqual(clamp.update(0.0, 0.0, 150.0, 7.0, True, 120.0, 8.0),
+                               128.0)
+
+    def test_never_below_local_ground(self):
+        clamp = self.inject.GroundClamp()
+        self.assertEqual(clamp.update(0.0, 0.0, 90.0, None, False, 120.0, 8.0),
+                         128.0)
+
+    def test_airborne_offset_needs_two_seconds_near_the_ground(self):
+        f = self.inject.ground_target_offset
+        self.assertEqual(f(600.0, 80.0, 540.0, False, True), 20.0)
+        self.assertEqual(f(600.0, 80.0, 540.0, False, False), 0.0)
+        clamp = self.inject.GroundClamp()
+        sample = dict(altitude=600.0, agl=80.0, on_ground=False, local_ground=540.0)
+        _, altitude = self._run(clamp, 1.9, **sample)
+        self.assertEqual(altitude, 600.0, "不到两秒就用了偏移")
+        now, _ = self._run(clamp, 0.2, start=1.9, **sample)
+        self.assertEqual(clamp.target, 20.0)
+        _, altitude = self._run(clamp, 2.1, start=now, **sample)
+        self.assertAlmostEqual(altitude, 620.0, places=6, msg="着陆段 2 秒走完")
+
+    def test_landing_blends_in_two_seconds(self):
+        clamp = self.inject.GroundClamp()
+        airborne = dict(altitude=100.0, agl=100.0, on_ground=False, local_ground=30.0)
+        now, _ = self._run(clamp, 0.5, **airborne)
+        self.assertEqual(clamp.offset, 0.0)
+        # 接地：对方地面 0，本地地面 30
+        ground = dict(altitude=6.0, agl=6.0, on_ground=True, local_ground=30.0,
+                      model_height=6.0)
+        now, altitude = self._run(clamp, 1.0, start=now, **ground)
+        self.assertGreater(clamp.offset, 0.0)
+        self.assertLess(clamp.offset, 30.0, "一帧就跳到位了")
+        self.assertEqual(altitude, 36.0, "不低于地面 + 模型高度")
+        _, altitude = self._run(clamp, 1.1, start=now, **ground)
+        self.assertAlmostEqual(clamp.offset, 30.0, places=6)
+
+    def test_climb_out_takes_ten_seconds(self):
+        clamp = self.inject.GroundClamp()
+        ground = dict(altitude=6.0, agl=6.0, on_ground=True, local_ground=30.0,
+                      model_height=6.0)
+        now, _ = self._run(clamp, 0.1, **ground)
+        self.assertAlmostEqual(clamp.offset, 30.0)
+        climb = dict(altitude=500.0, agl=500.0, on_ground=False, local_ground=30.0)
+        now, _ = self._run(clamp, 5.0, start=now, **climb)
+        self.assertAlmostEqual(clamp.offset, 15.0, delta=0.2,
+                               msg="爬升段应当 10 秒走完，5 秒走一半")
+        self._run(clamp, 5.1, start=now, **climb)
+        self.assertEqual(clamp.offset, 0.0)
+
+    def test_above_the_ceiling_the_ground_is_ignored(self):
+        clamp = self.inject.GroundClamp()
+        self.assertEqual(clamp.update(0.0, 0.0, 18000.0, 17000.0, False, 40000.0),
+                         18000.0)
+
+    def test_the_result_does_not_depend_on_the_frame_rate(self):
+        results = []
+        for dt in (1 / 30, 1 / 60, 1 / 144):
+            clamp = self.inject.GroundClamp()
+            self._run(clamp, 0.1, dt=dt, altitude=6.0, agl=6.0, on_ground=True,
+                      local_ground=30.0, model_height=6.0)
+            _, altitude = self._run(clamp, 3.0, dt=dt, start=0.1, altitude=500.0,
+                                    agl=500.0, on_ground=False, local_ground=30.0)
+            results.append(clamp.offset)
+        self.assertAlmostEqual(min(results), max(results), delta=0.1, msg=results)
+
+    def test_an_implausible_local_ground_is_rejected(self):
+        clamp = self.inject.GroundClamp()
+        self.assertEqual(clamp.update(0.0, 0.0, 6900.0, 8.0, True, 0.0), 6900.0)
+        self.assertTrue(clamp.rejected)
+
+
+class ModelWaitTest(unittest.TestCase):
+    """机型还没问到时先等一会再建，免得通用模型建出来又换掉。"""
+
+    def setUp(self):
+        import inject
+        self.inject = inject
+
+    def _creates(self, calls):
+        return [c for c in calls if c[0] == "create"]
+
+    def test_a_known_type_is_created_at_once(self):
+        injector, sim, calls, _ = _frame_fake(self.inject)
+        injector.sync([_traffic_entry()], now=100.0)
+        self.assertEqual(len(self._creates(calls)), 1)
+
+    def test_an_unknown_type_waits_then_is_created_anyway(self):
+        injector, sim, calls, _ = _frame_fake(self.inject)
+        entry = _traffic_entry(equipment="", model="通用模型")
+        injector.sync([entry], now=100.0)
+        injector.sync([entry], now=100.0 + self.inject.MODEL_WAIT - 0.1)
+        self.assertEqual(self._creates(calls), [], "没等机型就建了")
+        injector.sync([entry], now=100.0 + self.inject.MODEL_WAIT)
+        self.assertEqual(len(self._creates(calls)), 1,
+                         "只发 @ 的老客户端也得看得见")
+
+    def test_the_type_arriving_during_the_wait_creates_the_right_model(self):
+        injector, sim, calls, _ = _frame_fake(self.inject)
+        injector.sync([_traffic_entry(equipment="", model="通用模型")], now=100.0)
+        injector.sync([_traffic_entry(model="738 Air China")], now=100.5)
+        creates = self._creates(calls)
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(creates[0][1], b"738 Air China")
+        self.assertEqual(injector._waiting_for_type, {})
+
+    def test_an_aircraft_that_leaves_while_waiting_is_forgotten(self):
+        injector, sim, calls, _ = _frame_fake(self.inject)
+        injector.sync([_traffic_entry(equipment="", model="通用模型")], now=100.0)
+        injector.sync([], now=100.5)
+        self.assertEqual(injector._waiting_for_type, {})
+
+
 class VoiceHostTest(unittest.TestCase):
     """语音服务器换域名之后，老配置里存的那个旧域名必须换掉。
 
@@ -1241,10 +2388,15 @@ class SharedCopyTest(unittest.TestCase):
     `ptt.py` 和 `theme.py` 是后加的共享件，同样一处都不能自己改。`chime.py`
     也一样：提示音的判定和播放只在 xpc/test_xpc.py 里测，两份不一致的话
     这边就成了没人测过的代码。
+
+    `micgain.py`、`denoise.py` 和它们的测试也是共享件：降噪、增益和限幅两边
+    必须一致，否则两个客户端发出去的响度和底噪不一样，校准就白做了。
     """
 
-    SHARED = ("voice.py", "traffic.py", "mumblecompat.py", "ptt.py",
-              "theme.py", "update.py", "chime.py", "observer.py")
+    SHARED = ("voice.py", "traffic.py", "altitude.py", "mumblecompat.py", "ptt.py",
+              "theme.py", "update.py", "chime.py", "observer.py",
+              "micgain.py", "test_micgain.py", "denoise.py", "test_denoise.py",
+              "calibration.py")
 
     def test_shared_files_are_byte_identical_to_xpc(self):
         here = os.path.dirname(os.path.abspath(__file__))
@@ -1379,6 +2531,1133 @@ class StoredPasswordTest(unittest.TestCase):
         self.write({"cid": "1234", "password": "", "remember_password": False})
         s = self.module.Settings(self.path)
         self.assertFalse(s.password_migrated)
+
+
+class MicCalibrationSettingsTest(unittest.TestCase):
+    """mic_calibration、mic_denoise 落盘；mic_volume 是本次会话的乘数，不落盘。"""
+
+    def setUp(self):
+        import denoise
+        import settings as settings_module
+        self.denoise = denoise
+        self.settings_module = settings_module
+        self._available = denoise.available
+        denoise.available = lambda: True
+        self.path = os.path.join(tempfile.mkdtemp(prefix="can-settings-"),
+                                 "settings.json")
+
+    def tearDown(self):
+        self.denoise.available = self._available
+
+    def test_calibration_and_denoise_round_trip(self):
+        s = self.settings_module.Settings(self.path)
+        s.mic_calibration["Mic A"] = {"gain_db": 8.5, "denoise": True}
+        s.save()
+        again = self.settings_module.Settings(self.path)
+        self.assertEqual(again.mic_calibration, {"Mic A": {"gain_db": 8.5, "denoise": True}})
+        self.assertTrue(again.mic_denoise)
+        self.assertEqual(again.baseline_for("Mic A"), 8.5)
+
+    def test_toggling_denoise_invalidates_the_baseline(self):
+        s = self.settings_module.Settings(self.path)
+        s.mic_calibration["Mic A"] = {"gain_db": 8.5, "denoise": True}
+        s.mic_denoise = False
+        self.assertIsNone(s.baseline_for("Mic A"))
+
+    def test_instances_do_not_share_the_dict(self):
+        a = self.settings_module.Settings(self.path + ".a")
+        b = self.settings_module.Settings(self.path + ".b")
+        a.mic_calibration["Mic A"] = {"gain_db": 1.0}
+        self.assertEqual(b.mic_calibration, {})
+
+    def test_mic_volume_is_not_persisted(self):
+        s = self.settings_module.Settings(self.path)
+        s.mic_volume = 150
+        s.save()
+        with open(self.path, encoding="utf-8") as f:
+            self.assertNotIn("mic_volume", json.load(f))
+        self.assertEqual(self.settings_module.Settings(self.path).mic_volume, 100)
+
+    def test_old_mic_volume_is_ignored(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"mic_volume": 170}, f)
+        self.assertEqual(self.settings_module.Settings(self.path).mic_volume, 100)
+
+    def test_corrupt_calibration_becomes_empty(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"mic_calibration": "x"}, f)
+        self.assertEqual(self.settings_module.Settings(self.path).mic_calibration, {})
+
+
+# ---------------------------------------------------------------------------
+# FSD 连接和他机：掉线重连、发送失败、快速位置包、重复样本、时间戳。
+# fsdpilot.py 是 msfs 自己的分叉，这些只在这里测。
+# ---------------------------------------------------------------------------
+
+import logging
+import re
+import socket
+import threading
+
+import fsdpilot
+import traffic as traffic_module
+
+CAN_FSD = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "can-fsd", "internal", "fsd")
+
+
+class _FakeClock:
+    """假的单调钟和假的 stop_event：wait(delay) 直接把钟拨过去。"""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.waits = []
+
+    def monotonic(self):
+        return self.now
+
+    def wait(self, delay):
+        self.waits.append(delay)
+        self.now += delay
+        return False
+
+    def is_set(self):
+        return False
+
+    def set(self):
+        pass
+
+
+class FsdRetryPolicyTest(unittest.TestCase):
+    """重连要熬过服务端的"幽灵连接"，认证失败则立刻停。
+
+    can-fsd 在旧连接死透之前拒绝同一个呼号（postoffice.go 的 register），
+    读超时 90 秒、空闲清理最长约 90 秒。老策略三次 × 3 秒就放弃，还连语音
+    一起下线。
+    """
+
+    def make_client(self, outcomes):
+        """outcomes 里每一项是一次 _connect 的结果：True，或一个 FAILURE_*。"""
+        client = fsdpilot.FSDPilot.__new__(fsdpilot.FSDPilot)
+        client.callsign = "CCA1501"
+        client.running = True
+        client.clock = _FakeClock()
+        client.stop_event = client.clock
+        client.reconnect_window = fsdpilot.RECONNECT_WINDOW
+        client.gave_up = False
+        client._retryable = False
+        client._failure = fsdpilot.FAILURE_TRANSIENT
+        client.states = []
+        client._status = lambda state, message: client.states.append(
+            ('reconnecting' if client._retryable and state in ('error', 'stopped')
+             else state, message))
+        client.connect_calls = 0
+
+        def fake_connect():
+            index = client.connect_calls
+            client.connect_calls += 1
+            outcome = outcomes[index] if index < len(outcomes) else outcomes[-1]
+            if outcome is True:
+                return True
+            client._failure = outcome
+            if outcome == fsdpilot.FAILURE_FATAL:
+                client._retryable = False
+            return False
+
+        client._connect = fake_connect
+        client._loop = lambda: None
+        client._close = lambda: None
+        return client
+
+    def run_client(self, client):
+        with mock.patch.object(fsdpilot.time, "monotonic", client.clock.monotonic):
+            client._run()
+
+    def test_the_window_outlasts_the_server_holding_the_callsign(self):
+        # can-fsd：readTimeout 90 s；空闲 60 s、每 30 s 扫一次
+        self.assertGreaterEqual(fsdpilot.RECONNECT_WINDOW, 120)
+
+    def test_a_callsign_held_by_the_ghost_is_waited_out(self):
+        in_use = fsdpilot.FAILURE_IN_USE
+        # 掉线后一分半左右都被旧连接占着（3+5+10+15+20+30 秒），然后放出来了
+        client = self.make_client([True] + [in_use] * 6 + [True, fsdpilot.FAILURE_FATAL])
+        self.run_client(client)
+        self.assertEqual(client.connect_calls, 9)
+        self.assertGreaterEqual(sum(client.clock.waits), 90)
+        self.assertFalse(client.gave_up)
+        self.assertGreater(client.connect_calls, 4, "老预算只有三次重试")
+        self.assertNotIn('offline', [state for state, _ in client.states])
+
+    def test_gives_up_only_after_the_whole_window(self):
+        client = self.make_client([True] + [fsdpilot.FAILURE_IN_USE] * 100)
+        self.run_client(client)
+        self.assertTrue(client.gave_up)
+        self.assertEqual(client.states[-1][0], 'offline')
+        self.assertGreaterEqual(sum(client.clock.waits), fsdpilot.RECONNECT_WINDOW)
+        self.assertLessEqual(max(client.clock.waits), max(fsdpilot.RECONNECT_DELAYS))
+
+    def test_a_dropped_link_that_cannot_reconnect_also_keeps_trying(self):
+        client = self.make_client([True] + [fsdpilot.FAILURE_TRANSIENT] * 100)
+        self.run_client(client)
+        self.assertTrue(client.gave_up)
+        self.assertGreater(client.connect_calls, 4)
+
+    def test_the_backoff_grows(self):
+        client = self.make_client([True] + [fsdpilot.FAILURE_TRANSIENT] * 100)
+        self.run_client(client)
+        waits = client.clock.waits
+        self.assertEqual(waits[0], fsdpilot.RECONNECT_DELAYS[0])
+        self.assertGreater(waits[3], waits[0])
+
+    def test_an_auth_failure_while_reconnecting_stops_at_once(self):
+        client = self.make_client([True, fsdpilot.FAILURE_IN_USE, fsdpilot.FAILURE_FATAL])
+        self.run_client(client)
+        self.assertEqual(client.connect_calls, 3)
+        self.assertFalse(client.gave_up)
+        # 掉线后一次、呼号被占后一次；认证失败之后不再等
+        self.assertEqual(len(client.clock.waits), 2)
+
+    def test_first_connection_in_use_is_waited_out(self):
+        """客户端崩了或断网后重开：头一次登录撞上的就是自己的旧连接。"""
+        client = self.make_client([fsdpilot.FAILURE_IN_USE] * 3 + [True, fsdpilot.FAILURE_FATAL])
+        self.run_client(client)
+        self.assertEqual(client.connect_calls, 5)
+
+    def test_first_connection_that_cannot_reach_the_server_is_not_retried(self):
+        client = self.make_client([fsdpilot.FAILURE_TRANSIENT])
+        self.run_client(client)
+        self.assertEqual(client.connect_calls, 1)
+        self.assertEqual(client.states, [])
+
+    def test_first_connection_with_a_bad_password_is_not_retried(self):
+        client = self.make_client([fsdpilot.FAILURE_FATAL])
+        self.run_client(client)
+        self.assertEqual(client.connect_calls, 1)
+
+
+class FsdLoginRefusalTest(unittest.TestCase):
+    """登录被拒时按 can-fsd 的错误码分类（internal/fsd/errors.go）。"""
+
+    def make_pilot(self):
+        states = []
+        pilot = fsdpilot.FSDPilot("fsd.example", "CCA1501", "1000", "pw",
+                                  on_status=lambda state, message: states.append(state))
+        return pilot, states
+
+    def test_callsign_in_use_is_retryable(self):
+        pilot, states = self.make_pilot()
+        self.assertFalse(pilot._handle_packet(
+            "$ERserver:CCA1501:1::Callsign already in use"))
+        self.assertEqual(pilot._failure, fsdpilot.FAILURE_IN_USE)
+        self.assertEqual(states, ['reconnecting'], "首连撞上呼号被占也不是终态")
+
+    def test_bad_password_is_terminal_even_mid_reconnect(self):
+        pilot, states = self.make_pilot()
+        pilot._retryable = True       # 已经登录过、正在重连
+        pilot._handle_packet("$ERserver:CCA1501:6::Invalid CID/password")
+        self.assertEqual(pilot._failure, fsdpilot.FAILURE_FATAL)
+        self.assertEqual(states, ['error'], "终态不能被翻成 reconnecting")
+
+    def test_rate_limited_and_kicked_are_terminal(self):
+        for packet in ("$ERserver:CCA1501:6::Too many failed attempts; try again later",
+                       "$ERserver:CCA1501:13::Recently disconnected by a supervisor"):
+            pilot, _ = self.make_pilot()
+            pilot._handle_packet(packet)
+            self.assertEqual(pilot._failure, fsdpilot.FAILURE_FATAL, packet)
+
+    def test_server_full_is_transient(self):
+        pilot, _ = self.make_pilot()
+        pilot._handle_packet("$ERserver:CCA1501:12::Server full")
+        self.assertEqual(pilot._failure, fsdpilot.FAILURE_TRANSIENT)
+
+    def test_codes_match_can_fsd(self):
+        path = os.path.join(CAN_FSD, "errors.go")
+        if not os.path.exists(path):
+            self.skipTest("边上没有 can-fsd")
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+        codes = dict(re.findall(r"(ErrCode\w+)\s*=\s*(\d+)", source))
+        self.assertEqual(codes["ErrCodeCallsignInUse"], fsdpilot.ERR_CALLSIGN_IN_USE)
+        self.assertEqual(codes["ErrCodeServerFull"], fsdpilot.ERR_SERVER_FULL)
+
+
+class _BrokenSocket:
+    """sendall 一律失败；shutdown 之后 recv 读到 EOF，之前一直超时。"""
+
+    def __init__(self):
+        self.shut = threading.Event()
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def sendall(self, data):
+        raise ConnectionResetError(10054, "connection reset by peer")
+
+    def recv(self, size):
+        if self.shut.wait(self.timeout or 0.01):
+            return b""
+        raise socket.timeout()
+
+    def shutdown(self, how):
+        self.shut.set()
+
+    def close(self):
+        self.shut.set()
+
+
+class FsdSendFailureTest(unittest.TestCase):
+    """发不出去必须真的触发重连，不能停在"重连中"什么也不做。"""
+
+    def test_a_failed_send_closes_the_socket(self):
+        pilot = fsdpilot.FSDPilot("fsd.example", "CCA1501", "1000", "pw")
+        sock = _BrokenSocket()
+        pilot._sock = sock
+        with self.assertLogs("fsd", logging.WARNING) as logs:
+            self.assertFalse(pilot._send("#TMCCA1501:@21800:hello"))
+        self.assertTrue(sock.shut.is_set(), "socket 该被 shutdown")
+        self.assertIsInstance(pilot._broken, ConnectionResetError)
+        self.assertIn("ConnectionResetError", "\n".join(logs.output))
+
+    def test_a_failed_position_send_leads_to_a_reconnect(self):
+        states = []
+        pilot = fsdpilot.FSDPilot("fsd.example", "CCA1501", "1000", "pw",
+                                  on_status=lambda state, message: states.append((state, message)))
+        pilot.update_position({"latitude": 31.0, "longitude": 121.0, "altitude": 3000,
+                               "groundspeed": 200, "pitch": 0.0, "bank": 0.0,
+                               "heading": 90.0})
+        calls = []
+
+        def fake_connect():
+            calls.append(1)
+            pilot._broken = None
+            if len(calls) > 1:
+                return False
+            pilot._sock = _BrokenSocket()
+            pilot._logged_in = True
+            return True
+
+        pilot._connect = fake_connect
+        waits = []
+        pilot.stop_event = mock.MagicMock()
+        pilot.stop_event.is_set.return_value = False
+        # 第一次等待之前就说明已经走到"安排重连"了；返回 True 让 _run 结束
+        pilot.stop_event.wait.side_effect = lambda delay: waits.append(delay) or True
+        pilot.running = True
+        worker = threading.Thread(target=pilot._run, daemon=True)
+        worker.start()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive(), "_loop 卡在一条坏掉的 socket 上了")
+        self.assertEqual(waits, [fsdpilot.RECONNECT_DELAYS[0]], "没有安排重连")
+        self.assertIn('reconnecting', [state for state, _ in states])
+
+    def test_a_receive_error_is_logged_with_its_type(self):
+        pilot = fsdpilot.FSDPilot("fsd.example", "CCA1501", "1000", "pw")
+
+        class Resetting:
+            def settimeout(self, timeout):
+                pass
+
+            def recv(self, size):
+                raise ConnectionResetError(10054, "reset")
+
+        pilot._sock = Resetting()
+        with self.assertLogs("fsd", logging.INFO) as logs:
+            self.assertEqual(pilot._read_packet(timeout=0.1), "")
+        self.assertIn("ConnectionResetError", "\n".join(logs.output))
+        self.assertIn("10054", "\n".join(logs.output))
+
+    def test_eof_is_logged_as_eof(self):
+        pilot = fsdpilot.FSDPilot("fsd.example", "CCA1501", "1000", "pw")
+
+        class Closed:
+            def settimeout(self, timeout):
+                pass
+
+            def recv(self, size):
+                return b""
+
+        pilot._sock = Closed()
+        with self.assertLogs("fsd", logging.INFO) as logs:
+            self.assertEqual(pilot._read_packet(timeout=0.1), "")
+        self.assertIn("EOF", "\n".join(logs.output))
+
+
+class FastPositionTest(unittest.TestCase):
+    """协议版本 101：收 ^ / #SL / #ST，别人的 Velocity 客户端才是 5 Hz。
+
+    报文取自 can-fsd docs/protocol.md 的示例，原样。
+    """
+
+    FAST = ("^DAL1151:40.6354992:-73.7795597:16.81:8.10:12582828:"
+            "0.0015:0.0001:0.0005:0.0001:0.0000:-0.0029:-0.40")
+    SLOW = ("#SLPRM4211:41.0844150:-73.1060790:26684.57:26961.66:4269806144:"
+            "196.8918:-1.4936:174.1947:-0.0000:-0.0000:-0.0001:-2.11")
+    STOPPED = "#STDAL2119:40.6453400:-73.7743400:13.56:-0.03:29360076:0.00"
+
+    def setUp(self):
+        self.table = traffic_module.TrafficTable()
+        self.pilot = fsdpilot.FSDPilot("fsd.example", "CCA1501", "1000", "pw",
+                                       traffic=self.table)
+        self.pilot._send = lambda packet: True
+
+    def test_logs_in_at_the_velocity_revision(self):
+        self.assertEqual(fsdpilot.PROTO_REVISION, 101)
+
+    def test_the_revision_is_the_one_can_fsd_forwards_fast_positions_to(self):
+        path = os.path.join(CAN_FSD, "client.go")
+        if not os.path.exists(path):
+            self.skipTest("边上没有 can-fsd")
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+        match = re.search(r"ProtoRevisionVelocity\s*=\s*(\d+)", source)
+        self.assertEqual(int(match.group(1)), fsdpilot.PROTO_REVISION)
+
+    def test_field_counts_match_can_fsd(self):
+        """我们的解析下限和 can-fsd 的 minFields 一致，示例报文也够数。"""
+        fast, stopped = can_fsd_fast_min_fields(self)
+        self.assertEqual(fast, len(self.FAST.split(":")))
+        self.assertEqual(fast, len(self.SLOW.split(":")))
+        self.assertEqual(stopped, len(self.STOPPED.split(":")))
+
+    def test_fast_position(self):
+        self.assertTrue(self.pilot._handle_packet(self.FAST))
+        aircraft = self.table.get("DAL1151")
+        self.assertIsNotNone(aircraft)
+        sample = aircraft.latest
+        self.assertAlmostEqual(sample.latitude, 40.6354992)
+        self.assertAlmostEqual(sample.longitude, -73.7795597)
+        self.assertAlmostEqual(sample.altitude, 16.81)
+        # X 向东、Y 向上、Z 向北；存的也是 (东, 上, 北)
+        self.assertEqual(sample.velocity, (0.0015, 0.0001, 0.0005))
+        attitude = fsdpilot.unpack_pbh(12582828)
+        self.assertAlmostEqual(sample.heading, attitude["heading"])
+
+    def test_rotation_agl_and_nose_wheel_are_kept(self):
+        """角速度是弧度每秒，X/Z 按 xPilot 的方向（低头、左坡为正）取反。"""
+        self.pilot._handle_packet(self.FAST)
+        sample = self.table.get("DAL1151").latest
+        pitch_rate, heading_rate, bank_rate = sample.rotation
+        self.assertAlmostEqual(pitch_rate, -math.degrees(0.0001))
+        self.assertAlmostEqual(heading_rate, 0.0)
+        self.assertAlmostEqual(bank_rate, math.degrees(0.0029))
+        self.assertAlmostEqual(sample.agl, 8.10)
+        self.assertAlmostEqual(sample.nose_wheel, -0.40)
+
+    def test_slow_variant_and_groundspeed(self):
+        self.pilot._handle_packet(self.SLOW)
+        sample = self.table.get("PRM4211").latest
+        self.assertEqual(sample.velocity, (196.8918, -1.4936, 174.1947))
+        expected = round(((174.1947 ** 2 + 196.8918 ** 2) ** 0.5) * 1.943844492)
+        self.assertEqual(sample.groundspeed, expected)
+        self.assertAlmostEqual(sample.nose_wheel, -2.11)
+
+    def test_stopped_variant_has_zero_velocity(self):
+        self.pilot._handle_packet(self.STOPPED)
+        sample = self.table.get("DAL2119").latest
+        self.assertEqual(sample.velocity, (0.0, 0.0, 0.0))
+        self.assertEqual(sample.rotation, (0.0, 0.0, 0.0))
+        self.assertEqual(sample.groundspeed, 0)
+        self.assertAlmostEqual(sample.agl, -0.03)
+        self.assertAlmostEqual(sample.nose_wheel, 0.0)
+
+    def test_our_own_fast_position_is_ignored(self):
+        self.pilot._handle_packet(self.FAST.replace("DAL1151", "CCA1501"))
+        self.assertNotIn("CCA1501", self.table)
+
+    def test_a_short_packet_is_ignored(self):
+        self.assertTrue(self.pilot._handle_packet("^DAL1151:40.0:-73.0"))
+        self.assertNotIn("DAL1151", self.table)
+
+    def test_fast_position_first_sight_asks_for_the_type(self):
+        sent = []
+        self.pilot._send = lambda packet: sent.append(packet) or True
+        self.pilot._handle_packet(self.FAST)
+        self.assertIn("#SBCCA1501:DAL1151:PIR", sent)
+
+
+def can_fsd_fast_min_fields(test):
+    """can-fsd 的 minFields：(^ / #SL 的段数, #ST 的段数)。"""
+    path = os.path.join(CAN_FSD, "packet.go")
+    if not os.path.exists(path):
+        test.skipTest("边上没有 can-fsd")
+    with open(path, encoding="utf-8") as f:
+        source = f.read()
+    fast = re.search(r"case PacketFastPilotPosition, PacketFastPilotPositionSlow:"
+                     r"\s*return (\d+)", source)
+    stopped = re.search(r"case PacketFastPilotPositionStopped:\s*return (\d+)", source)
+    return int(fast.group(1)), int(stopped.group(1))
+
+
+def moving_snapshot(**changes):
+    snapshot = {
+        "latitude": 31.143400, "longitude": 121.805000,
+        "altitude": 35000, "agl": 34000, "groundspeed": 450,
+        "pitch": 2.0, "bank": -5.0, "heading": 271.0,
+        "squawk": 2000, "xpdr_mode": 2, "on_ground": False,
+        "velocity_east": -231.2, "velocity_up": 2.5, "velocity_north": 4.1,
+        "pitch_rate": 0.5, "heading_rate": -3.0, "bank_rate": 1.5,
+        "nose_wheel": 0.0,
+    }
+    snapshot.update(changes)
+    return snapshot
+
+
+def parked_snapshot():
+    return moving_snapshot(
+        altitude=13, agl=0, groundspeed=0, on_ground=True,
+        velocity_east=0.0, velocity_up=0.0, velocity_north=0.0,
+        pitch_rate=0.0, heading_rate=0.0, bank_rate=0.0, nose_wheel=12.5)
+
+
+class FastPositionSendTest(unittest.TestCase):
+    """发 ^ / #SL / #ST。节奏和内容照 xPilot 的 networkmanager.cpp。"""
+
+    def setUp(self):
+        self.sent = []
+        self.pilot = fsdpilot.FSDPilot("fsd.example", "CCA1501", "1000", "pw")
+        self.pilot._send = lambda packet: self.sent.append(packet) or True
+        self.pilot.update_position(moving_snapshot())
+
+    def test_send_fast_is_off_until_the_server_says_so(self):
+        self.assertFalse(self.pilot.send_fast)
+
+    def test_send_fast_on_and_off(self):
+        self.assertTrue(self.pilot._handle_packet("$SFSERVER:CCA1501:1"))
+        self.assertTrue(self.pilot.send_fast)
+        self.assertTrue(self.pilot._handle_packet("$SFSERVER:CCA1501:0"))
+        self.assertFalse(self.pilot.send_fast)
+
+    def test_send_fast_for_someone_else_is_ignored(self):
+        self.pilot._handle_packet("$SFSERVER:CES2345:1")
+        self.assertFalse(self.pilot.send_fast)
+
+    def test_the_fast_tick_sends_a_fast_position(self):
+        self.assertEqual(self.pilot._send_fast_position(slow=False), "^")
+        self.assertTrue(self.sent[0].startswith("^CCA1501:"))
+
+    def test_fast_field_layout_matches_can_fsd(self):
+        fast, _ = can_fsd_fast_min_fields(self)
+        self.pilot._send_fast_position(slow=False)
+        fields = self.sent[0].split(":")
+        self.assertEqual(len(fields), fast)
+        self.assertEqual(float(fields[1]), 31.1434)          # 纬度
+        self.assertEqual(float(fields[2]), 121.805)          # 经度
+        self.assertEqual(fields[3], "35000.00")              # 真高，英尺
+        self.assertEqual(fields[4], "34000.00")              # 离地高，英尺
+        attitude = fsdpilot.unpack_pbh(int(fields[5]))       # 和 `@` 同一个 PBH
+        self.assertAlmostEqual(attitude["pitch"], 2.0, delta=0.4)
+        self.assertAlmostEqual(attitude["bank"], -5.0, delta=0.4)
+        self.assertAlmostEqual(attitude["heading"], 271.0, delta=0.4)
+        # 速度：东、上、北，米每秒
+        self.assertEqual([float(v) for v in fields[6:9]], [-231.2, 2.5, 4.1])
+        # 角速度：弧度每秒，低头/右转/左坡为正（xPilot 发 -Q、R、-P）
+        self.assertAlmostEqual(float(fields[9]), -math.radians(0.5), places=4)
+        self.assertAlmostEqual(float(fields[10]), math.radians(-3.0), places=4)
+        self.assertAlmostEqual(float(fields[11]), -math.radians(1.5), places=4)
+        self.assertEqual(fields[12], "0.00")                 # 前轮角，度
+
+    def test_a_parked_aircraft_sends_stopped(self):
+        _, stopped = can_fsd_fast_min_fields(self)
+        self.pilot.update_position(parked_snapshot())
+        self.assertEqual(self.pilot._send_fast_position(slow=False), "#ST")
+        fields = self.sent[0].split(":")
+        self.assertTrue(fields[0].startswith("#STCCA1501"))
+        self.assertEqual(len(fields), stopped)
+        self.assertEqual(fields[6], "12.50")                 # 前轮角
+
+    def test_the_slow_tick_sends_slow_only_when_moving(self):
+        _ = self.pilot._send_fast_position(slow=True)
+        self.assertTrue(self.sent[0].startswith("#SLCCA1501:"))
+        self.assertEqual(len(self.sent[0].split(":")), 13)
+        self.pilot.update_position(parked_snapshot())
+        self.assertIsNone(self.pilot._send_fast_position(slow=True))
+        self.assertEqual(len(self.sent), 1)
+
+    def test_turning_fast_off_hands_over_to_slow(self):
+        """关掉时补一个包：在动补 #SL（别人手里的速度不能被清零）。"""
+        self.pilot._handle_packet("$SFSERVER:CCA1501:1")
+        self.pilot._handle_packet("$SFSERVER:CCA1501:0")
+        self.assertTrue(self.sent[-1].startswith("#SLCCA1501:"))
+
+    def test_turning_fast_off_while_parked_sends_stopped(self):
+        self.pilot.update_position(parked_snapshot())
+        self.pilot._handle_packet("$SFSERVER:CCA1501:1")
+        self.pilot._handle_packet("$SFSERVER:CCA1501:0")
+        self.assertTrue(self.sent[-1].startswith("#STCCA1501:"))
+
+    def test_a_repeated_flag_sends_nothing(self):
+        self.pilot._handle_packet("$SFSERVER:CCA1501:0")
+        self.assertEqual(self.sent, [])
+
+    def test_nothing_without_a_snapshot(self):
+        pilot = fsdpilot.FSDPilot("fsd.example", "CCA1501", "1000", "pw")
+        pilot._send = self.sent.append
+        self.assertIsNone(pilot._send_fast_position(slow=False))
+        self.assertEqual(self.sent, [])
+
+    def test_clearing_the_simulator_sample_stops_fast_packets(self):
+        self.pilot._send_fast_position(slow=False)
+        self.pilot.update_position(None)
+        self.assertIsNone(self.pilot._send_fast_position(slow=False))
+        self.assertEqual(len(self.sent), 1)
+
+    def test_small_rates_count_as_stopped(self):
+        self.assertTrue(fsdpilot.is_stopped(parked_snapshot()))
+        self.assertTrue(fsdpilot.is_stopped(moving_snapshot(
+            velocity_east=0.001, velocity_up=0.0, velocity_north=0.0,
+            pitch_rate=0.0, heading_rate=0.1, bank_rate=0.0)))
+        self.assertFalse(fsdpilot.is_stopped(moving_snapshot()))
+
+    def test_what_we_send_is_what_we_receive(self):
+        """我们发出去的 ^，另一个我们收进来，速度和角速度原样还原。"""
+        self.pilot._send_fast_position(slow=False)
+        table = traffic_module.TrafficTable()
+        other = fsdpilot.FSDPilot("fsd.example", "CES2345", "1001", "pw",
+                                  traffic=table)
+        other._send = lambda packet: True
+        other._handle_packet(self.sent[0])
+        sample = table.get("CCA1501").latest
+        self.assertEqual(sample.velocity, (-231.2, 2.5, 4.1))
+        for got, want in zip(sample.rotation, (0.5, -3.0, 1.5)):
+            self.assertAlmostEqual(got, want, delta=0.01)
+        self.assertAlmostEqual(sample.agl, 34000.0)
+
+    def test_the_login_sequence_sends_at_then_a_fast_position(self):
+        """_loop 一开头：先 `@`，再一个快速位置（停着就是 #ST）。"""
+        self.pilot.update_position(parked_snapshot())
+        self.pilot.running = False          # 循环体一次都不跑
+        self.pilot._loop()
+        self.assertTrue(self.sent[0].startswith("@"))
+        self.assertTrue(self.sent[1].startswith("#STCCA1501:"))
+
+
+class VelocityTrafficTest(unittest.TestCase):
+    """发过快速位置的飞机按上报的速度走；`@` 从此只是心跳。"""
+
+    def setUp(self):
+        self.table = traffic_module.TrafficTable()
+
+    def fast(self, at, lat=30.0, lon=120.0, velocity=(0.0, 5.0, 100.0)):
+        self.table.update_position("DAL1", latitude=lat, longitude=lon,
+                                   altitude=10000.0, pitch=0.0, bank=0.0,
+                                   heading=0.0, velocity=velocity, now=at)
+
+    def slow(self, at, lat, lon=120.0, squawk=1234, groundspeed=250):
+        self.table.update_position("DAL1", latitude=lat, longitude=lon,
+                                   altitude=10000, pitch=0.0, bank=0.0,
+                                   heading=0.0, squawk=squawk,
+                                   groundspeed=groundspeed, now=at)
+
+    def test_moves_along_the_velocity(self):
+        self.fast(100.0)
+        position = self.table.get("DAL1").state_at(101.0)
+        self.assertAlmostEqual(position["latitude"],
+                               30.0 + 100.0 / traffic_module.METRES_PER_DEGREE)
+        self.assertAlmostEqual(position["altitude"],
+                               10000.0 + 5.0 * traffic_module.FEET_PER_METRE)
+
+    def test_slow_position_does_not_move_it(self):
+        self.fast(100.0, lat=30.0)
+        self.slow(100.1, lat=30.5, squawk=4321, groundspeed=260)
+        aircraft = self.table.get("DAL1")
+        self.assertEqual(aircraft.latest.latitude, 30.0, "`@` 不该替换带速度的样本")
+        self.assertEqual(aircraft.motion.target[0], 30.0)
+        self.assertEqual(aircraft.squawk, 4321, "应答机还是要跟 `@` 走")
+        self.assertEqual(aircraft.latest.groundspeed, 260)
+
+    def test_slow_positions_never_count_again(self):
+        """xPilot 的 HaveVelocities：发过一次快速位置，`@` 就永远只是心跳。"""
+        self.fast(100.0, lat=30.0, velocity=(0.0, 0.0, 0.0))
+        self.slow(130.0, lat=30.5)
+        aircraft = self.table.get("DAL1")
+        self.assertEqual(aircraft.latest.latitude, 30.0)
+        self.assertAlmostEqual(aircraft.state_at(131.0)["latitude"], 30.0)
+
+    def test_slow_positions_keep_it_alive(self):
+        self.fast(100.0)
+        self.slow(110.0, lat=30.0)
+        self.assertEqual(self.table.prune(now=100.0 + traffic_module.STALE_AFTER + 1), [])
+
+    def test_vertical_speed_comes_from_the_velocity(self):
+        self.fast(100.0, velocity=(0.0, 5.08, 0.0))
+        self.assertAlmostEqual(self.table.get("DAL1").vertical_speed,
+                               5.08 * traffic_module.FEET_PER_METRE * 60.0)
+
+    def test_a_repeated_fast_snapshot_does_not_pull_it_back(self):
+        """发送方快照没刷新、同一个位置又发了一遍：只换速度，不往回拽。"""
+        self.fast(100.0)
+        before = self.table.get("DAL1").state_at(100.2)["latitude"]
+        self.fast(100.2)                      # 同一份快照
+        aircraft = self.table.get("DAL1")
+        self.assertEqual(aircraft.motion.error_remaining, 0.0)
+        later = aircraft.state_at(100.4)["latitude"]
+        self.assertAlmostEqual(later - before,
+                               0.2 * 100.0 / traffic_module.METRES_PER_DEGREE)
+
+
+class MotionTest(unittest.TestCase):
+    """xPilot 的运动模型（network_aircraft.cpp），纯的积分器。"""
+
+    def motion(self, heading=90.0, velocity=(0.0, 0.0, 0.0),
+               rotation=(0.0, 0.0, 0.0), lat=30.0, lon=120.0, altitude=10000.0):
+        motion = traffic_module.Motion()
+        motion.receive(lat, lon, altitude, 0.0, 0.0, heading,
+                       velocity=velocity, rotation=rotation)
+        return motion
+
+    def test_nothing_to_draw_before_the_first_sample(self):
+        motion = traffic_module.Motion()
+        motion.advance(1.0)
+        self.assertIsNone(motion.state())
+
+    def test_the_first_sample_is_drawn_where_it_is(self):
+        state = self.motion(heading=271.0).state()
+        self.assertEqual((state["latitude"], state["longitude"], state["altitude"]),
+                         (30.0, 120.0, 10000.0))
+        self.assertAlmostEqual(state["heading"], 271.0)
+
+    def test_constant_velocity_is_a_straight_line(self):
+        motion = self.motion(velocity=(0.0, 5.0, 100.0))
+        for _ in range(60):
+            motion.advance(1.0 / 30.0)
+        state = motion.state()
+        self.assertAlmostEqual(state["latitude"],
+                               30.0 + 200.0 / traffic_module.METRES_PER_DEGREE, places=12)
+        self.assertEqual(state["longitude"], 120.0)
+        self.assertAlmostEqual(state["altitude"],
+                               10000.0 + 10.0 * traffic_module.FEET_PER_METRE, places=9)
+
+    def test_the_result_does_not_depend_on_the_frame_rate(self):
+        """30 Hz 注入、10 Hz 推送、插件每帧：同样的时长，同样的结果。"""
+        def run(frames):
+            motion = self.motion(velocity=(80.0, 3.0, 60.0), rotation=(1.0, 3.0, -2.0))
+            motion.advance(0.3)
+            motion.receive(30.0002, 120.001, 10020.0, 1.0, 5.0, 92.0,
+                           velocity=(82.0, 3.0, 58.0), rotation=(1.0, 3.0, -2.0))
+            for _ in range(frames):
+                motion.advance(3.0 / frames)
+            return motion.state()
+        coarse, fine = run(3), run(300)
+        for key in ("latitude", "longitude", "altitude", "pitch", "bank", "heading"):
+            self.assertAlmostEqual(coarse[key], fine[key], places=6, msg=key)
+
+    def test_a_new_sample_does_not_move_the_drawn_aircraft(self):
+        motion = self.motion(velocity=(100.0, 0.0, 0.0))
+        motion.advance(0.2)
+        before = motion.state()
+        motion.receive(30.001, 120.003, 10050.0, 3.0, 10.0, 95.0,
+                       velocity=(100.0, 0.0, 0.0))
+        after = motion.state()
+        for key in before:
+            self.assertEqual(before[key], after[key], key)
+
+    def test_an_error_converges_over_two_seconds(self):
+        """误差 =（上报 − 画出）/ 2 秒，2 秒后正好落在上报位置的延长线上。"""
+        velocity = (100.0, 2.0, 50.0)
+        motion = self.motion(velocity=velocity)
+        motion.advance(0.2)
+        target = (30.0003, 120.0021, 10010.0)
+        motion.receive(*target, 0.0, 0.0, 90.0, velocity=velocity)
+        for _ in range(10):
+            motion.advance(traffic_module.ERROR_TIME / 10)
+        state = motion.state()
+        cos_lat = math.cos(math.radians(30.0003))
+        expected_lat = target[0] + 2.0 * 50.0 / traffic_module.METRES_PER_DEGREE
+        expected_lon = target[1] + 2.0 * 100.0 / (traffic_module.METRES_PER_DEGREE * cos_lat)
+        self.assertAlmostEqual(state["latitude"], expected_lat, places=8)
+        self.assertAlmostEqual(state["longitude"], expected_lon, places=7)
+        self.assertAlmostEqual(state["altitude"],
+                               target[2] + 2.0 * 2.0 * traffic_module.FEET_PER_METRE,
+                               places=6)
+
+    def test_the_correction_is_continuous(self):
+        """修正是速度，不是跳变：每一帧走的距离都差不多。"""
+        motion = self.motion(velocity=(0.0, 0.0, 100.0))
+        motion.advance(0.2)
+        motion.receive(30.0005, 120.0, 10000.0, 0.0, 0.0, 90.0,
+                       velocity=(0.0, 0.0, 100.0))
+        previous = motion.state()["latitude"]
+        steps = []
+        for _ in range(90):
+            motion.advance(1.0 / 30.0)
+            latitude = motion.state()["latitude"]
+            steps.append(latitude - previous)
+            previous = latitude
+        largest = max(steps) * traffic_module.METRES_PER_DEGREE
+        self.assertLess(largest, (100.0 + 30.0) / 30.0,
+                        "一帧走得比速度加误差速度还多，是跳过去的")
+
+    def test_the_error_stops_after_two_seconds(self):
+        motion = self.motion(velocity=(0.0, 0.0, 0.0))
+        motion.receive(30.001, 120.0, 10000.0, 0.0, 0.0, 90.0)
+        motion.advance(traffic_module.ERROR_TIME + 5.0)
+        self.assertAlmostEqual(motion.state()["latitude"], 30.001, places=9)
+
+    def test_rotation_rates_integrate(self):
+        motion = self.motion(heading=90.0, rotation=(0.0, 3.0, 0.0))
+        motion.advance(0.4)
+        self.assertAlmostEqual(motion.state()["heading"], 91.2, places=6)
+
+    def test_rotation_rates_are_cleared_after_half_a_second(self):
+        """0.5 秒没有新样本：角速度清零，姿态落到最后上报的那个。"""
+        motion = self.motion(heading=90.0, rotation=(0.0, 3.0, 0.0))
+        motion.advance(0.6)
+        self.assertEqual(motion.rotation, (0.0, 0.0, 0.0))
+        self.assertAlmostEqual(motion.state()["heading"], 90.0, places=6)
+        motion.advance(5.0)
+        self.assertAlmostEqual(motion.state()["heading"], 90.0, places=6)
+
+    def test_positional_velocity_survives_the_rotation_timeout(self):
+        motion = self.motion(velocity=(0.0, 0.0, 100.0), rotation=(0.0, 3.0, 0.0))
+        motion.advance(1.0)
+        self.assertAlmostEqual(motion.state()["latitude"],
+                               30.0 + 100.0 / traffic_module.METRES_PER_DEGREE)
+
+    def test_a_late_sample_brings_no_rotation(self):
+        """xPilot 在 UpdateVelocityVectors 里先清角速度：隔太久的样本的角速度不算。"""
+        motion = self.motion(heading=90.0)
+        motion.advance(1.0)
+        motion.receive(30.0, 120.0, 10000.0, 0.0, 0.0, 100.0, rotation=(0.0, 3.0, 0.0))
+        self.assertEqual(motion.rotation, (0.0, 0.0, 0.0))
+        self.assertAlmostEqual(motion.state()["heading"], 100.0, places=6)
+
+    def test_an_attitude_error_is_corrected_the_short_way_across_north(self):
+        motion = self.motion(heading=359.0)
+        motion.advance(0.2)
+        motion.receive(30.0, 120.0, 10000.0, 0.0, 0.0, 1.0)
+        motion.advance(0.2)
+        heading = motion.state()["heading"]
+        self.assertTrue(heading > 359.0 or heading < 1.0, heading)
+        # 走一半（误差速度 2°/2 s，0.2 s 走 0.2°）
+        self.assertAlmostEqual(heading, 359.2, places=6)
+
+    def test_heading_rate_crosses_north(self):
+        motion = self.motion(heading=359.0, rotation=(0.0, 5.0, 0.0))
+        motion.advance(0.4)
+        self.assertAlmostEqual(motion.state()["heading"], 1.0, places=6)
+
+    def test_longitude_wraps_across_the_antimeridian(self):
+        motion = self.motion(lon=179.9999, velocity=(100.0, 0.0, 0.0))
+        motion.advance(1.0)
+        longitude = motion.state()["longitude"]
+        self.assertTrue(-180.0 <= longitude < -179.99, longitude)
+
+    def test_bank_and_pitch_come_back_out(self):
+        motion = traffic_module.Motion()
+        motion.receive(30.0, 120.0, 0.0, 4.0, -20.0, 200.0)
+        state = motion.state()
+        self.assertAlmostEqual(state["pitch"], 4.0, places=9)
+        self.assertAlmostEqual(state["bank"], -20.0, places=9)
+        self.assertAlmostEqual(state["heading"], 200.0, places=9)
+
+
+class SlowSenderTest(unittest.TestCase):
+    """只发 `@` 的客户端：用相邻两个样本算速度，走同一条误差速度的路。"""
+
+    def setUp(self):
+        self.table = traffic_module.TrafficTable()
+
+    def add(self, at, lat, lon=120.0, altitude=10000, heading=90.0):
+        self.table.update_position("CES2345", latitude=lat, longitude=lon,
+                                   altitude=altitude, pitch=0.0, bank=0.0,
+                                   heading=heading, groundspeed=250, now=at)
+
+    def at(self, now):
+        return self.table.get("CES2345").state_at(now)
+
+    def test_a_single_sample_is_held(self):
+        self.add(100.0, 30.0)
+        self.assertAlmostEqual(self.at(105.0)["latitude"], 30.0)
+
+    def test_velocity_is_derived_from_two_samples(self):
+        self.add(100.0, 30.0, altitude=10000)
+        self.add(101.0, 30.01, altitude=10010)
+        east, up, north = self.table.get("CES2345").motion.velocity
+        self.assertAlmostEqual(north, 0.01 * traffic_module.METRES_PER_DEGREE, places=6)
+        self.assertAlmostEqual(up, 10 * traffic_module.METRES_PER_FOOT, places=9)
+        self.assertAlmostEqual(east, 0.0, places=9)
+
+    def test_it_moves_smoothly_and_catches_up(self):
+        """5 Hz 的 `@`：每个样本到达时画面不跳，最后跟上真实位置。"""
+        speed = 0.001                        # 度每秒，匀速向北
+        now = 100.0
+        self.add(now, 30.0)
+        previous = self.at(now)["latitude"]
+        for tick in range(1, 51):
+            now = 100.0 + tick * 0.2
+            before = self.at(now)["latitude"]
+            self.assertLess(before - previous, 0.2 * speed * 1.8,
+                            f"{now} 之前走得太快")
+            self.add(now, 30.0 + speed * tick * 0.2)
+            self.assertEqual(before, self.at(now)["latitude"], f"{now} 跳了")
+            previous = before
+        # 起步那一下的误差按 2 秒的时间常数收敛，10 秒后剩不到 1%
+        self.assertAlmostEqual(self.at(now)["latitude"], 30.0 + speed * 10.0, places=5)
+
+    def test_heading_rate_takes_the_short_way(self):
+        # 359° 到 1° 应当往前走 2°，不是倒着走 358°
+        # 相隔要在 ROTATION_HOLD 以内，否则到达时角速度就被清掉了
+        self.add(100.0, 30.0, heading=359.0)
+        self.add(100.2, 30.0, heading=1.0)
+        _, heading_rate, _ = self.table.get("CES2345").motion.rotation
+        self.assertAlmostEqual(heading_rate, 10.0, places=6)
+        heading = self.at(100.3)["heading"]
+        self.assertTrue(heading > 359.0 or heading < 1.0, heading)
+
+    def test_heading_rate_short_way_downwards(self):
+        self.add(100.0, 30.0, heading=10.0)
+        self.add(100.2, 30.0, heading=350.0)
+        _, heading_rate, _ = self.table.get("CES2345").motion.rotation
+        self.assertAlmostEqual(heading_rate, -100.0, places=6)
+
+    def test_longitude_takes_the_short_way_across_the_antimeridian(self):
+        # 179.98°E 到 -179.98° 是往前 0.04°，线性差值会横穿整个地球
+        self.add(100.0, 30.0, lon=179.98)
+        self.add(101.0, 30.0, lon=-179.98)
+        east, _, _ = self.table.get("CES2345").motion.velocity
+        self.assertGreater(east, 0.0)
+        longitude = self.at(101.5)["longitude"]
+        self.assertTrue(abs(longitude) > 179.9,
+                        f"应当贴着 180° 经线，算出来是 {longitude}")
+
+    def test_duplicate_timestamp_replaces_latest(self):
+        # 同一时刻的两个包（同一次 recv 读出来的）：新的替换 latest，
+        # 不当新的一段——两点间隔是零，速度会除零
+        self.add(100.0, 30.0)
+        self.add(100.0, 40.0)
+        aircraft = self.table.get("CES2345")
+        self.assertIsNone(aircraft.previous)
+        self.assertEqual(aircraft.latest.latitude, 40.0)
+        self.assertEqual(aircraft.motion.velocity, (0.0, 0.0, 0.0))
+
+    def test_vertical_speed(self):
+        self.add(100.0, 30.0, altitude=10000)
+        self.add(101.0, 30.0, altitude=10010)
+        self.assertAlmostEqual(self.table.get("CES2345").vertical_speed, 600.0, places=3)
+
+    def test_state_at_an_earlier_time_does_not_rewind(self):
+        self.add(100.0, 30.0)
+        self.add(101.0, 30.01)
+        later = self.at(102.0)["latitude"]
+        self.assertEqual(self.at(50.0)["latitude"], later)
+
+
+class DuplicateSampleTest(unittest.TestCase):
+    """发送方把同一份快照重复发几次，不能被当成"停下来了"。"""
+
+    def setUp(self):
+        self.table = traffic_module.TrafficTable()
+
+    def add(self, at, lat, altitude=10000):
+        self.table.update_position("CES1", latitude=lat, longitude=120.0,
+                                   altitude=altitude, pitch=0.0, bank=0.0,
+                                   heading=0.0, groundspeed=250, now=at)
+
+    def test_a_repeated_snapshot_is_not_a_new_sample(self):
+        self.add(100.0, 30.0)
+        self.add(101.0, 30.01)
+        self.add(101.2, 30.01)          # 同一份快照又来了
+        self.add(101.4, 30.01)
+        aircraft = self.table.get("CES1")
+        self.assertEqual(aircraft.previous.time, 100.0)
+        self.assertEqual(aircraft.latest.time, 101.0)
+        # 两点之间的速度还在，飞机继续往前走，而不是停在 30.01
+        self.assertGreater(aircraft.motion.velocity[2], 0.0)
+
+    def test_the_next_real_update_follows_on(self):
+        self.add(100.0, 30.0)
+        self.add(101.0, 30.01)
+        self.add(101.2, 30.01)
+        self.add(102.0, 30.02)
+        aircraft = self.table.get("CES1")
+        self.assertEqual(aircraft.previous.time, 101.0)
+        self.assertEqual(aircraft.latest.time, 102.0)
+
+    def test_an_aircraft_that_really_stopped_does_stop(self):
+        self.add(100.0, 30.0)
+        self.add(101.0, 30.01)
+        later = 101.0 + traffic_module.DUPLICATE_WINDOW + 0.1
+        self.add(later, 30.01)
+        aircraft = self.table.get("CES1")
+        self.assertEqual(aircraft.latest.time, later)
+        self.assertEqual(aircraft.motion.velocity[2], 0.0)
+        settled = aircraft.state_at(later + traffic_module.ERROR_TIME + 1)
+        self.assertAlmostEqual(settled["latitude"], 30.01, places=9)
+
+    def test_an_altitude_change_is_not_a_duplicate(self):
+        self.add(100.0, 30.0, altitude=10000)
+        self.add(100.2, 30.0, altitude=10010)
+        self.assertEqual(self.table.get("CES1").latest.altitude, 10010)
+
+    def test_repeats_keep_the_aircraft_alive(self):
+        """重复样本不进 latest，但对方还在线，prune 不能把它清掉。"""
+        self.add(100.0, 30.0)
+        for i in range(1, 100):
+            self.add(100.0 + i * 0.2, 30.0)
+        now = 100.0 + 99 * 0.2 + 1.0
+        self.assertEqual(self.table.prune(now=now), [])
+
+
+class TrafficClockTest(unittest.TestCase):
+    """时间戳用高分辨率单调钟，打平的时候新的样本胜出。"""
+
+    def setUp(self):
+        self.table = traffic_module.TrafficTable()
+
+    def add(self, at, lat):
+        self.table.update_position("CES1", latitude=lat, longitude=120.0,
+                                   altitude=10000, pitch=0.0, bank=0.0,
+                                   heading=0.0, now=at)
+
+    def test_the_default_clock_is_perf_counter(self):
+        before = time.perf_counter()
+        self.table.update_position("CES1", latitude=30.0, longitude=120.0,
+                                   altitude=10000, pitch=0.0, bank=0.0, heading=0.0)
+        after = time.perf_counter()
+        self.assertTrue(before <= self.table.get("CES1").latest.time <= after)
+
+    def test_a_tied_timestamp_keeps_the_newer_sample(self):
+        self.add(100.0, 30.0)
+        self.add(100.2, 30.1)
+        self.add(100.2, 30.2)           # 同一次 recv 读出来的下一个包
+        aircraft = self.table.get("CES1")
+        self.assertEqual(aircraft.latest.latitude, 30.2)
+        self.assertEqual(aircraft.previous.latitude, 30.0)
+        self.assertGreater(aircraft.latest.time, aircraft.previous.time)
+        # 速度按 previous → 新的 latest 算
+        self.assertAlmostEqual(aircraft.motion.velocity[2],
+                               1.0 * traffic_module.METRES_PER_DEGREE, places=6)
+
+    def test_the_first_type_request_is_not_skipped_early_in_uptime(self):
+        """单调钟的零点不固定，info_requested 不能从 0 起算。"""
+        asked = []
+        table = traffic_module.TrafficTable(on_request_info=asked.append)
+        table.update_position("CES1", latitude=30.0, longitude=120.0, altitude=0,
+                              pitch=0.0, bank=0.0, heading=0.0, now=5.0)
+        self.assertEqual(asked, ["CES1"])
+
+
+class SimVarPollingTest(unittest.TestCase):
+    """每轮只串着读会动的那几个 SimVar，其余轮流读。"""
+
+    def setUp(self):
+        self.link = simlink.SimLink()
+        self.read = []
+
+        def get(_, simvar):
+            self.read.append(simvar)
+            return 1.0
+        self.link._requests = type("R", (), {"get": get})()
+
+    def test_the_first_round_reads_everything(self):
+        self.link._poll()
+        self.assertEqual(sorted(self.read), sorted(simlink.SIMVARS.values()))
+
+    def test_later_rounds_read_the_fast_set_plus_a_slice(self):
+        self.link._poll()
+        self.read.clear()
+        self.link._poll()
+        fast = {simlink.SIMVARS[name] for name in simlink.FAST_SIMVARS}
+        self.assertTrue(fast <= set(self.read))
+        self.assertEqual(len(self.read), len(fast) + simlink.SLOW_PER_POLL)
+
+    def test_every_slow_simvar_comes_round(self):
+        self.link._poll()
+        self.read.clear()
+        rounds = -(-len(simlink.SLOW_SIMVARS) // simlink.SLOW_PER_POLL)
+        for _ in range(rounds):
+            self.link._poll()
+        slow = {simlink.SIMVARS[name] for name in simlink.SLOW_SIMVARS}
+        self.assertTrue(slow <= set(self.read))
+
+    def test_the_position_fields_are_all_fast(self):
+        for name in ("latitude", "longitude", "altitude", "pitch", "bank",
+                     "heading", "groundspeed", "on_ground", "pressure_altitude",
+                     "velocity_east", "velocity_up", "velocity_north",
+                     "pitch_rate", "heading_rate", "bank_rate"):
+            self.assertIn(name, simlink.FAST_SIMVARS)
+
+    def test_all_failing_in_a_partial_round_is_still_failed(self):
+        self.link._poll()
+
+        def boom(_, simvar):
+            raise OSError("连接没了")
+        self.link._requests = type("R", (), {"get": boom})()
+        self.assertIs(self.link._poll(), simlink.FAILED)
+
+
+class NetworkAltitudeTest(unittest.TestCase):
+    """位置包报网络高度，他机高度按本机温度误差修正（xPilot AdjustIncomingAltitude）。"""
+
+    OWN = {
+        "latitude": 31.2, "longitude": 121.5,
+        "altitude": 39700, "network_altitude": 38000,
+        "pressure_altitude": 38000, "temperature_error": -1700,
+        "pressure_delta": 0, "agl": 39000.0, "groundspeed": 450,
+        "pitch": 0.0, "bank": 0.0, "heading": 90.0, "squawk": 2000,
+        "xpdr_mode": 2, "on_ground": False,
+        "velocity_east": 230.0, "velocity_up": 0.0, "velocity_north": 0.0,
+        "pitch_rate": 0.0, "heading_rate": 0.0, "bank_rate": 0.0,
+        "nose_wheel": 0.0,
+    }
+    FAST = ("^CES2345:31.3:121.6:{alt}:{alt}:12582828:"
+            "230.0:0.0:0.0:0.0:0.0:0.0:0.0")
+
+    def setUp(self):
+        self.table = traffic_module.TrafficTable()
+        self.sent = []
+        self.pilot = fsdpilot.FSDPilot("fsd.example", "CCA1501", "1000", "pw",
+                                       traffic=self.table)
+        self.pilot._send = lambda packet: self.sent.append(packet) or True
+
+    def _at(self, alt):
+        pbh = fsdpilot.pack_pbh(0.0, 0.0, 90.0)
+        return f"@N:CES2345:2000:1:31.3:121.6:{alt}:450:{pbh}:0"
+
+    def _received(self):
+        return self.table.get("CES2345").latest.altitude
+
+    def test_position_packet_carries_the_network_altitude_and_the_delta(self):
+        own = dict(self.OWN, altitude=38334, network_altitude=38334,
+                   temperature_error=0, pressure_delta=-334)
+        self.pilot.update_position(own)
+        self.pilot._send_position()
+        fields = self.sent[0].split(":")
+        self.assertEqual(fields[6], "38334")
+        self.assertEqual(fields[9], "-334")
+        self.assertEqual(int(fields[6]) + int(fields[9]), 38000)
+
+    def test_warm_atmosphere_sends_the_flight_level(self):
+        self.pilot.update_position(dict(self.OWN))
+        self.pilot._send_position()
+        fields = self.sent[0].split(":")
+        self.assertEqual(fields[6], "38000")
+        self.assertEqual(fields[9], "0")
+
+    def test_fast_packets_carry_the_network_altitude(self):
+        self.pilot.update_position(dict(self.OWN))
+        for kind in ("^", "#SL", "#ST"):
+            packet = fsdpilot.fast_position_packet(kind, "CCA1501", self.OWN)
+            self.assertEqual(packet.split(":")[3], "38000.00", kind)
+
+    def test_incoming_position_is_adjusted_by_our_temperature_error(self):
+        self.pilot.update_position(dict(self.OWN))
+        self.pilot._handle_packet(self._at(38000))
+        self.assertEqual(self._received(), 39700)
+
+    def test_incoming_fast_position_is_adjusted_too(self):
+        self.pilot.update_position(dict(self.OWN))
+        self.pilot._handle_packet(self.FAST.format(alt="40000.00"))
+        self.assertAlmostEqual(self._received(), 41700.0)
+
+    def test_distant_traffic_is_left_alone(self):
+        self.pilot.update_position(dict(self.OWN))
+        self.pilot._handle_packet(self._at(31000))
+        self.assertEqual(self._received(), 31000)
+
+    def test_without_our_own_snapshot_nothing_is_adjusted(self):
+        self.pilot._handle_packet(self._at(38000))
+        self.assertEqual(self._received(), 38000)
 
 
 if __name__ == "__main__":

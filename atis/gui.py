@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QListWidgetItem,
                              QMessageBox, QDialog, QSplitter, QFileDialog,
                              QSizePolicy)
-from qfluentwidgets import (BodyLabel, CaptionLabel, ComboBox, FluentIcon,
+from qfluentwidgets import (BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentIcon,
                             LineEdit, ListWidget, PasswordLineEdit,
                             PrimaryPushButton, PushButton, StrongBodyLabel,
                             SubtitleLabel, TextEdit, TogglePushButton)
@@ -53,7 +53,6 @@ from settings import Settings, SettingsDialog
 log = logging.getLogger("gui")
 
 # 语音（Mumble）服务器。FSD 是另一台，地址在设置里（fsd.ceruleanavi.net:6809）。
-SERVER = "audio.ceruleanavi.net"
 
 # 外观在 theme.py 里，四个客户端共用一份——它们多半并排开着，长得不一样会很跳。
 # 这里只把用到的名字取出来，**不要在这个文件里再写死任何 #rrggbb**。
@@ -257,6 +256,10 @@ class AtisWindow(QMainWindow):
         self.metars = {}                # callsign -> Metar
         self.raw_metars = {}            # callsign -> 原始电码，用来判断变没变
         self._weather_errors = {}       # callsign -> 还没恢复的取天气错误
+        self._updating_previews = False
+        self._manual_update_timer = QTimer(self)
+        self._manual_update_timer.setSingleShot(True)
+        self._manual_update_timer.timeout.connect(self._push_manual_update)
 
         self.signals = AtisSignals()
         self.signals.state.connect(self.on_broadcast_state)
@@ -441,11 +444,13 @@ class AtisWindow(QMainWindow):
         self.text_preview = TextEdit()
         self.text_preview.setReadOnly(True)
         self.text_preview.setFixedHeight(90)
+        self.text_preview.textChanged.connect(self.on_manual_text_changed)
         right_layout.addWidget(self.text_preview)
 
         right_layout.addWidget(StrongBodyLabel(t("main.voice_script")))
         self.voice_preview = TextEdit()
         self.voice_preview.setReadOnly(True)
+        self.voice_preview.textChanged.connect(self.on_manual_text_changed)
         right_layout.addWidget(self.voice_preview)
 
         broadcast_row = QHBoxLayout()
@@ -843,6 +848,35 @@ class AtisWindow(QMainWindow):
             self.profile.save()
             self.regenerate()
 
+    def on_manual_text_changed(self):
+        """把主页面手动编辑的两份稿子写回当前预设。"""
+        if self._updating_previews:
+            return
+        preset = self.current_preset()
+        if not preset or not preset.manual_text:
+            return
+        preset.manual_atis = self.text_preview.toPlainText()
+        preset.manual_voice = self.voice_preview.toPlainText()
+        self.profile.save()
+        self._manual_update_timer.start(400)
+
+    def _push_manual_update(self):
+        station = self.current_station()
+        if station and station.callsign in self.broadcasters:
+            self.push_update(station)
+
+    def _set_preview_text(self, text, voice):
+        self._updating_previews = True
+        try:
+            self.text_preview.setPlainText(text)
+            self.voice_preview.setPlainText(voice)
+        finally:
+            self._updating_previews = False
+
+    def _set_manual_editing(self, enabled):
+        self.text_preview.setReadOnly(not enabled)
+        self.voice_preview.setReadOnly(not enabled)
+
     def regenerate(self):
         """把当前席位 + 预设 + METAR 渲染出来，填进右边的预览。
 
@@ -852,23 +886,22 @@ class AtisWindow(QMainWindow):
         station = self.current_station()
         preset = self.current_preset()
         if not station or not preset:
-            self.text_preview.setPlainText('')
-            self.voice_preview.setPlainText('')
+            self._set_preview_text('', '')
+            self._set_manual_editing(False)
             self.letter_label.setText(t("main.letter_none"))
             return
 
         self.letter_label.setText(t("main.letter", letter=station.letter))
+        self._set_manual_editing(preset.manual_text)
         rendered = script.render(station, preset, self.metars.get(station.callsign))
         if rendered is None:
-            self.text_preview.setPlainText('（还没有天气数据）')
-            self.voice_preview.setPlainText('')
+            self._set_preview_text(t("main.metar_none"), '')
             return
 
         text, voice = rendered
-        self.text_preview.setPlainText(text)
-        self.voice_preview.setPlainText(voice)
+        self._set_preview_text(text, voice)
 
-        unknown = script.unknown_variables(preset)
+        unknown = script.unknown_variables(preset) if not preset.manual_text else []
         if unknown:
             self.status_label.setText(t("preset.unknown_vars", names=', '.join(unknown)))
         return text, voice
@@ -1061,14 +1094,9 @@ class AtisWindow(QMainWindow):
 
         self.start_broadcast(station, cid, password, rating)
 
-    def frequency_conflict(self, station):
-        return rules.frequency_conflict(station, self.profile, self.broadcasters)
-
     def start_broadcast(self, station, cid, password, rating=0):
         """核对通过之后真正建立两条连接。"""
-        # **必须再查一遍。** 数据源核对要走网络，隔着几秒，这期间完全可能又开
-        # 了一个同频率的席位——只信点按钮那一刻的检查会漏。规则本身在 rules.py
-        # 里，两条路径共用一份，文案不会各说各的。
+        # 数据源核对后再次检查账号和播出稿，两条路径共用 rules.py。
         rendered = self.render_for(station)
         refused = rules.blocking_reason(
             station, self.profile, self.broadcasters, cid, password, rendered)
@@ -1111,7 +1139,9 @@ class AtisWindow(QMainWindow):
                 fsd.start()
 
         broadcaster = Broadcaster(
-            SERVER, cid, password, station,
+            self.settings.mumble_host, cid, password, station,
+            datafeed_url=self.settings.datafeed_url,
+            atis_range_nm=self.settings.atis_range_nm,
             on_state=lambda state, message, _c=callsign:
                 self.signals.state.emit(_c, state, message))
         self.broadcasters[callsign] = broadcaster
@@ -1238,9 +1268,9 @@ class AtisWindow(QMainWindow):
         box.exec()
 
         clicked = box.clickedButton()
-        if clicked is download and found.download:
+        if clicked is download and update.is_safe_url(found.download):
             QDesktopServices.openUrl(QUrl(found.download))
-        elif clicked is notes and found.notes:
+        elif clicked is notes and update.is_safe_url(found.notes):
             QDesktopServices.openUrl(QUrl(found.notes))
         elif clicked is skip:
             self.settings.skipped_version = found.version
@@ -1254,6 +1284,7 @@ class AtisWindow(QMainWindow):
 
     def closeEvent(self, event):
         try:
+            self.profile.save()
             # 两个字典取并集：万一 FSD 连上了而语音没起来，也要收干净
             for callsign in set(self.broadcasters) | set(self.fsd_clients):
                 self.stop_broadcast(callsign)
@@ -1283,33 +1314,43 @@ class PresetDialog(QDialog):
         name_row.addWidget(self.name)
         layout.addLayout(name_row)
 
-        layout.addWidget(BodyLabel(t("preset.template")))
+        self.manual_text = CheckBox(t("preset.manual_text"))
+        self.manual_text.setChecked(self.preset.manual_text)
+        self.manual_text.setToolTip(t("preset.manual_text_hint"))
+        self.manual_text.toggled.connect(self.toggle_generated_fields)
+        layout.addWidget(self.manual_text)
+
+        self.generated_fields = QWidget()
+        generated_layout = QVBoxLayout(self.generated_fields)
+        generated_layout.setContentsMargins(0, 0, 0, 0)
+
+        generated_layout.addWidget(BodyLabel(t("preset.template")))
         self.template = TextEdit()
         self.template.setPlainText(self.preset.template)
-        layout.addWidget(self.template)
+        generated_layout.addWidget(self.template)
 
         variables = BodyLabel(t("preset.variables", names='  '.join(
             f'[{name}]' for name in sorted(set(template_module.ALIASES)))))
         variables.setWordWrap(True)
         variables.setStyleSheet(f"color: {IDLE_COLOR}; font-size: 11px;")
-        layout.addWidget(variables)
+        generated_layout.addWidget(variables)
 
         vox = BodyLabel(t("preset.vox_hint"))
         vox.setStyleSheet(f"color: {IDLE_COLOR};")
         vox.setWordWrap(True)
-        layout.addWidget(vox)
+        generated_layout.addWidget(vox)
 
-        layout.addWidget(BodyLabel(t("preset.conditions")))
+        generated_layout.addWidget(BodyLabel(t("preset.conditions")))
         self.conditions = TextEdit()
         self.conditions.setPlainText(self.preset.airport_conditions)
         self.conditions.setFixedHeight(60)
-        layout.addWidget(self.conditions)
+        generated_layout.addWidget(self.conditions)
 
-        layout.addWidget(BodyLabel('NOTAM  [NOTAMS]'))
+        generated_layout.addWidget(BodyLabel(t("preset.notams")))
         self.notams = TextEdit()
         self.notams.setPlainText(self.preset.notams)
         self.notams.setFixedHeight(60)
-        layout.addWidget(self.notams)
+        generated_layout.addWidget(self.notams)
 
         tl_row = QHBoxLayout()
         self.transition_level = LineEdit()
@@ -1317,7 +1358,9 @@ class PresetDialog(QDialog):
         self.transition_level.setPlaceholderText(t("preset.transition_hint"))
         tl_row.addWidget(BodyLabel(t("preset.transition")))
         tl_row.addWidget(self.transition_level)
-        layout.addLayout(tl_row)
+        generated_layout.addLayout(tl_row)
+        layout.addWidget(self.generated_fields)
+        self.toggle_generated_fields(self.preset.manual_text)
 
         buttons = QHBoxLayout()
         ok = PrimaryPushButton(t("common.save"))
@@ -1330,10 +1373,15 @@ class PresetDialog(QDialog):
 
     def apply(self):
         self.preset.name = self.name.text().strip() or self.preset.name
+        self.preset.manual_text = self.manual_text.isChecked()
         self.preset.template = self.template.toPlainText()
         self.preset.airport_conditions = self.conditions.toPlainText().strip()
         self.preset.notams = self.notams.toPlainText().strip()
         self.preset.transition_level = self.transition_level.text().strip()
+
+    def toggle_generated_fields(self, manual):
+        self.generated_fields.setVisible(not manual)
+        self.setMinimumHeight(260 if manual else 520)
 
 
 def selftest():

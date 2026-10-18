@@ -8,6 +8,7 @@
 
 import os
 import sys
+import threading
 import time
 from unittest import mock
 
@@ -94,6 +95,35 @@ def main():
             failures.append((name, e))
             print(f"  FAIL {name}: {type(e).__name__}: {e}")
 
+    # 冒烟测试不能弹校准框（dialog.open() 在离屏环境里没人点）；
+    # 对话框本身用假输入源单独建一次。
+    import calibration
+    import numpy as np
+    calibration.input_device_name = lambda index: None
+
+    class FakeSource:
+        rate = 48000
+        chunk = 960
+
+        def read_available(self):
+            return np.zeros(0, dtype=np.int16)
+
+        def close(self):
+            pass
+
+    def calibration_dialog():
+        for denoise_on in (False, True):
+            dialog = calibration.CalibrationDialog(
+                None, "Fake Mic", denoise_on,
+                source_factory=lambda index: FakeSource())
+            dialog.start()
+            dialog._tick()
+            dialog._finish()                   # 全静音 → too_short，不应抛异常
+            assert dialog.entry() is None
+            dialog.reject()
+
+    check("校准对话框", calibration_dialog)
+
     # 用临时配置，别动开发机上真实的 xpc_settings.json
     import settings as settings_module
     settings_module.Settings.save = lambda self: None
@@ -131,13 +161,13 @@ def main():
         assert window.fsd is None, "不该建立任何连接"
     check("拦下空账号", rejects_missing_credentials)
 
-    def asks_when_simulator_absent():
+    def rejects_when_simulator_absent():
         _dialogs.clear()
         window.cid_input.setText("1234")
         window.connect_all()          # X-Plane 未连接，替身里 connected 为假
-        assert _dialogs, "模拟器没连上时应当询问而不是直接连"
-        assert window.fsd is None, "选了否就不该连"
-    check("模拟器缺席时询问", asks_when_simulator_absent)
+        assert _dialogs and _dialogs[-1][0] == "warning", "模拟器没连上时应当直接拦下"
+        assert window.fsd is None, "模拟器没连上时不应建立 FSD 连接"
+    check("模拟器缺席时拒绝连接", rejects_when_simulator_absent)
 
     print("消息区：")
     check("收到文字消息", lambda: window.on_text_message(
@@ -188,6 +218,21 @@ def main():
 
     print("状态回调：")
     check("模拟器状态", lambda: window.on_sim_state(True, "已连接 X-Plane"))
+
+    def disconnects_fsd_when_simulator_goes_away():
+        class FakeFsd:
+            stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        fsd = FakeFsd()
+        window.fsd = fsd
+        window.on_sim_state(False, "模拟器断开")
+        assert fsd.stopped, "模拟器断开时应停止 FSD"
+        assert window.fsd is None, "模拟器断开时不应保留 FSD 引用"
+    check("模拟器断开时关闭网络", disconnects_fsd_when_simulator_goes_away)
+
     check("网络状态", lambda: window.on_fsd_status("online", "已上线"))
     check("语音状态", lambda: window.on_voice_status("online", "语音已连接"))
     check("频道切换", lambda: window.on_channel(121.5, "FREQ_121500"))
@@ -210,6 +255,69 @@ def main():
             window.connect_button.text()
     check("网络失败时语音继续", fsd_error_keeps_voice)
 
+    class FakeLink:
+        """FSD / 语音的替身：只记下有没有被 stop()。"""
+
+        def __init__(self):
+            self.stopped = threading.Event()
+
+        def stop(self, *args, **kwargs):
+            self.stopped.set()
+
+        def update_position(self, snapshot):
+            pass
+
+        def set_frequency(self, value):
+            pass
+
+    def ignores_stale_link_status():
+        old_voice, current_voice = FakeLink(), FakeLink()
+        window.voice = current_voice
+        window.on_voice_status("offline", "旧连接已结束", old_voice)
+        assert window.voice is current_voice, "旧语音连接不能清掉新连接"
+
+        old_fsd, current_fsd = FakeLink(), FakeLink()
+        window.fsd = current_fsd
+        window.on_fsd_status("offline", "旧连接已结束", old_fsd)
+        assert window.fsd is current_fsd, "旧 FSD 连接不能清掉新连接"
+        window.fsd = window.voice = None
+    check("忽略旧连接状态", ignores_stale_link_status)
+
+    def voice_offline_keeps_fsd():
+        # 语音服务器一抖，飞机不能从网络上消失
+        fsd, voice = FakeLink(), FakeLink()
+        window.fsd, window.voice = fsd, voice
+        try:
+            window.on_voice_status("offline", "被服务器踢下线")
+            assert window.fsd is fsd, "FSD 不该被收掉"
+            assert not fsd.stopped.is_set(), "FSD 不该被 stop()"
+            assert window.voice is None, "语音那条应当收掉"
+            assert voice.stopped.wait(2), "被踢那条路径 Voice 不会自己 stop()，界面要收"
+            assert window.connect_button.text() == t("connect.disconnect"), \
+                window.connect_button.text()
+        finally:
+            window.fsd = window.voice = None
+    check("语音下线时网络继续", voice_offline_keeps_fsd)
+
+    def fsd_offline_keeps_voice():
+        voice = FakeLink()
+        window.fsd, window.voice = None, voice
+        try:
+            window.on_fsd_status("offline", "重连超时")
+            assert window.voice is voice, "语音不该被收掉"
+            assert not voice.stopped.is_set(), "语音不该被 stop()"
+        finally:
+            window.voice = None
+    check("网络下线时语音继续", fsd_offline_keeps_voice)
+
+    def last_link_gone_disconnects():
+        window.fsd, window.voice = None, FakeLink()
+        window.on_voice_status("offline", "重连用尽")
+        assert window.voice is None and window.fsd is None
+        assert window.connect_button.text() == t("connect.connect"), \
+            window.connect_button.text()
+    check("两条都没了才整个断开", last_link_gone_disconnects)
+
     print("指示灯：")
     check("TX 点亮", lambda: window.tx_light.set_lit(True))
     check("RX 点亮", lambda: window.rx_light.set_lit(True))
@@ -230,10 +338,21 @@ def main():
             self.sim = None
 
         def sync(self, entries):
+            self.threads.add(threading.current_thread())
             self.synced.append(entries)
 
         def clear(self):
             self.synced.append("cleared")
+
+    FakeInjector.threads = set()
+
+    def wait_for(condition, timeout=1.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if condition():
+                return True
+            time.sleep(0.01)
+        return condition()
 
     def traffic_from_fsd():
         import aimatch
@@ -251,15 +370,13 @@ def main():
     check("从 FSD 收到一架他机", traffic_from_fsd)
 
     def traffic_reaches_the_injector():
+        window.injection_loop.start()     # connect_all 里启动的那条循环
         window.injector = FakeInjector()
         window.tick()
-        window.traffic_tick()      # 他机现在走自己的快节奏定时器
-        # 注入走后台线程了，等它跑完
-        for _ in range(50):
-            if window.injector.synced:
-                break
-            time.sleep(0.02)
-        assert window.injector.synced, "他机没有交给注入器"
+        window.traffic_tick()      # 挑模型；写进模拟器的是注入循环
+        assert wait_for(lambda: window.injector.synced), "他机没有交给注入器"
+        assert threading.main_thread() not in FakeInjector.threads, \
+            "注入跑到了 Qt 线程上"
         entries = window.injector.synced[-1]
         assert entries, "交给注入器的列表是空的"
         entry = entries[0]
@@ -288,6 +405,7 @@ def main():
         window.traffic_tick()
         elapsed = time.time() - started
         assert elapsed < 0.2, f"tick() 被注入拖了 {elapsed:.2f} 秒"
+        window.injector = FakeInjector()
         time.sleep(1.2)                  # 让后台线程收尾，别泄漏到下一项
     check("注入不阻塞界面", tick_does_not_block_on_injection)
 
@@ -307,24 +425,28 @@ def main():
         window.traffic.set_plane_info("CES2345", equipment="B738", airline="CCA")
         window.tick()
         window.traffic_tick()
-        time.sleep(0.15)
-        first = window.injector.synced[-1][0]["model"]
-        assert first == "坏模型", first
+        assert wait_for(lambda: window.injector.synced
+                        and window.injector.synced[-1]
+                        and window.injector.synced[-1][0]["model"] == "坏模型"), \
+            window.injector.synced[-1:]
 
         # 模拟器拒绝了它
         window.injector.bad_titles.add("坏模型")
         window.tick()
         window.traffic_tick()
-        time.sleep(0.15)
-        second = window.injector.synced[-1][0]["model"]
-        assert second == "好模型", f"被拒之后还在用 {second}"
+        assert wait_for(lambda: window.injector.synced[-1]
+                        and window.injector.synced[-1][0]["model"] == "好模型"), \
+            f"被拒之后还在用 {window.injector.synced[-1][0]['model']}"
     check("被拒绝的模型会换一个", rejected_model_is_replaced)
 
     def render_can_be_turned_off():
-        window.injector = FakeInjector()
         window.settings.render_traffic = False
+        window.traffic_tick()
+        time.sleep(0.1)                  # 正在跑的那一帧收尾
+        window.injector = FakeInjector()
         window.tick()
         window.traffic_tick()
+        time.sleep(0.1)                  # 给注入循环几帧
         window.settings.render_traffic = True
         assert not [s for s in window.injector.synced if s != "cleared"], \
             "关掉之后不该再放飞机进去"
@@ -345,6 +467,7 @@ def main():
         window.injector = FakeInjector()
         window.disconnect_all()
         assert "cleared" in window.injector.synced, "断开时没有清掉他机"
+        assert not window.injection_loop.running, "断开之后注入循环还在跑"
     check("断开时清掉已注入的飞机", disconnect_clears_injected_traffic)
 
     print("观察员模式：")
@@ -452,6 +575,69 @@ def main():
     settings_dialog = gui.SettingsDialog(window.settings, window)
     check("建立设置对话框", lambda: settings_dialog)
     check("设置可应用", lambda: settings_dialog.apply())
+
+    def settings_without_rnnoise():
+        import denoise
+        original = denoise.available
+        denoise.available = lambda: False
+        try:
+            dialog = gui.SettingsDialog(window.settings, window)
+            assert not dialog.denoise_check.isEnabled()
+            dialog.reject()
+        finally:
+            denoise.available = original
+
+    check("设置对话框（降噪不可用）", settings_without_rnnoise)
+
+    def calibration_prompt_only_when_device_or_denoise_changed():
+        """保存设置之后，只有真的换了输入设备或切了降噪才该再问一次校准——
+        单纯换个语言之类的保存不该每次都弹一次校准框。"""
+        cases = [
+            # (old_device, old_denoise, new_device, new_denoise, expected)
+            (None, True, None, True, False),      # 什么都没变
+            (None, True, 3, True, True),           # 换了设备
+            (None, True, None, False, True),       # 切了降噪
+            (None, False, 3, True, True),          # 两个都变了
+        ]
+        for old_device, old_denoise, new_device, new_denoise, expected in cases:
+            got = gui.calibration_state_changed(old_device, old_denoise,
+                                                new_device, new_denoise)
+            assert got == expected, (
+                f"calibration_state_changed({old_device!r}, {old_denoise!r}, "
+                f"{new_device!r}, {new_denoise!r}) = {got}, expected {expected}")
+    check("保存设置后只在设备或降噪变了才提示校准",
+          calibration_prompt_only_when_device_or_denoise_changed)
+
+    def recalibrating_reaches_the_live_baseline_even_if_cancelled():
+        """SettingsDialog.calibrate() 一点就把新校准落盘，哪怕这次设置整体
+        被取消，也不能等凑巧换了设备或降噪才把新基准套到发送链路上。"""
+        class RejectedDialog:
+            def __init__(self, settings, parent=None):
+                pass
+
+            def exec(self):
+                return 0    # QDialog.DialogCode.Rejected
+
+        original_dialog = gui.SettingsDialog
+        original_lookup = calibration.input_device_name
+        gui.SettingsDialog = RejectedDialog
+        calibration.input_device_name = lambda index: "Fake Calibration Mic"
+        try:
+            denoise_on = window.settings.denoise_active()
+            window.settings.mic_calibration["Fake Calibration Mic"] = {
+                "gain_db": -6.0, "speech_dbfs": -20.0, "noise_dbfs": -50.0,
+                "denoise": denoise_on,
+            }
+            window.settings.mic_baseline_db = 0.0
+            window.open_settings()
+            assert window.settings.mic_baseline_db == -6.0, (
+                f"取消设置之后基准没有套用: {window.settings.mic_baseline_db}")
+        finally:
+            gui.SettingsDialog = original_dialog
+            calibration.input_device_name = original_lookup
+            window.settings.mic_calibration.pop("Fake Calibration Mic", None)
+    check("取消设置也套用新校准的基准",
+          recalibrating_reaches_the_live_baseline_even_if_cancelled)
 
     def preview_button_plays_one():
         _chimes.clear()

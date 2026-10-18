@@ -11,6 +11,7 @@ import sys
 import os
 import signal
 import time
+import logging
 import Ice
 import requests
 import json
@@ -18,6 +19,8 @@ import traceback
 import re
 
 import serverconf
+
+log = logging.getLogger("auth")
 
 try:
     import MumbleServer as MumbleIce          # Mumble 1.5+
@@ -71,11 +74,13 @@ MURMUR_LOCAL_ACCOUNTS = frozenset({"SuperUser"})
 # 全局关闭标志，Ctrl+C 时立即设置，阻止清理时再做 Ice 调用
 _shutting_down = False
 
-# 通播账号的名字形状：{cid}_atis{频率6位}，由 atis/broadcast.py 和
-# server/ATIS/mumble.py 拼出来。**结尾要卡死**——原来是 r"^.*_atis\d{6}"，
-# 不卡结尾的话 1000_atis1180001 也算匹配，而取 id 时 split 拿到的是 7 位的
-# 1180001，等于凭空造出一个谁也不认识的用户 id。
-ATIS_NAME = re.compile(r"^(?P<cid>.*)_atis(?P<freq>\d{6})$")
+# 通播名字为 {cid}_atis{频率6位}_{callsign}；兼容旧版没有 callsign 的名字。
+# callsign 为 ICAO_ATIS、ICAO_D_ATIS 或 ICAO_A_ATIS，必须完整匹配。
+ATIS_NAME = re.compile(
+    r"^(?P<cid>.*)_atis(?P<freq>\d{6})"
+    r"(?:_(?P<airport>[A-Z0-9]{4})_(?:(?P<kind>[DA])_)?ATIS)?$")
+ATIS_ID_BASE = 1_000_000_000
+ATIS_ID_COUNT = 36 ** 4 * 3
 
 
 def is_atis_name(name):
@@ -90,19 +95,24 @@ def user_id_for(name):
     报错，只会让按名字配的权限静默落空。
 
     普通用户：id 就是 CAN 号，所以 Mumble 用户名必须是纯数字。
-    通播账号：id 是频率那六位，这样同一个人在不同频率上开的多个通播不会互相
-    顶掉（同名踢人是按名字判的，名字里带着频率）。代价是不同 cid 在**同一个**
-    频率上开通播会拿到同一个 id——这个取舍是全网约定的一部分，见 CLAUDE.md。
+    新版通播：id 由机场和通播类型唯一确定，频率和运营账号变化不改变 id。
+    旧版通播：保留频率六位作为 id。新版 id 使用保留的正整数区间。
     """
     matched = ATIS_NAME.match(name)
     if matched:
+        if matched.group("airport"):
+            kind = {None: 0, "D": 1, "A": 2}[matched.group("kind")]
+            return ATIS_ID_BASE + int(matched.group("airport"), 36) * 3 + kind
         return int(matched.group("freq"))
     # 不能直接 int(name)：int() 还认下划线、正负号、前后空白、甚至全角数字
     # （int("１０００") == 1000）。名字"１０００"和"1000"是两个不同的账号，
     # 同名踢人踢不到对方，却会拿到同一个用户 id——继承对方的全部 ACL。
     if not (name.isascii() and name.isdigit()):
         raise ValueError(f"not a plain numeric name: {name!r}")
-    return int(name)
+    user_id = int(name)
+    if ATIS_ID_BASE <= user_id < ATIS_ID_BASE + ATIS_ID_COUNT:
+        raise ValueError("numeric account overlaps the ATIS identity namespace")
+    return user_id
 
 
 class AuthenticatorI(MumbleIce.ServerAuthenticator):
@@ -173,6 +183,7 @@ class AuthenticatorI(MumbleIce.ServerAuthenticator):
 
     def authenticate(self, name, pw, certificates, certhash, certstrong, current=None):
         try:
+            log.info("authentication request: server_id=%s username=%s", SERVER_ID, name)
             print(f"认证用户: {name}")
             # 名字既不是纯数字也不是通播格式的，只有 MURMUR_LOCAL_ACCOUNTS
             # 里那几个才**放行**给 Murmur 自己的账号库（SuperUser 要能登进来，
@@ -183,14 +194,20 @@ class AuthenticatorI(MumbleIce.ServerAuthenticator):
                 user_id = user_id_for(name)
             except ValueError:
                 if name in MURMUR_LOCAL_ACCOUNTS:
+                    log.info("authentication delegated to local account database: username=%s", name)
                     return (AUTH_FALLTHROUGH, "", [])
+                log.warning("authentication refused: username=%s reason=invalid_identity", name)
                 return (AUTH_FAILED, "", [])
+            log.info("authentication identity resolved: username=%s user_id=%s kind=%s",
+                     name, user_id, "atis" if is_atis_name(name) else "member")
             if is_atis_name(name):
                 print(f"匹配到ATIS登录: {name}")
                 result = login_ATIS(name, pw)
             else:
                 result = login(name, pw)
 
+            log.info("authentication result: username=%s user_id=%s upstream=%s",
+                     name, user_id, result)
             if result == VERIFY_OK:
                 self.kick_previous_session(name)
                 return (user_id, name, [])
@@ -220,11 +237,8 @@ class AuthenticatorI(MumbleIce.ServerAuthenticator):
     def idToName(self, id, current=None):
         """用户 id → 名字。
 
-        **通播账号这条路是还不回去的**，不是没写：id 取的是频率六位，cid 那
-        一截在 authenticate 里就丢了，118000 既可能是 CAN 118000 也可能是
-        118.000 上的某个通播。这里只能给出数字本身。Murmur 拿它做的是显示和
-        ACL 反查，当前部署（根 ACL 只用 all 组）碰不到这条路。真要能反查，
-        得先改 id 的算法，而那个算法是全网约定，见 CLAUDE.md。
+        通播 id 不保留运营 cid；新版也不保留频率，不能恢复完整登录名字。
+        此接口返回数字 id，当前部署的根 ACL 只使用 all 组。
         """
         return str(id)
 
@@ -275,6 +289,7 @@ class ServerCallbackI(MumbleIce.ServerCallback):
 
 
 url = "https://ceruleanavi.net/api/v1/public/auth"
+USER_AGENT = "Mozilla/5.0 (compatible; CanATIS/1.0)"
 
 # 上游接口的三种结果。"验证不了"必须和"密码不对"分开：前者再试一次就好，
 # 后者再试多少遍都一样，而且会被 can-web 按 CAN 计进限流。
@@ -291,12 +306,17 @@ def verify(cid, password):
     print 出来，等于服务器日志里躺着全网成员的网站密码。仓库在
     xpc/fsdpilot.py 里对 #AP 做了 _redact()，服务端这边同样得守。
     """
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        # Cloudflare rejects requests using requests' default User-Agent.
+        "User-Agent": USER_AGENT,
+    }
     data = {"cid": str(cid), "password": str(password)}
     print(f"登录请求: cid={cid}")           # 密码不进日志
 
     last_error = None
     for attempt in range(HTTP_RETRIES + 1):
+        started = time.monotonic()
         try:
             response = requests.post(url, headers=headers,
                                      data=json.dumps(data),
@@ -308,6 +328,9 @@ def verify(cid, password):
                 time.sleep(HTTP_RETRY_DELAY)
             continue
 
+        log.info("credential verification response: cid=%s endpoint=%s status=%s "
+                 "attempt=%s elapsed_ms=%.0f", cid, url, response.status_code,
+                 attempt + 1, (time.monotonic() - started) * 1000)
         if response.status_code == 200:
             print(f"登录成功: cid={cid}")
             return VERIFY_OK
@@ -321,8 +344,22 @@ def verify(cid, password):
             if attempt < HTTP_RETRIES:
                 time.sleep(HTTP_RETRY_DELAY)
             continue
+        if response.status_code == 429:
+            # can-api rate-limits FSD/ATIS credential checks. A valid password
+            # must not be reported as a credential failure while that limit is
+            # active; let Murmur return its temporary-authentication error so
+            # the client retries later instead of asking the operator to reset
+            # a working password.
+            print(f"上游限流: cid={cid}")
+            return VERIFY_UNREACHABLE
+        if response.status_code == 403:
+            # A 403 from the public route is the proxy/WAF, not its credential
+            # contract (wrong credentials are a 400). Do not report it as a
+            # password failure to the Mumble client.
+            print(f"上游拒绝访问: cid={cid}, status=403")
+            return VERIFY_UNREACHABLE
         # 接口明确说了不行（4xx）就不再试——重试只会把这个账号推向限流
-        print(f"登录失败: cid={cid}, {response.status_code}, {response.text}")
+        print(f"登录失败: cid={cid}, status={response.status_code}")
         return VERIFY_REJECTED
 
     print(f"验证不了 cid={cid}（上游没有响应）: {last_error}")
@@ -334,7 +371,7 @@ def login(cid, password):
 
 
 def login_ATIS(name, password):
-    """ATIS 登录，用户名形如 DDDD_atisDDDDDD。
+    """ATIS 登录，兼容带 callsign 的新版名字和旧版频率名字。
 
     **这条路径不能去掉**，哪怕服务端一台通播机都不跑：管制员手里的桌面通播
     客户端（atis/，打包成 can-atis）登录用的就是 `{自己的cid}_atis{频率}`，
@@ -398,6 +435,10 @@ def watch_connection(server, context, interval=None):
 def main():
     global _shutting_down, _communicator
     exit_code = 0
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)-7s %(name)-12s %(message)s")
+    log.info("CAN authenticator starting: identity=station-v1 ice_proxy=%s "
+             "server_id=%s upstream=%s", ICE_PROXY, SERVER_ID, url)
 
     # 注册信号处理（确保主线程处理）
     signal.signal(signal.SIGINT, signal_handler)
@@ -462,6 +503,7 @@ def main():
         try:
             server.setAuthenticator(auth_prx, context)
             print("认证器已设置")
+            log.info("CAN authenticator registered: server_id=%s identity=station-v1", SERVER_ID)
 
             server.addCallback(callback_prx, context)
             print("服务器回调已注册")

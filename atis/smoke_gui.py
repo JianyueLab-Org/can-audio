@@ -122,6 +122,29 @@ def main():
             f"切回来没有恢复：{window.metar_label.text()!r}"
     check("METAR 行跟着席位走", the_metar_line_follows_the_selection)
 
+    def manual_text_can_be_edited_on_the_main_page():
+        station = window.current_station()
+        preset = station.presets[0]
+        previous = (preset.manual_text, preset.manual_atis, preset.manual_voice)
+        try:
+            preset.manual_text = True
+            preset.manual_atis = "手动文字稿"
+            preset.manual_voice = "手动语音稿"
+            window.regenerate()
+            assert not window.text_preview.isReadOnly(), "手动模式下文字通播仍是只读"
+            assert not window.voice_preview.isReadOnly(), "手动模式下语音稿仍是只读"
+            window.text_preview.setPlainText("新的文字稿")
+            window.voice_preview.setPlainText("新的语音稿")
+            assert preset.manual_atis == "新的文字稿"
+            assert preset.manual_voice == "新的语音稿"
+
+            dialog = gui.PresetDialog(preset, parent=window)
+            assert dialog.generated_fields.isHidden(), "手动模式下模板字段没有隐藏"
+        finally:
+            preset.manual_text, preset.manual_atis, preset.manual_voice = previous
+            window.regenerate()
+    check("手动模式可编辑主页面稿件", manual_text_can_be_edited_on_the_main_page)
+
     def the_top_bar_does_not_grow_with_the_window():
         """顶栏纵向要钉成 Fixed。
 
@@ -462,6 +485,44 @@ def main():
 
     settings_dialog = gui.SettingsDialog(window.settings, window)
     check("建立设置对话框", lambda: settings_dialog)
+
+    def custom_voice_host_is_saved_and_used():
+        import settings as settings_module
+        original_host = window.settings.mumble_host
+        station = window.current_station()
+        try:
+            assert settings_dialog.mumble_host_input.text() == original_host
+            settings_dialog.mumble_host_input.setText("  voice.example.net  ")
+            settings_dialog.save_and_close()
+            assert window.settings.mumble_host == "voice.example.net"
+            assert settings_module.Settings().mumble_host == "voice.example.net"
+            with mock.patch.object(window.settings, "connect_fsd", False), \
+                    mock.patch.object(gui, "Broadcaster") as broadcaster:
+                window.start_broadcast(station, "1000", "test-password")
+                assert broadcaster.call_args.args[0] == "voice.example.net"
+                broadcaster.return_value.start.assert_called_once()
+                window.stop_broadcast(station.callsign)
+        finally:
+            window.settings.mumble_host = original_host
+            window.settings.save_settings()
+    check("自定义语音地址保存并传给广播连接", custom_voice_host_is_saved_and_used)
+
+    def cancelling_keeps_the_voice_host():
+        original_host = window.settings.mumble_host
+        dialog = gui.SettingsDialog(window.settings, window)
+        dialog.mumble_host_input.setText("cancelled.example.net")
+        dialog.reject()
+        assert window.settings.mumble_host == original_host
+    check("取消设置不改变语音地址", cancelling_keeps_the_voice_host)
+
+    def blank_voice_host_restores_the_default():
+        import settings as settings_module
+        dialog = gui.SettingsDialog(window.settings, window)
+        dialog.mumble_host_input.setText("   ")
+        dialog.save_and_close()
+        assert window.settings.mumble_host == settings_module.DEFAULT_MUMBLE_HOST
+        assert settings_module.Settings().mumble_host == settings_module.DEFAULT_MUMBLE_HOST
+    check("语音地址留空恢复默认", blank_voice_host_restores_the_default)
 
     print("导入 vATIS 配置：")
 

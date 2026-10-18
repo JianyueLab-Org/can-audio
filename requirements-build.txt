@@ -40,6 +40,7 @@ SimConnect
 pyttsx3
 comtypes                        # pyttsx3 在 Windows 上走 SAPI5，需要它
 requests                        # 取天气和数据源
+certifi                         # 给打包版提供稳定、随程序分发的 HTTPS 根证书
 
 # ---- 打包 ----
 pyinstaller

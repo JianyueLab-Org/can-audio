@@ -18,6 +18,7 @@ import struct
 import threading
 import time
 
+import altitude as altitude_model
 from i18n import t
 
 log = logging.getLogger("sim")
@@ -57,10 +58,12 @@ DATAREFS = {
     # 真高（米），FSD 要英尺
     "elevation":    "sim/flightmodel/position/elevation",
     "agl":          "sim/flightmodel/position/y_agl",
-    # 高度表上读到的数（英尺）和高度表窗口里拨的气压（inHg）。这两个只用来
-    # 算位置包最后那个气压修正量，不参与"飞机实际在哪儿"。
-    "indicated_altitude": "sim/cockpit2/gauges/indicators/altitude_ft_pilot",
-    "baro_setting": "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot",
+    # 海平面气压（inHg）。X-Plane 11 用它算气压高度，见 altitude.xplane_altitudes()。
+    "sea_level_baro": "sim/weather/barometer_sealevel_inhg",
+    # 这两个只有 X-Plane 12 有：气压高度（英尺）和高度表温度误差（英尺）。
+    # 不存在的 dataref X-Plane 不推送，推了就是 12，不按版本分支。
+    "pressure_altitude": "sim/flightmodel2/position/pressure_altitude",
+    "temperature_error": "sim/weather/aircraft/altimeter_temperature_error",
     "groundspeed":  "sim/flightmodel/position/groundspeed",
     "pitch":        "sim/flightmodel/position/theta",
     "bank":         "sim/flightmodel/position/phi",
@@ -76,7 +79,32 @@ DATAREFS = {
     "com2_legacy":  "sim/cockpit/radios/com2_freq_hz",
     "com1_power":   "sim/cockpit2/radios/actuators/com1_power",
     "on_ground":    "sim/flightmodel/failures/onground_any",
+    # 快速位置包（`^` / `#SL`）要的速度，米每秒。OpenGL 局部坐标：+x 东、
+    # +y 上、+z **南**，所以向北是 -local_vz（xPilot 也是这么发的）。
+    "local_vx":     "sim/flightmodel/position/local_vx",
+    "local_vy":     "sim/flightmodel/position/local_vy",
+    "local_vz":     "sim/flightmodel/position/local_vz",
+    # 机体角速度，度每秒：Q 俯仰（抬头为正）、R 偏航（右转为正）、P 滚转
+    # （右坡为正）
+    "pitch_rate":   "sim/flightmodel/position/Q",
+    "heading_rate": "sim/flightmodel/position/R",
+    "bank_rate":    "sim/flightmodel/position/P",
+    # 前轮转角，度（xPilot 用的同一个）
+    "nose_wheel":   "sim/flightmodel2/gear/tire_steer_actual_deg[0]",
+    # 下面这些是报给别人做动画用的（ACC），dataref 和 xPilot 的 XplaneAdapter
+    # 用的同一套
+    "light_beacon":  "sim/cockpit/electrical/beacon_lights_on",
+    "light_landing": "sim/cockpit/electrical/landing_lights_on",
+    "light_taxi":    "sim/cockpit/electrical/taxi_light_on",
+    "light_strobe":  "sim/cockpit/electrical/strobe_lights_on",
+    "light_nav":     "sim/cockpit/electrical/nav_lights_on",
+    "gear":          "sim/cockpit/switches/gear_handle_status",
+    "flaps":         "sim/flightmodel/controls/flaprat",
+    "speedbrake":    "sim/flightmodel2/controls/speedbrake_ratio",
+    "engine_on":     "sim/flightmodel/engine/ENGN_running[0]",
 }
+# 扰流板比例超过这个值才算"放出"
+SPOILERS_OUT_RATIO = 0.1
 
 INDEX_TO_NAME = {index: name for index, name in enumerate(DATAREFS)}
 NAME_TO_INDEX = {name: index for index, name in INDEX_TO_NAME.items()}
@@ -89,35 +117,6 @@ XPDR_ONLINE = 2
 XPDR_STANDBY = 1
 # 判"停着"的地速门槛（节）。和 fsdpilot 降低位置包频率用的是同一条线。
 PARKED_SPEED_KT = 1
-
-# 标准大气压，高度表拨到这个值时"指示高度"就是气压高度。
-STANDARD_PRESSURE_INHG = 29.92
-# 高度表窗口能拨到的范围。超出这个范围的值一定是没读到（0）或者读错了，
-# 拿它去算修正量会把飞机在雷达上挪三万英尺，所以宁可不修正。
-BARO_RANGE = (25.0, 32.0)
-
-
-def pressure_delta(indicated_ft, baro_inhg, true_altitude_ft):
-    """位置包最后一个字段：气压高度减真高，英尺。
-
-    应答机报的是**气压高度**（高度表拨 29.92 时读到的数），而位置包第 7 个
-    字段报的是**真高**——两者在巡航高度上能差一千英尺，这就是"座舱里 35000、
-    雷达上 34000"的由来。FSD 协议把差值单独放在最后一个字段里，正是为了让
-    画他机的客户端拿真高摆飞机、让管制端拿真高加修正量当高度显示。
-
-    气压高度 = 指示高度 + (29.92 - 高度表拨的气压) * 1000。温度偏差带来的
-    误差不需要另算：指示高度本身就带着它，真高不带，相减自然就有了。
-
-    读不到就返回 0，也就是退回修正前的行为——宁可不修正，不能瞎修正。
-    """
-    if indicated_ft is None or baro_inhg is None:
-        return 0
-    if not BARO_RANGE[0] <= baro_inhg <= BARO_RANGE[1]:
-        return 0
-    pressure_altitude = (indicated_ft
-                         + (STANDARD_PRESSURE_INHG - baro_inhg) * 1000.0)
-    return int(round(pressure_altitude - true_altitude_ft))
-
 
 def xpdr_mode(raw_mode, on_ground, groundspeed_kt):
     """transponder_mode dataref -> 位置包要的应答机模式。
@@ -378,19 +377,35 @@ class XPlaneLink:
         """当前这一份数据，已经换算成 FSD 要的单位。"""
         with self._lock:
             raw = dict(self.values)
+            last_update = self.last_update
         if not raw:
             return None
+        # Do not let the FSD client keep broadcasting the last frame after
+        # X-Plane has stopped producing samples.  A zero timestamp is kept as
+        # a fresh value for callers that preload a snapshot in tests/tools.
+        if last_update and time.time() - last_update >= STALE_AFTER:
+            return None
 
-        elevation = raw.get("elevation", 0.0)
-        altitude = int(round(elevation / METRES_PER_FOOT))
+        elevation = raw.get("elevation", 0.0) / METRES_PER_FOOT
+        altitude = int(round(elevation))
+        sea_level = raw.get("sea_level_baro")
+        network, pressure, temperature_error = altitude_model.xplane_altitudes(
+            elevation,
+            sea_level * altitude_model.INHG_TO_HPA if sea_level else None,
+            raw.get("pressure_altitude"), raw.get("temperature_error"))
+        network = int(round(network))
+        pressure = int(round(pressure))
         groundspeed = int(round(raw.get("groundspeed", 0.0) * KNOTS_PER_MPS))
         on_ground = bool(raw.get("on_ground", 0))
         return {
             "latitude": raw.get("latitude", 0.0),
             "longitude": raw.get("longitude", 0.0),
+            # 真高。网络高度、气压高度和修正量的算法见 altitude.py。
             "altitude": altitude,
-            "pressure_delta": pressure_delta(raw.get("indicated_altitude"),
-                                             raw.get("baro_setting"), altitude),
+            "network_altitude": network,
+            "pressure_altitude": pressure,
+            "temperature_error": int(round(temperature_error)),
+            "pressure_delta": pressure - network,
             "agl": int(round(raw.get("agl", 0.0) / METRES_PER_FOOT)),
             "groundspeed": groundspeed,
             "pitch": raw.get("pitch", 0.0),
@@ -403,6 +418,26 @@ class XPlaneLink:
             "com2": self._frequency(raw.get("com2"), raw.get("com2_legacy")),
             "com1_power": bool(raw.get("com1_power", 1)),
             "on_ground": on_ground,
+            # 快速位置包用：世界速度（东/上/北）米每秒，机体角速度度每秒
+            "velocity_east": raw.get("local_vx", 0.0),
+            "velocity_up": raw.get("local_vy", 0.0),
+            "velocity_north": -raw.get("local_vz", 0.0),
+            "pitch_rate": raw.get("pitch_rate", 0.0),
+            "heading_rate": raw.get("heading_rate", 0.0),
+            "bank_rate": raw.get("bank_rate", 0.0),
+            "nose_wheel": raw.get("nose_wheel", 0.0),
+            # 下面这些是报给别人做动画用的，键名和 msfs/simlink.py 一致
+            "gear_down": bool(raw.get("gear", 1)),
+            "flaps": max(0.0, min(1.0, raw.get("flaps", 0.0))),
+            "spoilers": raw.get("speedbrake", 0.0) > SPOILERS_OUT_RATIO,
+            "engines_on": bool(raw.get("engine_on", 1)),
+            "lights": {
+                "beacon_on": bool(raw.get("light_beacon", 0)),
+                "landing_on": bool(raw.get("light_landing", 0)),
+                "taxi_on": bool(raw.get("light_taxi", 0)),
+                "strobe_on": bool(raw.get("light_strobe", 0)),
+                "nav_on": bool(raw.get("light_nav", 0)),
+            },
         }
 
     @staticmethod

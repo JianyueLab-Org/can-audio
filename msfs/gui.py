@@ -47,9 +47,12 @@ from qfluentwidgets import (BodyLabel, CaptionLabel, CheckBox, ComboBox,
                             StrongBodyLabel, TextEdit)
 
 import aimatch
+import calibration
 import chime
+import denoise
 import fsdpilot
 import i18n
+import micgain
 import observer
 import ptt
 import recovery
@@ -86,8 +89,8 @@ ROOT_SEPARATOR = "；"
 class Signals(QObject):
     """后台线程 → GUI 线程的唯一通道。"""
     sim_state = pyqtSignal(bool, str)
-    fsd_status = pyqtSignal(str, str)
-    voice_status = pyqtSignal(str, str)
+    fsd_status = pyqtSignal(str, str, object)
+    voice_status = pyqtSignal(str, str, object)
     text_message = pyqtSignal(str, str, str)
     controllers = pyqtSignal(list)
     ptt = pyqtSignal(bool)
@@ -133,6 +136,15 @@ class Card(HeaderCardWidget):
         return self
 
 
+def calibration_state_changed(old_device, old_denoise, new_device, new_denoise):
+    """设置对话框关掉后，输入设备或降噪状态是不是真的变了。
+
+    只有变了才可能需要重新校准——纯粹改了语言之类的话，每次保存设置都弹一次
+    校准框，会把设置对话框变成一个陷阱。
+    """
+    return old_device != new_device or old_denoise != new_denoise
+
+
 class MsfsWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -146,10 +158,14 @@ class MsfsWindow(QMainWindow):
         self.fsd_recovery = recovery.FsdRecovery()
         self.snapshot = None
 
-        # 他机：FSD 线程往表里写，tick() 读出来插值好放进模拟器
+        # 他机：FSD 线程往表里写，注入循环每一帧把它积分到此刻、写进模拟器
+        # （运动模型见 traffic.Motion）。
         self.traffic = traffic_module.TrafficTable()
         self.injector = None            # 要等 SimConnect 连上才能建
-        self._injecting = threading.Event()   # 上一轮注入还没做完
+        # traffic_tick 每 200 ms 更新一次：(本机经纬度, 呼号 -> 模型名)。
+        # 注入循环只读这个引用，不碰 _model_cache。
+        self._traffic_plan = None
+        self.injection_loop = inject.InjectionLoop(self._inject_frame)
         self.models = aimatch.ModelSet()
         self._model_cache = {}          # 呼号 -> 匹配到的 title
         self._load_models()
@@ -175,9 +191,9 @@ class MsfsWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(500)
-        # 他机单独一个更快的节奏：500 ms 推一次的话一架 450 kt 的飞机每半秒
-        # 瞬移 115 米，traffic.py 的插值等于白算。200 ms 是注入开销（每架一次
-        # SimConnect IPC）和平滑度之间的折中；上一轮没做完会自动跳过。
+        # 200 ms：把本机位置喂给 FSD（位置包 5 Hz），并给注入循环挑模型。
+        # 写进模拟器的那一步不在这里，在 injection_loop 上（跟着模拟器的帧，
+        # 没有 Frame 事件时 30 Hz）。
         self.traffic_timer = QTimer(self)
         self.traffic_timer.timeout.connect(self.traffic_tick)
         self.traffic_timer.start(200)
@@ -190,6 +206,9 @@ class MsfsWindow(QMainWindow):
 
         # 起来之后在后台问一次有没有新版。查不到就当没这回事。
         self.check_for_update()
+
+        # 所选麦克风在当前降噪状态下没校准过就弹一次。open() 不阻塞，窗口先显示出来。
+        QTimer.singleShot(0, self.maybe_prompt_calibration)
 
     # ---------- 界面 ----------
     def _build_ui(self):
@@ -441,14 +460,11 @@ class MsfsWindow(QMainWindow):
         if not cid or not password:
             QMessageBox.warning(self, t("dialog.missing"), t("dialog.missing_body"))
             return
-        # 观察员本来就常常不开模拟器（他就是个话务员），这一句问了也白问
+        # 飞行员没有模拟器位置时不能登录 FSD：否则服务端会保留一条没有有效
+        # 位置的连接，模拟器随后退出也会继续重连。
         if not watching and not self.sim.connected:
-            answer = QMessageBox.question(
-                self, t("dialog.no_sim"), t("dialog.no_sim_body"),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if answer != QMessageBox.StandardButton.Yes:
-                return
+            QMessageBox.warning(self, t("dialog.no_sim"), t("dialog.no_sim_body"))
+            return
 
         # 存下来，下次开机不用重填。密码是例外：勾了"记住密码"才落盘，
         # 没勾的话它只活在内存里（settings.save() 会写空串）。
@@ -471,16 +487,26 @@ class MsfsWindow(QMainWindow):
         # 观察员只有语音这一条链路，connect_voice 关着也要连——否则点了"连接"
         # 之后什么都不会发生，界面上却写着已连接。
         if self.settings.connect_voice or watching:
-            self.voice = voice_module.Voice(
+            voice = voice_module.Voice(
                 host=self.settings.mumble_host, username=cid, password=password,
                 settings=self.settings,
-                on_status=self.signals.voice_status.emit,
                 on_ptt=self.signals.ptt.emit,
                 on_rx=self.signals.rx.emit,
                 on_channel=self.signals.channel.emit)
+            voice.on_status = lambda state, message, voice=voice: \
+                self.signals.voice_status.emit(state, message, voice)
+            voice.on_ptt = lambda transmitting, voice=voice: \
+                self.signals.ptt.emit(transmitting) if voice is self.voice else None
+            voice.on_rx = lambda receiving, voice=voice: \
+                self.signals.rx.emit(receiving) if voice is self.voice else None
+            voice.on_channel = lambda frequency, channel, voice=voice: \
+                self.signals.channel.emit(frequency, channel) \
+                if voice is self.voice else None
+            self.voice = voice
             threading.Thread(target=self.voice.start, daemon=True).start()
 
         self.ptt_watcher.start()
+        self.injection_loop.start()
         self.connect_button.setEnabled(True)
         self.connect_button.setText(t("connect.disconnect"))
 
@@ -529,7 +555,10 @@ class MsfsWindow(QMainWindow):
         self.channel_label.setText("")
         self.tx_light.set_lit(False)
         self.rx_light.set_lit(False)
-        # 断开网络就没有他机来源了，把已经放进去的清掉，否则会冻在天上
+        # 断开网络就没有他机来源了，把已经放进去的清掉，否则会冻在天上。
+        # 先停注入循环：不停的话表里还没过期的飞机下一帧又被建回来。
+        self.injection_loop.stop()
+        self._traffic_plan = None
         if self.injector is not None:
             self.injector.clear()
         self._model_cache.clear()
@@ -557,13 +586,17 @@ class MsfsWindow(QMainWindow):
             com1 = snapshot.get("com1")
             self.com1_label.setText(t("radio.com1", frequency=f"{com1:.3f}") if com1
                                     else t("radio.com1_none"))
+            # 显示气压高度（ATC 看到的高度），不是真高
             self.position_label.setText(
                 f"{snapshot['latitude']:.4f} {snapshot['longitude']:.4f}  "
-                f"{snapshot['altitude']} ft  {snapshot['groundspeed']} kt  "
+                f"{snapshot.get('pressure_altitude', snapshot['altitude'])} ft  "
+                f"{snapshot['groundspeed']} kt  "
                 f"{snapshot['heading']:03.0f}°  A{snapshot['squawk']:04d}")
 
-            if self.fsd:
-                self.fsd.update_position(snapshot)
+        if self.fsd:
+            # Passing None clears the last simulator sample after the
+            # freshness deadline, so the FSD worker cannot rebroadcast it.
+            self.fsd.update_position(snapshot)
 
         # 语音频率每一拍都要跟一次，而且**不能挂在"这轮读到了模拟器数据"下面**：
         # 观察员多半根本没开模拟器，上面整段一次都不会跑，手输的频率就永远送不
@@ -655,7 +688,16 @@ class MsfsWindow(QMainWindow):
         self._sync_frequency()
 
     def traffic_tick(self):
-        """每 0.2 秒：把他机插值到当下放进模拟器。和 tick() 分开是为了平滑。"""
+        """每 0.2 秒：把最新的本机位置交给 FSD，并更新注入循环要的模型表。
+
+        位置也在这里喂而不是在 tick() 里：FSD 每 0.2 秒发一个位置包，0.5 秒
+        才喂一次的话，连着两三个包是同一份数据，别人那边飞机一走一停。
+        """
+        snapshot = self.sim.snapshot()
+        if snapshot:
+            self.snapshot = snapshot
+        if self.fsd:
+            self.fsd.update_position(snapshot)
         snapshot = self.snapshot
         if snapshot:
             self._push_traffic(snapshot)
@@ -701,17 +743,16 @@ class MsfsWindow(QMainWindow):
         threading.Thread(target=scan, daemon=True).start()
 
     def _push_traffic(self, snapshot):
-        """把他机插值到当前时刻，放进模拟器。"""
+        """给注入循环准备好这一轮要的东西：注入器、本机位置、每架飞机的模型。
+
+        真正写进模拟器的是 _inject_frame，在注入循环的线程上。
+        """
         # prune 不受开关控制：关着渲染的话表会涨一整场
         for callsign in self.traffic.prune():
             self._model_cache.pop(callsign, None)
         if not self.settings.render_traffic:
-            # 刚关掉开关时把已经放进去的清掉——不清的话飞机全部冻在天上，
-            # 用户本来是嫌掉帧才关的，结果掉帧还在
-            if (self.injector is not None and self.injector.aircraft
-                    and not self._injecting.is_set()):
-                self._injecting.set()
-                threading.Thread(target=self._clear_injected, daemon=True).start()
+            # 已经放进去的由注入循环清掉（_inject_frame）
+            self._traffic_plan = None
             return
         # SimLink 断线重连后句柄是新建的，旧注入器抱着死句柄：创建请求发到
         # 关掉的连接上、objectID 永远不回来。句柄一换就重建注入器。
@@ -722,7 +763,9 @@ class MsfsWindow(QMainWindow):
             self._model_cache.clear()
         # 注入器要等 SimConnect 真的连上才能建
         if self.injector is None and self.sim.sim is not None:
-            self.injector = inject.TrafficInjector(self.sim.sim)
+            # 模拟器每画一帧，注入循环醒一次（在 dispatch 线程上只置个事件）
+            self.injector = inject.TrafficInjector(
+                self.sim.sim, on_frame=self.injection_loop.frame)
             if not self.injector.available:
                 self.add_message(t("msg.inject_unavailable"), theme.ACTIVE_COLOR)
 
@@ -731,33 +774,36 @@ class MsfsWindow(QMainWindow):
             origin=origin,
             limit=inject.MAX_AIRCRAFT,
             max_range_nm=self.settings.traffic_range_nm or None)
-
-        for entry in entries:
-            entry["model"] = self._model_for(entry)
+        models = {entry["callsign"]: self._model_for(entry) for entry in entries}
         self.traffic_label.setText(t("radio.traffic", count=len(entries)))
-        # 注入走后台线程。sync() 里每架飞机都是一次 SimConnect 同步 IPC，最多
-        # 40 架、每 0.5 秒一轮——在 Qt 主线程上做这件事窗口会"未响应"。
-        # 上一轮还没做完就跳过这一轮，别让请求越堆越多。
-        if self.injector is not None and not self._injecting.is_set():
-            self._injecting.set()
-            threading.Thread(target=self._inject, args=(entries,),
-                             daemon=True).start()
+        # 整个换掉引用，不原地改：注入循环在另一条线程上读它
+        self._traffic_plan = (origin, models)
 
-    def _inject(self, entries):
-        try:
-            self.injector.sync(entries)
-        except Exception as e:
-            log.warning("injecting traffic into the simulator raised: %s", e)
-        finally:
-            self._injecting.clear()
+    def _inject_frame(self):
+        """注入循环的一帧（不在 Qt 线程上）：积分到此刻，写进模拟器。
 
-    def _clear_injected(self):
-        try:
-            self.injector.clear()
-        except Exception as e:
-            log.warning("clearing the injected traffic raised: %s", e)
-        finally:
-            self._injecting.clear()
+        sync() 里每架飞机一次 SimConnect 调用；放在 Qt 线程上窗口会"未响应"。
+        """
+        injector = self.injector
+        if injector is None:
+            return
+        if not self.settings.render_traffic:
+            # 刚关掉开关时把已经放进去的清掉——不清的话飞机全部冻在天上，
+            # 用户本来是嫌掉帧才关的，结果掉帧还在
+            if injector.aircraft:
+                injector.clear()
+            return
+        plan = self._traffic_plan
+        if plan is None:
+            return
+        origin, models = plan
+        entries = self.traffic.snapshot(
+            origin=origin,
+            limit=inject.MAX_AIRCRAFT,
+            max_range_nm=self.settings.traffic_range_nm or None)
+        for entry in entries:
+            entry["model"] = models.get(entry["callsign"], "")
+        injector.sync(entries)
 
     def _model_for(self, entry):
         """给一架飞机挑模型。匹配结果缓存住，别每帧都算。
@@ -807,8 +853,20 @@ class MsfsWindow(QMainWindow):
             f"color: {theme.ON_COLOR if connected else theme.IDLE_COLOR};")
         self.add_message(t("msg.sim", message=message),
                          theme.ON_COLOR if connected else theme.ACTIVE_COLOR)
+        if not connected:
+            # SimConnect and FSD are independent links. Keep FSD alive while the
+            # simulator reconnects so a healthy FSD session keeps receiving the
+            # latest snapshot, and a dead worker can be replaced on recovery.
+            self.snapshot = None
+            self.ident_button.setEnabled(False)
+            self.fsd_label.setText(t("net.disconnected"))
+            self.add_message(t("msg.sim_gone_fsd"), theme.ACTIVE_COLOR)
+            self.connect_button.setText(
+                t("connect.disconnect") if self.voice or self.fsd else t("connect.connect"))
 
-    def on_fsd_status(self, state, message):
+    def on_fsd_status(self, state, message, source=None):
+        if source is not None and source is not self.fsd:
+            return
         colour = {'online': theme.ON_COLOR, 'error': theme.MUTED_COLOR,
                   'offline': theme.MUTED_COLOR}.get(state, theme.ACTIVE_COLOR)
         keys = {'online': "net.online", 'reconnecting': "net.reconnecting",
@@ -824,10 +882,11 @@ class MsfsWindow(QMainWindow):
         if state == 'reconnecting':
             return
 
-        # 重连次数用尽：整个下线。FSD 自己已经收摊了，这里连语音一起收。
+        # 重连窗口用完：FSD 自己已经收摊了。只收这一条，语音不动——两条链路
+        # 互不依赖，语音那头的人照样听得见、叫得到。
         if state == 'offline':
             self.fsd = None
-            self.disconnect_all()
+            self._link_gone("msg.fsd_gone_voice_stays")
             return
 
         if state == 'error':
@@ -838,7 +897,9 @@ class MsfsWindow(QMainWindow):
             self.connect_button.setText(
                 t("connect.disconnect") if self.voice or self.fsd else t("connect.connect"))
 
-    def on_voice_status(self, state, message):
+    def on_voice_status(self, state, message, source=None):
+        if source is not None and source is not self.voice:
+            return
         colour = {'online': theme.ON_COLOR, 'error': theme.MUTED_COLOR,
                   'offline': theme.MUTED_COLOR}.get(state, theme.ACTIVE_COLOR)
         keys = {'online': "voicebar.online", 'reconnecting': "voicebar.reconnecting",
@@ -854,11 +915,19 @@ class MsfsWindow(QMainWindow):
         if state == 'reconnecting':
             return
 
-        # 重连次数用尽：整个下线。语音自己已经收摊了（Voice._give_up 走的是
-        # stop()），这里把引用清掉再统一走断开，FSD 也一起收。
+        # 语音彻底下线（重连次数用尽，或被服务端踢了）：只收语音，FSD 不动。
+        # 以前这里走 disconnect_all()，语音服务器一抖，飞机就从网络上消失。
+        # 被踢的那条路径 Voice 自己不会 stop()，所以这里要收；重连用尽那条
+        # 已经 stop() 过，再来一次是空操作。
         if state == 'offline':
+            voice = self.voice
             self.voice = None
-            self.disconnect_all()
+            if voice:
+                threading.Thread(target=voice.stop, daemon=True).start()
+            self.tx_light.set_lit(False)
+            self.rx_light.set_lit(False)
+            self.channel_label.setText("")
+            self._link_gone("msg.voice_gone_fsd_stays")
             return
 
         if state == 'error':
@@ -870,6 +939,14 @@ class MsfsWindow(QMainWindow):
                 threading.Thread(target=voice.stop, daemon=True).start()
             self.connect_button.setText(
                 t("connect.disconnect") if self.fsd else t("connect.connect"))
+
+    def _link_gone(self, key):
+        """一条链路彻底下线之后：另一条还在就说一句、留着它；都没了才整个断开。"""
+        if self.fsd or self.voice:
+            self.add_message(t(key), theme.ACTIVE_COLOR)
+            self.connect_button.setText(t("connect.disconnect"))
+        else:
+            self.disconnect_all()
 
     def on_text_message(self, sender, recipient, body):
         if recipient.startswith("@"):
@@ -956,6 +1033,44 @@ class MsfsWindow(QMainWindow):
         except Exception as e:
             log.warning("could not switch the transmitter: %s", e)
 
+    # ---------- 麦克风校准 ----------
+    def apply_mic_baseline(self):
+        """按当前输入设备和降噪状态取基准增益写到 settings.mic_baseline_db
+        （Voice 发送时读），记一行日志。"""
+        name = calibration.input_device_name(self.settings.input_device_index)
+        baseline = self.settings.baseline_for(name)
+        log.info("mic baseline for %s: %s (denoise %s)", name or "unknown device",
+                 "uncalibrated" if baseline is None else f"{baseline:+.1f} dB",
+                 "on" if self.settings.denoise_active() else "off")
+        self.settings.mic_baseline_db = baseline or 0.0
+        return name, baseline
+
+    def maybe_prompt_calibration(self):
+        name, baseline = self.apply_mic_baseline()
+        if name is not None and baseline is None:
+            self.run_calibration(name)
+
+    def run_calibration(self, device_name):
+        was_running = self.ptt_watcher.is_running()
+        self.ptt_watcher.stop()
+        dialog = calibration.CalibrationDialog(
+            self.settings.input_device_index, device_name,
+            self.settings.denoise_active(), self)
+
+        def done(code):
+            if code == QDialog.DialogCode.Accepted and dialog.entry():
+                self.settings.mic_calibration[device_name] = dialog.entry()
+                self.settings.save()
+            else:
+                log.info("calibration skipped on %s", device_name)
+            self.apply_mic_baseline()
+            self.ptt_watcher.set_bindings(self.settings.ptt_bindings)
+            if was_running:
+                self.ptt_watcher.start()
+
+        dialog.finished.connect(done)
+        dialog.open()
+
     # ---------- 对话框 ----------
     def open_settings(self):
         # 开设置期间把监听整个停掉。录绑定时 PttCapture 要独占 SDL 的事件队列
@@ -963,6 +1078,9 @@ class MsfsWindow(QMainWindow):
         # 不该真的发出去一段语音。
         was_running = self.ptt_watcher.is_running()
         self.ptt_watcher.stop()
+        old_mic = self.settings.mic_volume
+        old_device = self.settings.input_device_index
+        old_denoise = self.settings.denoise_active()
         dialog = SettingsDialog(self.settings, self)
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
         if accepted:
@@ -977,9 +1095,21 @@ class MsfsWindow(QMainWindow):
                 except Exception as e:
                     QMessageBox.warning(self, t("dialog.audio"),
                                         t("dialog.audio_failed", error=e))
+        # 对话框里的"校准"按钮会立即把新基准存进 settings 并落盘，哪怕这次
+        # 设置整体被取消——不管 accepted 与否都要重新套用一次，否则要等凑巧
+        # 换了设备或降噪状态才会生效。
+        _, baseline = self.apply_mic_baseline()
+        if accepted and self.settings.mic_volume != old_mic:
+            log.info(micgain.describe_multiplier(
+                old_mic, self.settings.mic_volume, baseline or 0.0))
         self.ptt_watcher.set_bindings(self.settings.ptt_bindings)
         if was_running:
             self.ptt_watcher.start()
+        if accepted and calibration_state_changed(
+                old_device, old_denoise,
+                self.settings.input_device_index, self.settings.denoise_active()):
+            # 换了输入设备或切了降噪，且新状态下没校准过，就再提示一次
+            QTimer.singleShot(0, self.maybe_prompt_calibration)
 
     def open_flight_plan(self):
         dialog = FlightPlanDialog(self.settings, self)
@@ -1041,11 +1171,11 @@ class MsfsWindow(QMainWindow):
         box.exec()
 
         clicked = box.clickedButton()
-        if clicked is download and found.download:
+        if clicked is download and update.is_safe_url(found.download):
             QDesktopServices.openUrl(QUrl(found.download))
             self.add_message(t("msg.update_downloading", version=found.version),
                              theme.ON_COLOR)
-        elif clicked is notes and found.notes:
+        elif clicked is notes and update.is_safe_url(found.notes):
             QDesktopServices.openUrl(QUrl(found.notes))
         elif clicked is skip:
             self.settings.skipped_version = found.version
@@ -1061,6 +1191,9 @@ class MsfsWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.timer.stop()
+        self.traffic_timer.stop()
+        # 注入循环要在 clear() 之前停，否则它下一帧又把飞机建回来
+        self.injection_loop.stop()
         self.ptt_watcher.stop()
         if self.fsd:
             self.fsd.stop()
@@ -1250,6 +1383,28 @@ class SettingsDialog(QDialog):
         form.addRow(BodyLabel(t("settings.mic_volume")), self.mic_slider)
         form.addRow(BodyLabel(t("settings.speaker_volume")), self.speaker_slider)
 
+        calib_row = QHBoxLayout()
+        self.baseline_label = CaptionLabel("")
+        self.baseline_label.setStyleSheet(f"color: {theme.IDLE_COLOR};")
+        calib_button = PushButton(t("calib.button"))
+        calib_button.clicked.connect(self.calibrate)
+        calib_row.addWidget(self.baseline_label)
+        calib_row.addStretch()
+        calib_row.addWidget(calib_button)
+        form.addRow(calib_row)
+
+        self.denoise_check = CheckBox(t("calib.denoise"))
+        if denoise.available():
+            self.denoise_check.setChecked(bool(self.settings.mic_denoise))
+        else:
+            self.denoise_check.setChecked(False)
+            self.denoise_check.setEnabled(False)
+            self.denoise_check.setText(t("calib.denoise_unavailable"))
+        form.addRow(self.denoise_check)
+
+        self.input_box.currentIndexChanged.connect(lambda _: self._refresh_baseline())
+        self._refresh_baseline()
+
         # ---- 消息提示音 ----
         self.alert_check = CheckBox(t("settings.message_sound"))
         self.alert_check.setChecked(bool(getattr(self.settings,
@@ -1434,10 +1589,33 @@ class SettingsDialog(QDialog):
         self.cleanup()
         super().accept()
 
+    def _refresh_baseline(self):
+        name = calibration.input_device_name(self.input_box.currentData())
+        baseline = self.settings.baseline_for(name)
+        self.baseline_label.setText(
+            t("calib.uncalibrated") if baseline is None
+            else t("calib.baseline", db=f"{baseline:+.1f}"))
+
+    def calibrate(self):
+        """校准当前选中的输入设备，按已保存的降噪状态测，结果立即落盘。"""
+        index = self.input_box.currentData()
+        name = calibration.input_device_name(index)
+        if name is None:
+            self.baseline_label.setText(t("calib.no_device"))
+            return
+        dialog = calibration.CalibrationDialog(index, name,
+                                               self.settings.denoise_active(), self)
+        if dialog.exec() and dialog.entry():
+            self.settings.mic_calibration[name] = dialog.entry()
+            self.settings.save()
+        self._refresh_baseline()
+
     def apply(self):
         self.settings.input_device_index = self.input_box.currentData()
         self.settings.output_device_index = self.output_box.currentData()
         self.settings.mic_volume = self.mic_slider.value()
+        if denoise.available():
+            self.settings.mic_denoise = self.denoise_check.isChecked()
         self.settings.speaker_volume = self.speaker_slider.value()
         self.settings.message_sound = self.alert_check.isChecked()
         self.settings.message_sound_all = self.alert_all_check.isChecked()

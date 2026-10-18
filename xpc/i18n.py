@@ -151,6 +151,16 @@ TEXT = {
     "msg.sim":              {"zh": "[X-Plane] {message}", "en": "[X-Plane] {message}"},
     "msg.net":              {"zh": "[网络] {message}", "en": "[Network] {message}"},
     "msg.voice":            {"zh": "[语音] {message}", "en": "[Voice] {message}"},
+    # 一条链路下线不带走另一条。说一句，免得人以为整个客户端都断了
+    "msg.voice_gone_fsd_stays": {"zh": "语音已下线，网络连接保持；要恢复语音请断开后重新连接",
+                                 "en": "Voice went offline; the network connection stays up. "
+                                       "Disconnect and reconnect to get voice back"},
+    "msg.fsd_gone_voice_stays": {"zh": "网络已下线，语音保持连接；要重新上网络请断开后重新连接",
+                                 "en": "The network connection went offline; voice stays up. "
+                                       "Disconnect and reconnect to get back on the network"},
+    "msg.sim_gone_fsd": {"zh": "模拟器已断开，网络连接已关闭；模拟器恢复后请重新连接",
+                          "en": "The simulator disconnected; the network connection was "
+                               "closed. Reconnect after the simulator is ready"},
     "msg.text":             {"zh": "{sender}: {body}", "en": "{sender}: {body}"},
     "msg.text_private":     {"zh": "{sender} → {recipient}: {body}",
                              "en": "{sender} → {recipient}: {body}"},
@@ -195,11 +205,10 @@ TEXT = {
     "dialog.missing_body":  {"zh": "请填写 CAN ID 和密码。",
                              "en": "Enter your CAN ID and password."},
     "dialog.no_sim":        {"zh": "X-Plane 未连接", "en": "X-Plane not connected"},
-    "dialog.no_sim_body":   {"zh": "还没有从 X-Plane 收到数据。没有位置就无法把飞机"
-                                   "报到网络上。\n\n仍然继续连接吗？",
-                             "en": "No data from X-Plane yet. Without a position your "
-                                   "aircraft cannot be reported to the network.\n\n"
-                                   "Connect anyway?"},
+    "dialog.no_sim_body":   {"zh": "还没有从 X-Plane 收到数据。请先启动模拟器并进入飞行，"
+                                   "然后再连接网络。",
+                             "en": "No data from X-Plane yet. Start the simulator and "
+                                   "enter a flight before connecting to the network."},
     "dialog.observer":      {"zh": "观察员模式", "en": "Observer mode"},
     "dialog.observer_busy": {"zh": "连接期间不能切换观察员模式。先断开，再改。",
                              "en": "Observer mode cannot be switched while connected. "
@@ -503,11 +512,17 @@ TEXT = {
     "fsd.send_failed":      {"zh": "发送失败: {error}", "en": "Could not send: {error}"},
     "fsd.rejected":         {"zh": "FSD 拒绝登录（{code}）: {message}",
                              "en": "The FSD server refused the login ({code}): {message}"},
-    "fsd.reconnecting":     {"zh": "与 FSD 的连接断开，正在重连（{attempt}/{limit}）",
-                             "en": "Lost the FSD connection — reconnecting "
-                                   "({attempt}/{limit})"},
-    "fsd.give_up":          {"zh": "与 FSD 断开后重连 {limit} 次都没成功，已下线",
-                             "en": "Reconnected to FSD {limit} times without success — "
+    "fsd.reconnecting":     {"zh": "与 FSD 的连接断开，{delay} 秒后重连（第 {attempt} 次）",
+                             "en": "Lost the FSD connection — reconnecting in {delay} s "
+                                   "(attempt {attempt})"},
+    # 呼号还被上一条连接占着：服务端要等旧连接超时才放出来，最长一分半左右
+    "fsd.callsign_busy":    {"zh": "呼号 {callsign} 还被上一次的连接占着，"
+                                   "等服务器释放，{delay} 秒后再试",
+                             "en": "The callsign {callsign} is still held by the previous "
+                                   "connection — waiting for the server to release it, "
+                                   "retrying in {delay} s"},
+    "fsd.give_up":          {"zh": "与 FSD 断开后 {seconds} 秒内都没能重连，已下线",
+                             "en": "Could not get back onto FSD within {seconds} s — "
                                    "went offline"},
     "fsd.stopped":          {"zh": "已从 FSD 下线", "en": "Signed off from FSD"},
 
@@ -522,6 +537,33 @@ TEXT = {
                              "en": "The callsign {callsign} contains characters the "
                                    "server does not accept (only letters, digits, _ "
                                    "and - are allowed)"},
+    # ---- 麦克风音量自动校准 / 降噪 ----
+    "calib.title":        {"zh": "麦克风音量自动校准", "en": "Automatic microphone calibration"},
+    "calib.button":       {"zh": "麦克风音量自动校准", "en": "Calibrate microphone"},
+    "calib.baseline":     {"zh": "当前基准：{db} dB", "en": "Current baseline: {db} dB"},
+    "calib.uncalibrated": {"zh": "当前基准：未校准", "en": "Current baseline: not calibrated"},
+    "calib.device":       {"zh": "设备：{name}", "en": "Device: {name}"},
+    "calib.intro":        {"zh": "点击开始后先保持安静 1 秒，然后以平时通话的音量和麦克风距离读出下面这段话。",
+                           "en": "After pressing Start, stay quiet for one second, then read the text below at your normal speaking volume and microphone distance."},
+    "calib.phrase":       {"zh": "上海进近，东方五三五一，通过六千米下降到四千二百米，航向二七零，建立航向道报告。",
+                           "en": "Shanghai Approach, China Eastern five three five one, passing six thousand metres descending four thousand two hundred metres, heading two seven zero, will report established."},
+    "calib.start":        {"zh": "开始", "en": "Start"},
+    "calib.retry":        {"zh": "重试", "en": "Retry"},
+    "calib.save":         {"zh": "保存", "en": "Save"},
+    "calib.cancel":       {"zh": "取消", "en": "Cancel"},
+    "calib.stage_quiet":  {"zh": "请保持安静……", "en": "Stay quiet…"},
+    "calib.stage_read":   {"zh": "请朗读……", "en": "Read now…"},
+    "calib.result":       {"zh": "校准完成，基准 {db} dB", "en": "Calibrated: baseline {db} dB"},
+    "calib.fail_clipping":  {"zh": "输入削波。请把麦克风拿远一点，或调低系统输入音量后重试。",
+                             "en": "The input is clipping. Move the microphone further away or lower the system input level, then retry."},
+    "calib.fail_too_short": {"zh": "没有检测到足够的语音。请完整读出上面的文字后重试。",
+                             "en": "Not enough speech was detected. Read the whole text above, then retry."},
+    "calib.fail_too_noisy": {"zh": "环境太吵或麦克风声音太小。请换到安静的环境，或调高系统输入音量后重试。",
+                             "en": "The room is too noisy or the microphone too quiet. Move somewhere quieter or raise the system input level, then retry."},
+    "calib.open_failed":  {"zh": "打不开麦克风：{error}", "en": "Could not open the microphone: {error}"},
+    "calib.no_device":    {"zh": "没有可用的输入设备", "en": "No input device available"},
+    "calib.denoise":      {"zh": "麦克风降噪", "en": "Microphone noise suppression"},
+    "calib.denoise_unavailable": {"zh": "降噪不可用", "en": "Noise suppression unavailable"},
 }
 
 _current = DEFAULT

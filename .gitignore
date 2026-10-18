@@ -14,3 +14,10 @@ release/
 
 # macOS
 .DS_Store
+
+.temp/
+
+rnnoise.dll
+librnnoise.dylib
+native/rnnoise/work/
+native/rnnoise/out/
