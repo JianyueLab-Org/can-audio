@@ -248,6 +248,20 @@ def main():
         assert window.stack.selected_khz == 125900, "自己的席位频率不是主频率"
     check("自己的频率默认 RX+TX", my_own_frequency_defaults_to_rx_and_tx)
 
+    def adopts_multiple_position_frequencies():
+        window.on_datafeed(feed(controllers=[
+            {"cid": "1000", "callsign": "ZSPD_TWR",
+             "frequency": "118.000", "facility": 5},
+            {"cid": "1000", "callsign": "ZSPD_APP",
+             "frequency": "121.700", "facility": 5},
+        ]))
+        for khz in (118000, 121700):
+            radio = window.stack.get(khz)
+            assert radio is not None, khz
+            assert radio.rx and radio.tx, khz
+        assert window.stack.selected_khz in {118000, 121700}
+    check("多个席位频率都自动加入", adopts_multiple_position_frequencies)
+
     def a_manual_tx_off_is_not_undone():
         """管制员自己把 TX 关掉之后，下一轮刷新不该又给他打开。"""
         window.stack.set_tx(125900, False)

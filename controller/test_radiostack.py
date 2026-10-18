@@ -180,6 +180,20 @@ class OnDutyTest(unittest.TestCase):
         self.stack.set_tx(118000, True)
         self.assertTrue(self.stack.get(118000).tx)
 
+    def test_non_primary_frequency_still_supports_tx_and_xc(self):
+        self.stack.set_locked({118000})
+        self.stack.set_tx(121700, True)
+        self.stack.set_xc(121700, True)
+        self.assertEqual(self.stack.tx_frequencies(), [121700])
+        self.assertEqual(self.stack.xc_frequencies(), [121700])
+
+    def test_multiple_duty_frequencies_can_all_be_primary(self):
+        self.stack.set_locked({118000, 121700})
+        self.stack.select(121700)
+        self.assertEqual(self.stack.selected_khz, 121700)
+        self.stack.select(128500)
+        self.assertEqual(self.stack.selected_khz, 121700)
+
     def test_the_locked_frequency_cannot_be_removed(self):
         self.stack.set_locked(118000)
         self.assertFalse(self.stack.remove(118000))
@@ -196,6 +210,21 @@ class OnDutyTest(unittest.TestCase):
         self.assertFalse(self.stack.is_locked(118000))
         self.assertTrue(self.stack.transmit_allowed,
                         "默认放行——没连数据源时不该把人锁死")
+
+    def test_multiple_locked_frequencies_are_protected(self):
+        self.stack.set_locked({118000, 121700})
+        self.assertTrue(self.stack.is_locked(118000))
+        self.assertTrue(self.stack.is_locked(121700))
+        self.assertFalse(self.stack.is_locked(128500))
+        self.assertFalse(self.stack.remove(118000))
+        self.assertFalse(self.stack.remove(121700))
+
+    def test_selection_can_only_use_a_locked_frequency_when_locked(self):
+        self.stack.set_locked({118000, 121700})
+        self.stack.select(128500)
+        self.assertEqual(self.stack.selected_khz, 118000)
+        self.stack.select(121700)
+        self.assertEqual(self.stack.selected_khz, 121700)
 
 
 class RuntimeStateTest(unittest.TestCase):

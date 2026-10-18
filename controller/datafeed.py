@@ -46,17 +46,13 @@ def fetch(url=None, timeout=15):
         return None
 
 
-def controller_for(cid, data):
-    """找这个 CID 此刻正在管的席位，没有则返回 None。
-
-    「正在管制」的判定和 can-fsd 自己的一致（handler.go 的 handleQueryATC）：
-    要在 controllers[] 里，且席位类型高于观察员——挂着观察员不算在管制，
-    不该给他自动加频率。
-    """
+def controllers_for(cid, data):
+    """找这个 CID 此刻正在管的全部席位，按数据源顺序返回。"""
     cid = str(cid or "").strip()
     if not cid or not data:
-        return None
+        return []
 
+    positions = []
     for entry in data.get("controllers") or []:
         if str(entry.get("cid", "")).strip() != cid:
             continue
@@ -65,8 +61,17 @@ def controller_for(cid, data):
         except (TypeError, ValueError):
             facility = 0
         if facility > FACILITY_OBSERVER:
-            return entry
-    return None
+            positions.append(entry)
+    return positions
+
+
+def controller_for(cid, data):
+    """找这个 CID 的第一个管制席位，没有则返回 None。
+
+    保留这个单席位查询供现有调用方使用；需要支持多席位时使用
+    :func:`controllers_for`。
+    """
+    return next(iter(controllers_for(cid, data)), None)
 
 
 def frequency_khz(entry):

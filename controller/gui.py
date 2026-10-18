@@ -963,62 +963,57 @@ class ControllerWindow(QMainWindow):
         self.refresh_online_list()
 
     def apply_duty_state(self, data):
-        """按数据源判定本人在不在管制席位，据此开闸或落闸。
+        """按数据源判定本人正在管的全部席位，据此更新主频率权限。"""
+        entries = datafeed.controllers_for(self.cid, data)
+        duty_frequencies = {
+            khz for entry in entries
+            for khz in (datafeed.frequency_khz(entry),)
+            if khz is not None
+        }
+        dropped = self.stack.set_transmit_allowed(bool(entries))
+        self.stack.set_locked(duty_frequencies)
 
-        语音服务器没有花名册检查——任何账号都能进任何 FREQ_* 频道，也都能对着
-        它说话。这一层是客户端自觉守的，和 can-fsd 上「不在花名册里就不能上
-        席位」对应。判定用的是 datafeed.controller_for，和自动加频率同一条：
-        要在 controllers[] 里，且席位类型高于观察员。
-        """
-        entry = datafeed.controller_for(self.cid, data)
-        khz = datafeed.frequency_khz(entry) if entry else None
-
-        dropped = self.stack.set_transmit_allowed(entry is not None)
-        self.stack.set_locked(khz)
-
-        if entry is None:
+        if not entries:
             self.duty_label.setStyleSheet(f"color: {IDLE_COLOR};")
             self.duty_label.setText(t("duty.observer"))
             if dropped:
-                # 值守掉了会把已经开着的 TX 落下来，这事必须说出来，否则管制员
-                # 会对着一个自以为开着的频率讲话
                 log.info("no longer staffing a position on the datafeed, dropping "
                          "every TX / XC")
                 self.status_label.setStyleSheet(f"color: {IDLE_COLOR};")
                 self.status_label.setText(t("duty.tx_dropped"))
         else:
+            callsigns = ", ".join(
+                str(entry.get("callsign", "")).strip() for entry in entries)
             self.duty_label.setStyleSheet(f"color: {ON_COLOR};")
-            self.duty_label.setText(t("duty.on", callsign=str(
-                entry.get("callsign", "")).strip()))
+            self.duty_label.setText(t("duty.on", callsign=callsigns))
 
     def adopt_controlled_frequency(self, data):
-        """本人在网上上了席位的话，把那个频率自动加进电台栈。"""
-        entry = datafeed.controller_for(self.cid, data)
-        if not entry:
-            return
-        khz = datafeed.frequency_khz(entry)
-        if khz is None or khz in self._user_removed:
-            return
-        if self.stack.get(khz):
-            return
-        callsign = str(entry.get("callsign", "")).strip()
-        try:
-            self.stack.add(khz, callsign)
-        except ValueError as e:
-            log.warning("could not auto-add the position frequency: %s", e)
-            return
-        # 自己的席位频率默认就开 RX + TX：管制员上了席位，本来就是要在这个
-        # 频率上收发的，还要手动点两下才能说话是多余的一步——而且漏点了不会
-        # 报错，只是喊了半天没人应。set_tx 会连带打开 RX（不存在只发不收）。
-        #
-        # 只在**新加进来**的时候设（上面已经挡掉了栈里已有的），所以之后管制员
-        # 自己把 TX 关掉，下一轮刷新不会又给他打开。
-        self.stack.set_tx(khz, True)
-        self.stack.select(khz)          # 顺带设成主频率：真正进入的那个频道
+        """把本人在网上的全部席位频率自动加进电台栈。"""
+        entries = datafeed.controllers_for(self.cid, data)
+        adopted = []
+        for entry in entries:
+            khz = datafeed.frequency_khz(entry)
+            if khz is None or khz in self._user_removed:
+                continue
+            callsign = str(entry.get("callsign", "")).strip()
+            if self.stack.get(khz):
+                continue
+            try:
+                self.stack.add(khz, callsign)
+            except ValueError as e:
+                log.warning("could not auto-add the position frequency: %s", e)
+                continue
+            self.stack.set_tx(khz, True)
+            adopted.append((khz, callsign))
 
-        log.info("auto-added %s from position %s on the datafeed (RX + TX by "
-             "default)",
-                 callsign, radiostack.format_frequency(khz))
+        if not adopted:
+            return
+        # 所有本人席位都能成为主频率；最后自动加入的席位作为当前主频率。
+        self.stack.select(adopted[-1][0])
+        for khz, callsign in adopted:
+            log.info("auto-added %s from position %s on the datafeed (RX + TX by "
+                     "default)", callsign, radiostack.format_frequency(khz))
+        khz, callsign = adopted[-1]
         self.status_label.setStyleSheet(f"color: {ON_COLOR};")
         self.status_label.setText(t(
             "status.adopted", callsign=callsign,

@@ -116,9 +116,8 @@ class RadioStack:
         # 检查（任何账号都能进任何 FREQ_* 频道），这道闸是客户端自觉守的那一层，
         # 对应 can-fsd 上管制员必须在花名册里才能上席位。
         self.transmit_allowed = True
-        # 数据源上本人正在管的那个频率。它不许删——手滑删掉自己的席位频率，
-        # 等于把自己从工作频率上摘下去，而且下一轮自动加回来之前谁也听不到你。
-        self.locked_khz = None
+        # 数据源上本人正在管的频率集合。它们不许删，也只有这些频率能作为主频率。
+        self.locked_khz = set()
 
     # ---------- 查询 ----------
     def __iter__(self):
@@ -184,15 +183,26 @@ class RadioStack:
         return changed
 
     def set_locked(self, khz):
-        """把某个频率标成不可删除（本人正在管的席位）。None 表示解除。"""
-        if khz == self.locked_khz:
+        """设置本人正在管的频率集合；None 表示解除全部值守锁。"""
+        if khz is None:
+            locked = set()
+        elif isinstance(khz, int):
+            locked = {khz}
+        else:
+            locked = {int(value) for value in khz}
+        if locked == self.locked_khz:
             return False
-        self.locked_khz = khz
+        self.locked_khz = locked
+        if locked and self.selected_khz not in locked:
+            self.selected_khz = next(
+                (value for value in sorted(locked) if self.get(value)),
+                self.selected_khz,
+            )
         self._changed()
         return True
 
     def is_locked(self, khz):
-        return self.locked_khz is not None and khz == self.locked_khz
+        return khz in self.locked_khz
 
     def remove(self, khz):
         radio = self.get(khz)
@@ -275,8 +285,8 @@ class RadioStack:
         return self.set_xc(khz, not radio.xc) if radio else None
 
     def select(self, khz):
-        """选主频率——真正进入的那个 Mumble 频道。"""
-        if self.get(khz):
+        """选主频率；有值守席位时只能选择本人正在管的频率。"""
+        if self.get(khz) and (not self.locked_khz or self.is_locked(khz)):
             self.selected_khz = khz
             self._changed()
 
