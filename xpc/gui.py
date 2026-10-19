@@ -62,6 +62,7 @@ import xpinstall
 import xplane
 from i18n import t
 from settings import Settings
+from serverpicker import ServerPicker
 
 log = logging.getLogger("gui")
 
@@ -498,6 +499,7 @@ class XpcWindow(QMainWindow):
         if self.settings.connect_voice or watching:
             voice = voice_module.Voice(
                 host=self.settings.mumble_host, username=cid, password=password,
+                port=self.settings.mumble_port,
                 settings=self.settings,
                 on_ptt=self.signals.ptt.emit,
                 on_rx=self.signals.rx.emit,
@@ -1384,13 +1386,19 @@ class SettingsDialog(QDialog):
     def _network_tab(self):
         page = QWidget()
         form = QFormLayout(page)
-        self.mumble_input = LineEdit()
-        self.mumble_input.setText(self.settings.mumble_host)
-        self.fsd_input = LineEdit()
-        self.fsd_input.setText(self.settings.fsd_host)
-        self.fsd_port_input = SpinBox()
-        self.fsd_port_input.setRange(1, 65535)
-        self.fsd_port_input.setValue(int(self.settings.fsd_port))
+        self.mumble_picker = ServerPicker(
+            "audio", self.settings.mumble_host, self.settings.mumble_port, self)
+        self.fsd_picker = ServerPicker(
+            "fsd", self.settings.fsd_host, self.settings.fsd_port, self)
+        parent = self.parent()
+        locked = (getattr(parent, "voice", None) is not None
+                  or getattr(parent, "fsd", None) is not None)
+        self.mumble_picker.set_locked(locked)
+        self.fsd_picker.set_locked(locked)
+        self.mumble_input = self.mumble_picker.host_edit
+        self.mumble_port_input = self.mumble_picker.port_edit
+        self.fsd_input = self.fsd_picker.host_edit
+        self.fsd_port_input = self.fsd_picker.port_edit
         self.real_name_input = LineEdit()
         self.real_name_input.setText(self.settings.real_name)
         self.voice_check = CheckBox(t("settings.connect_voice"))
@@ -1398,9 +1406,8 @@ class SettingsDialog(QDialog):
         self.fsd_check = CheckBox(t("settings.connect_fsd"))
         self.fsd_check.setChecked(bool(self.settings.connect_fsd))
 
-        form.addRow(BodyLabel(t("settings.mumble_host")), self.mumble_input)
-        form.addRow(BodyLabel(t("settings.fsd_host")), self.fsd_input)
-        form.addRow(BodyLabel(t("settings.fsd_port")), self.fsd_port_input)
+        form.addRow(self.mumble_picker)
+        form.addRow(self.fsd_picker)
         form.addRow(BodyLabel(t("settings.real_name")), self.real_name_input)
         form.addRow(self.voice_check)
         form.addRow(self.fsd_check)
@@ -1618,9 +1625,10 @@ class SettingsDialog(QDialog):
         self.settings.debug = self.debug_check.isChecked()
         self.settings.language = self.language_box.currentData()
         i18n.set_language(self.settings.language)
-        self.settings.mumble_host = self.mumble_input.text().strip()
-        self.settings.fsd_host = self.fsd_input.text().strip()
-        self.settings.fsd_port = self.fsd_port_input.value()
+        self.settings.mumble_host = self.mumble_picker.host()
+        self.settings.mumble_port = self.mumble_picker.port()
+        self.settings.fsd_host = self.fsd_picker.host()
+        self.settings.fsd_port = self.fsd_picker.port()
         self.settings.real_name = self.real_name_input.text().strip()
         self.settings.connect_voice = self.voice_check.isChecked()
         self.settings.connect_fsd = self.fsd_check.isChecked()

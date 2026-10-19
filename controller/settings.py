@@ -13,7 +13,7 @@ import os
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QWidget
 from qfluentwidgets import (BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentIcon,
-                            LineEdit, PrimaryPushButton, PushButton, Slider, StrongBodyLabel,
+                            PrimaryPushButton, PushButton, Slider, StrongBodyLabel,
                             TransparentToolButton)
 
 import applog
@@ -25,6 +25,7 @@ import ptt
 import theme
 import version
 from i18n import t
+from serverpicker import ServerPicker
 
 log = logging.getLogger("settings")
 
@@ -50,6 +51,7 @@ class Settings:
         self.output_device_index = None
         self.last_username = ""
         self.mumble_host = DEFAULT_MUMBLE_HOST
+        self.mumble_port = 64738
         # 电台栈**不存**。频率该从数据源来：上了席位的自动加，别人的席位在
         # "在线频率"里点。留着上一场的频率反而危险——那些临时频道多半早就没
         # 人了，屏幕上却看起来一切正常。老配置里的 radios 键读到也直接忽略。
@@ -85,6 +87,7 @@ class Settings:
                     self.output_device_index = data.get("output_device_index", None)
                     self.last_username = data.get("last_username", "")
                     self.mumble_host = data.get("mumble_host") or DEFAULT_MUMBLE_HOST
+                    self.mumble_port = int(data.get("mumble_port", self.mumble_port))
                     self.always_on_top = bool(data.get("always_on_top", False))
                     self.compact = bool(data.get("compact", False))
                     self.language = data.get("language", "") or ""
@@ -108,6 +111,7 @@ class Settings:
                 "output_device_index": self.output_device_index,
                 "last_username": self.last_username,
                 "mumble_host": self.mumble_host,
+                "mumble_port": self.mumble_port,
                 "always_on_top": self.always_on_top,
                 "compact": self.compact,
                 "language": self.language,
@@ -247,12 +251,10 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout()
         layout.setSpacing(10)
 
-        host_layout = QHBoxLayout()
-        self.mumble_host_input = LineEdit()
-        self.mumble_host_input.setText(self.settings.mumble_host)
-        host_layout.addWidget(BodyLabel(t("settings.mumble_host")))
-        host_layout.addWidget(self.mumble_host_input, 1)
-        layout.addLayout(host_layout)
+        self.audio_picker = ServerPicker(
+            "audio", self.settings.mumble_host, self.settings.mumble_port, self)
+        self.audio_picker.set_locked(getattr(self.parent(), "voice", None) is not None)
+        layout.addWidget(self.audio_picker)
 
         layout.addWidget(StrongBodyLabel(t("settings.volume")))
 
@@ -420,8 +422,9 @@ class SettingsDialog(QDialog):
         self._refresh_baseline()
 
     def save_and_close(self):
-        self.settings.mumble_host = (self.mumble_host_input.text().strip()
-                                    or DEFAULT_MUMBLE_HOST)
+        if getattr(self.parent(), "voice", None) is None:
+            self.settings.mumble_host = self.audio_picker.host() or DEFAULT_MUMBLE_HOST
+            self.settings.mumble_port = self.audio_picker.port()
         self.settings.ptt_bindings = list(self.ptt_list.bindings)
         self.settings.mic_volume = self.mic_slider.value()
         self.settings.speaker_volume = self.speaker_slider.value()

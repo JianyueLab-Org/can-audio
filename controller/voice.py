@@ -277,8 +277,9 @@ class VoiceClient:
     """
 
     def __init__(self, server, cid, password, on_state=None, on_rx=None, on_tx=None,
-                 on_connection_change=None, reconnect_limit=RECONNECT_LIMIT):
+                 on_connection_change=None, reconnect_limit=RECONNECT_LIMIT, port=64738):
         self.server = server
+        self.port = port
         self.cid = str(cid).strip()
         self.password = password
         self.on_state = on_state
@@ -422,6 +423,7 @@ class VoiceClient:
             # BoundedReconnect 管，用尽了就整个下线。
             self.mumble = bounded_mumble()(self.server, self.cid,
                                            password=self.password,
+                                           port=self.port,
                                            reconnect=True)
             self.mumble.reconnect_limit = self.reconnect_limit
             self.mumble.on_reconnect = self._on_reconnect_attempt
@@ -974,16 +976,29 @@ class VoiceClient:
         # 是手动加的 118.000（自始至终没有第二个人在），席位频率 118.350 于是
         # 整晚只能收不能发。
         #
-        # 只试两个：用户选中的，和数据源上正在值守的那个席位频率。用户的选择
-        # 仍然排第一，只有在它**进不去**的时候才轮到席位频率——而席位频率恰恰
-        # 是唯一一个"必须能发话"的。故意不把整张 RX 表都试一遍：每次失败要等满
-        # 一个 CHANNEL_TIMEOUT，而这段等待是在 _sync_lock 里面的。
+        # 主频率只能是本人当前值守的席位。其它频率仍然可以 RX / TX / XC，
+        # 但不能因为手动点选了它，就把管制员送进错误的主频道。
+        #
+        # 有值守席位时，优先使用用户在这些席位中选的频率，再按席位频率回退。
+        # 没有数据源值守信息时保留旧行为，允许使用当前选中的频率；这兼容刚连上
+        # 语音、数据源尚未返回的短窗口。
         candidates = []
-        for khz in (stack.selected_khz, stack.locked_khz):
-            if khz in rx_channels and khz not in candidates:
-                candidates.append(khz)
-        if not candidates and rx_channels:
-            candidates.append(next(iter(rx_channels)))
+        raw_locked = getattr(stack, "locked_khz", ())
+        if isinstance(raw_locked, int):
+            locked = {raw_locked}
+        else:
+            locked = set(raw_locked or ())
+        if locked:
+            if stack.selected_khz in locked and stack.selected_khz in rx_channels:
+                candidates.append(stack.selected_khz)
+            candidates.extend(
+                khz for khz in sorted(locked)
+                if khz in rx_channels and khz not in candidates)
+        else:
+            if stack.selected_khz in rx_channels:
+                candidates.append(stack.selected_khz)
+            if not candidates and rx_channels:
+                candidates.append(next(iter(rx_channels)))
 
         joined_khz = None
         for khz in candidates:

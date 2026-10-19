@@ -510,8 +510,9 @@ class Broadcaster:
     def __init__(self, server, cid, password, station, on_state=None,
                  reconnect_limit=RECONNECT_LIMIT,
                  datafeed_url=atisrouting.DEFAULT_URL,
-                 atis_range_nm=atisrouting.DEFAULT_RANGE_NM):
+                 atis_range_nm=atisrouting.DEFAULT_RANGE_NM, port=64738):
         self.server = server
+        self.port = port
         self.cid = str(cid).strip()
         self.password = password
         self.station = station
@@ -680,6 +681,7 @@ class Broadcaster:
             # BoundedReconnect 管，用尽了这个席位就停播。
             self.mumble = bounded_mumble()(self.server, self.user,
                                            password=self.password,
+                                           port=self.port,
                                            reconnect=True)
             self.mumble.reconnect_limit = self.reconnect_limit
             self.mumble.on_reconnect = self._on_reconnect_attempt
