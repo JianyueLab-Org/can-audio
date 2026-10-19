@@ -52,8 +52,6 @@ from settings import Settings, SettingsDialog
 
 log = logging.getLogger("gui")
 
-# 语音（Mumble）服务器。FSD 是另一台，地址在设置里（fsd.ceruleanavi.net:6809）。
-
 # 外观在 theme.py 里，四个客户端共用一份——它们多半并排开着，长得不一样会很跳。
 # 这里只把用到的名字取出来，**不要在这个文件里再写死任何 #rrggbb**。
 from theme import (ACTIVE_COLOR, IDLE_COLOR, MONO_FONT, MUTED_COLOR as OFF_COLOR,
@@ -253,6 +251,7 @@ class AtisWindow(QMainWindow):
         self.profile = Profile(path=profile_module.DEFAULT_PROFILE_PATH)
         self.broadcasters = {}          # callsign -> Broadcaster（语音）
         self.fsd_clients = {}           # callsign -> FSDClient（网络在线与文字通播）
+        self._settings_dialog = None
         self.metars = {}                # callsign -> Metar
         self.raw_metars = {}            # callsign -> 原始电码，用来判断变没变
         self._weather_errors = {}       # callsign -> 还没恢复的取天气错误
@@ -1136,15 +1135,18 @@ class AtisWindow(QMainWindow):
                             _c, 'fsd-error' if state == 'error' else state,
                             f"[FSD] {message}"))
                 self.fsd_clients[callsign] = fsd
+                self._lock_server_settings()
                 fsd.start()
 
         broadcaster = Broadcaster(
             self.settings.mumble_host, cid, password, station,
             datafeed_url=self.settings.datafeed_url,
             atis_range_nm=self.settings.atis_range_nm,
+            port=self.settings.mumble_port,
             on_state=lambda state, message, _c=callsign:
                 self.signals.state.emit(_c, state, message))
         self.broadcasters[callsign] = broadcaster
+        self._lock_server_settings()
 
         self.settings.cid = cid
         self.settings.save_settings()
@@ -1276,9 +1278,19 @@ class AtisWindow(QMainWindow):
             self.settings.skipped_version = found.version
             self.settings.save_settings()
 
+    def _lock_server_settings(self):
+        if self._settings_dialog is not None:
+            self._settings_dialog.set_servers_locked(True)
+
     def open_settings(self):
-        dialog = SettingsDialog(self.settings, self)
-        dialog.exec()
+        dialog = SettingsDialog(
+            self.settings, self,
+            locked=bool(self.broadcasters or self.fsd_clients))
+        self._settings_dialog = dialog
+        try:
+            dialog.exec()
+        finally:
+            self._settings_dialog = None
         # 刷新间隔要立刻生效，不然改了得重启才算数
         self.apply_refresh_interval()
 

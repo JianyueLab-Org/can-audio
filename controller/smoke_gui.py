@@ -7,6 +7,7 @@
 """
 
 import os
+import atexit
 import sys
 import tempfile
 import time
@@ -19,7 +20,15 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # 的电台栈**（于是 "应该有两部电台" 在你存过频率时必然失败），跑完还会把它清空。
 # gui.resource_path 走的是 __file__，applog 这里也没启动，所以换目录是安全的。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-os.chdir(tempfile.mkdtemp(prefix="can-smoke-"))
+_original_cwd = os.getcwd()
+_scratch_root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".temp")
+os.makedirs(_scratch_root, exist_ok=True)
+_scratch = tempfile.TemporaryDirectory(prefix="controller-smoke-", dir=_scratch_root)
+def _cleanup_scratch():
+    os.chdir(_original_cwd)
+    _scratch.cleanup()
+atexit.register(_cleanup_scratch)
+os.chdir(_scratch.name)
 
 # pymumble 需要本机的 opus 原生库来编解码音频。这里不碰音频，缺库时放个替身
 # 让导入过去；pymumble 本身仍然是真的。
@@ -38,6 +47,9 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 # 真正的对话框逻辑另有一条用例单独测。
 import update
 update.check = lambda *args, **kwargs: None
+
+import serverdirectory
+serverdirectory.fetch = lambda *args, **kwargs: {"audio": []}
 
 import gui
 
@@ -613,6 +625,38 @@ def main():
     from settings import SettingsDialog
     import ptt
     dialog = SettingsDialog(window.settings, window)
+    def selected_endpoint_is_saved_and_locked_while_connecting():
+        from settings import Settings
+        dialog.audio_picker.host_edit.setText("custom.example")
+        dialog.audio_picker.port_edit.setValue(65000)
+        dialog.save_and_close()
+        loaded = Settings()
+        assert (loaded.mumble_host, loaded.mumble_port) == ("custom.example", 65000)
+        window.voice = object()
+        try:
+            locked = SettingsDialog(window.settings, window)
+            assert not locked.audio_picker.host_edit.isEnabled()
+            assert not locked.audio_picker.port_edit.isEnabled()
+            assert not locked.audio_picker.server_combo.isEnabled()
+            locked.reject()
+        finally:
+            window.voice = None
+    check("服务器设置保存并在连接时锁定", selected_endpoint_is_saved_and_locked_while_connecting)
+    def selected_endpoint_reaches_connection_and_session_label():
+        window.username_input.setText("123")
+        window.password_input.setText("password")
+        with mock.patch.object(gui, "VoiceClient") as voice_factory, \
+                mock.patch.object(window, "refresh_datafeed"), \
+                mock.patch.object(gui.threading, "Thread"):
+            voice_factory.return_value.connect.return_value = True
+            try:
+                window.connect_voice()
+                assert voice_factory.call_args.args[0] == "custom.example"
+                assert voice_factory.call_args.kwargs["port"] == 65000
+                assert "custom.example:65000" in window.session_label.text()
+            finally:
+                window.disconnect_voice()
+    check("服务器设置用于连接和会话标签", selected_endpoint_reaches_connection_and_session_label)
     check("建立设置对话框", lambda: dialog)
     check("PTT 绑定列表", lambda: dialog.ptt_list.bindings)
 
@@ -620,7 +664,7 @@ def main():
         window.pages.setCurrentIndex(0)
         app.processEvents()
         assert window.login_settings_button.isVisible(), "登录页需要能打开设置"
-        dialog.mumble_host_input.setText("  voice.example.net  ")
+        dialog.audio_picker.host_edit.setText("  voice.example.net  ")
         dialog.save_and_close()
         assert gui.Settings().mumble_host == "voice.example.net"
         window.username_input.setText("1000")

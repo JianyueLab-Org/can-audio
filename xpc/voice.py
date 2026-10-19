@@ -207,8 +207,9 @@ class Voice:
 
     def __init__(self, host, username, password="", settings=None,
                  on_status=None, on_ptt=None, on_rx=None, on_channel=None,
-                 reconnect_limit=RECONNECT_LIMIT):
+                 reconnect_limit=RECONNECT_LIMIT, port=64738):
         self.host = host
+        self.port = port
         self.username = username
         self.password = password
         self.settings = settings
@@ -432,6 +433,7 @@ class Voice:
             # BoundedReconnectMumble 管，用尽了就整个下线。
             self.mumble = bounded_mumble()(self.host, self.username,
                                            password=self.password,
+                                           port=self.port,
                                            reconnect=True)
             self.mumble.reconnect_limit = self.reconnect_limit
             self.mumble.on_reconnect = self._on_reconnect_attempt

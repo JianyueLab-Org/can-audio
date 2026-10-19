@@ -28,6 +28,7 @@ log = logging.getLogger("settings")
 SETTINGS_FILE = "xpc_settings.json"
 
 MUMBLE_HOST = "audio.ceruleanavi.net"
+MUMBLE_PORT = 64738
 FSD_HOST = "fsd.ceruleanavi.net"
 FSD_PORT = 6809
 
@@ -52,6 +53,7 @@ DEFAULTS = {
     "aircraft": "",
     "rating": 1,
     "mumble_host": MUMBLE_HOST,
+    "mumble_port": MUMBLE_PORT,
     "fsd_host": FSD_HOST,
     "fsd_port": FSD_PORT,
     # PTT 现在是一串绑定（键盘 / 鼠标侧键 / 摇杆），任意一个按住即发话。

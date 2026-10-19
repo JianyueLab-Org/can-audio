@@ -47,6 +47,9 @@ QMessageBox.question = staticmethod(_question)
 import update
 update.check = lambda *args, **kwargs: None
 
+import serverdirectory
+serverdirectory.fetch = lambda *args, **kwargs: {}
+
 # 提示音会真的去开一次输出设备。跑冒烟测试的机器上多半没有声卡（CI 上肯定
 # 没有），而且它本来也不该出声。换成记一笔——顺便把"哪条消息该响"这件事
 # 一起验了，判定本身的单元测试在 test_xpc.py 里。

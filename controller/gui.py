@@ -1065,6 +1065,7 @@ class ControllerWindow(QMainWindow):
         server = self.settings.mumble_host
         self.voice = VoiceClient(
             server, username, password,
+            port=self.settings.mumble_port,
             on_state=self.signals.state.emit,
             on_rx=self.signals.rx.emit,
             on_tx=self.signals.tx.emit,
@@ -1088,7 +1089,8 @@ class ControllerWindow(QMainWindow):
         self.cid = username
         self.settings.last_username = username
         self.settings.save_settings()
-        self.session_label.setText(f'{username} · {server}')
+        self.session_label.setText(
+            f"{username} · {server}:{self.settings.mumble_port}")
         self._set_connection_style(True)
         self.pages.setCurrentIndex(1)
         threading.Thread(target=self.voice.sync, args=(self.stack,),
