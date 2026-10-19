@@ -936,6 +936,24 @@ class SettingsTest(unittest.TestCase):
                 settings.save_settings()
                 self.assertEqual(self.module.Settings().mumble_host, host)
 
+    def test_missing_audio_endpoint_uses_public_server(self):
+        self.write({"fsd_host": "fsd.example", "fsd_port": 16809})
+        settings = self.module.Settings()
+        self.assertEqual(getattr(settings, "mumble_host", None),
+                         "audio.ceruleanavi.net")
+        self.assertEqual(getattr(settings, "mumble_port", None), 64738)
+        self.assertEqual((settings.fsd_host, settings.fsd_port),
+                         ("fsd.example", 16809))
+
+    def test_audio_endpoint_survives_save_and_reload(self):
+        settings = self.module.Settings()
+        settings.mumble_host = "audio.example"
+        settings.mumble_port = 16473
+        settings.save_settings()
+        again = self.module.Settings()
+        self.assertEqual(getattr(again, "mumble_host", None), "audio.example")
+        self.assertEqual(getattr(again, "mumble_port", None), 16473)
+
     def test_migrates_the_voice_host_away(self):
         # 早期版本把语音服务器的地址填成了 FSD 地址，那台机器上没有 FSD。
         # 语音服务器换过两次域名，三个都得认：前两个还留在老配置里，最后
@@ -2602,6 +2620,33 @@ class RejectIsNotACrashTest(unittest.TestCase):
                                side_effect=RuntimeError("别的错")):
             with self.assertRaises(RuntimeError):
                 client.run()
+
+
+class BroadcastEndpointTest(unittest.TestCase):
+    def test_custom_audio_port_reaches_the_mumble_connection(self):
+        broadcast = _load_broadcast()
+
+        class Connection:
+            def __init__(self, host, user, password, port=64738,
+                         reconnect=False):
+                self.endpoint = (host, port)
+                self.callbacks = mock.Mock()
+
+            def set_receive_sound(self, enabled):
+                pass
+
+            def start(self):
+                caster._connected = True
+
+        with mock.patch.object(broadcast, "Synthesizer"), \
+                mock.patch.object(broadcast, "bounded_mumble", return_value=Connection):
+            caster = broadcast.Broadcaster(
+                "audio.example", "1000", "pw", Station("ZSPD", "", "127.850"),
+                port=16473)
+            caster._join_channel = lambda: True
+            caster._router.attach = lambda connection: None
+            self.assertTrue(caster._connect())
+            self.assertEqual(caster.mumble.endpoint, ("audio.example", 16473))
 
 
 if __name__ == "__main__":

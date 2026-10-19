@@ -48,6 +48,9 @@ QMessageBox.question = staticmethod(_question)
 import update
 update.check = lambda *args, **kwargs: None
 
+import serverdirectory
+serverdirectory.fetch = lambda *args, **kwargs: {}
+
 # 提示音会真的去开一次输出设备。跑冒烟测试的机器上多半没有声卡（CI 上肯定
 # 没有），而且它本来也不该出声。换成记一笔——顺便把"哪条消息该响"这件事
 # 一起验了，判定本身的单元测试在 xpc/test_xpc.py 里。
@@ -219,7 +222,7 @@ def main():
     print("状态回调：")
     check("模拟器状态", lambda: window.on_sim_state(True, "已连接 X-Plane"))
 
-    def disconnects_fsd_when_simulator_goes_away():
+    def keeps_fsd_when_simulator_goes_away():
         class FakeFsd:
             stopped = False
 
@@ -228,10 +231,18 @@ def main():
 
         fsd = FakeFsd()
         window.fsd = fsd
-        window.on_sim_state(False, "模拟器断开")
-        assert fsd.stopped, "模拟器断开时应停止 FSD"
-        assert window.fsd is None, "模拟器断开时不应保留 FSD 引用"
-    check("模拟器断开时关闭网络", disconnects_fsd_when_simulator_goes_away)
+        window.snapshot = dict(SNAPSHOT)
+        window.ident_button.setEnabled(True)
+        try:
+            window.on_sim_state(False, "模拟器断开")
+            assert not fsd.stopped, "模拟器断开时应保留健康的 FSD 连接"
+            assert window.fsd is fsd, "模拟器断开时应保留 FSD 引用"
+            assert window.snapshot is None, "模拟器断开时不应保留过期位置"
+            assert not window.ident_button.isEnabled(), "模拟器断开时不能发送 IDENT"
+            assert window.connect_button.text() == t("connect.disconnect")
+        finally:
+            window.fsd = None
+    check("模拟器断开时保留网络", keeps_fsd_when_simulator_goes_away)
 
     check("网络状态", lambda: window.on_fsd_status("online", "已上线"))
     check("语音状态", lambda: window.on_voice_status("online", "语音已连接"))
@@ -239,13 +250,17 @@ def main():
 
     def fsd_error_keeps_voice():
         # 两条链路互不依赖，网络断了不该把语音一起收掉
+        class FailedFsd:
+            running = False
+
+        window.fsd = FailedFsd()
         window.voice = object()
         try:
             _fsd_error_keeps_voice()
         finally:
             # 断言挂了也要把替身收回去：留着它，后面每一项都会去碰这个
             # object()，一个失败会连着变成十个
-            window.voice = None
+            window.fsd = window.voice = None
 
     def _fsd_error_keeps_voice():
         window.on_fsd_status("error", "连接被拒绝")

@@ -277,8 +277,9 @@ class VoiceClient:
     """
 
     def __init__(self, server, cid, password, on_state=None, on_rx=None, on_tx=None,
-                 on_connection_change=None, reconnect_limit=RECONNECT_LIMIT):
+                 on_connection_change=None, reconnect_limit=RECONNECT_LIMIT, port=64738):
         self.server = server
+        self.port = port
         self.cid = str(cid).strip()
         self.password = password
         self.on_state = on_state
@@ -422,6 +423,7 @@ class VoiceClient:
             # BoundedReconnect 管，用尽了就整个下线。
             self.mumble = bounded_mumble()(self.server, self.cid,
                                            password=self.password,
+                                           port=self.port,
                                            reconnect=True)
             self.mumble.reconnect_limit = self.reconnect_limit
             self.mumble.on_reconnect = self._on_reconnect_attempt
