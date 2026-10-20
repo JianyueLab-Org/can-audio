@@ -409,6 +409,23 @@ def nearest_relatives(icao):
                         key=lambda t: (abs(size(t) - mine), order[t])))
 
 
+def is_special(model):
+    """X-CSL 的 @ 涂装：@ID（印尼空军）、@TA 这类，不是航司代码。
+
+    swift 的匹配器把军用和民用分开（CAircraftMatcherSetup::ByMilitary /
+    ByCivilian），民航飞机永远拿不到军用模型。CSL 包里没有军用标记，X-CSL
+    的约定是运营方代码前面加 @。
+    """
+    return (model.airline or "").startswith("@") or "@" in (model.name or "")
+
+
+def civilian_rank(model):
+    """越小越适合拿来顶一架民航飞机：通用涂装 0，航司涂装 1，@ 涂装 2。"""
+    if is_special(model):
+        return 2
+    return 1 if model.airline else 0
+
+
 def category_of(icao):
     """机型属于哪一类机身。认不出返回空。"""
     icao = (icao or "").upper()
@@ -444,6 +461,10 @@ class ModelSet:
             if model.airline:
                 key = (model.icao, model.airline)
                 self._by_icao_airline.setdefault(key, []).append(model)
+        # 只按机型挑时用的是每个列表的第一个，所以排好：不带航司的通用涂装、
+        # 普通航司、最后才是 @ 开头的军用/政府涂装（见 is_special）
+        for found in self._by_icao.values():
+            found.sort(key=civilian_rank)
 
     def __len__(self):
         return len(self.models)
@@ -570,4 +591,4 @@ class ModelSet:
                 return found[0], f"退到通用机型 {candidate}"
 
         # 9. 兜底。看不见的飞机比涂装错的飞机危险得多。
-        return self.models[0], "没有近似机型，用了包里的第一个"
+        return min(self.models, key=civilian_rank), "没有近似机型，用了包里的第一个"

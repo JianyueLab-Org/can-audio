@@ -3223,6 +3223,39 @@ class ModelMatchingTest(unittest.TestCase):
         model, why = models.match(airline="CCA")
         self.assertEqual(model.name, "A320_CCA", why)
 
+    def test_a_civilian_never_gets_a_military_livery_by_type(self):
+        """X-CSL 的 B738 包第一条是 @IDS（印尼空军）。只按机型挑的时候不能拿它。"""
+        models = cslmatch.ModelSet([
+            cslmatch.Model("B738:B738@IDS", "ids.obj", icao="B738", airline="@ID", livery="S"),
+            cslmatch.Model("B738:B738CES", "ces.obj", icao="B738", airline="CES"),
+        ])
+        model, why = models.match(equipment="B738", airline="UAL")
+        self.assertEqual(model.name, "B738:B738CES", why)
+
+    def test_the_generic_livery_comes_first_by_type(self):
+        models = cslmatch.ModelSet([
+            cslmatch.Model("B738:B738@IDS", "ids.obj", icao="B738", airline="@ID"),
+            cslmatch.Model("B738:B738CES", "ces.obj", icao="B738", airline="CES"),
+            cslmatch.Model("B738:B738", "gen.obj", icao="B738"),
+        ])
+        model, _ = models.match(equipment="B738")
+        self.assertEqual(model.name, "B738:B738")
+
+    def test_a_military_livery_is_used_when_it_is_all_there_is(self):
+        models = cslmatch.ModelSet([
+            cslmatch.Model("F5:F5@TA", "f5.obj", icao="F5", airline="@TA"),
+        ])
+        model, _ = models.match(equipment="F5")
+        self.assertEqual(model.name, "F5:F5@TA")
+
+    def test_the_last_resort_is_not_military_either(self):
+        models = cslmatch.ModelSet([
+            cslmatch.Model("F5:F5@TA", "f5.obj", icao="F5", airline="@TA"),
+            cslmatch.Model("C172:C172", "c172.obj", icao="C172"),
+        ])
+        model, _ = models.match(equipment="ZZZZ")
+        self.assertEqual(model.name, "C172:C172")
+
     def test_airline_from_callsign(self):
         self.assertEqual(cslmatch.airline_from_callsign("CCA1111"), "CCA")
         self.assertEqual(cslmatch.airline_from_callsign("ces5123"), "CES")

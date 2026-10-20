@@ -482,11 +482,20 @@ ParseAirlineCommand(
 	std::string group = gGroupings[icao];
 	package.matches[match_icao_airline].emplace(icao + " " + airline, static_cast<int>(package.planes.size()) - 1);
 #if USE_DEFAULTING
-	package.matches[match_icao		].emplace(icao,				static_cast<int>(package.planes.size()) - 1);
+	// XPC for CAN: the first livery of a type becomes its type-only match, so
+	// keep X-CSL's @ liveries (military / government, e.g. "@ID") out of it -
+	// otherwise every B738 without an airline was drawn as an Indonesian Air
+	// Force one, which is simply first in the file.
+	const bool civilian = airline.empty() || airline[0] != '@';
+	if (civilian) {
+		package.matches[match_icao		].emplace(icao,				static_cast<int>(package.planes.size()) - 1);
+	}
 #endif
 	if (!group.empty()) {
 #if USE_DEFAULTING
-		package.matches[match_group	     ].emplace(group,				  static_cast<int>(package.planes.size()) - 1);
+		if (civilian) {
+			package.matches[match_group	     ].emplace(group,				  static_cast<int>(package.planes.size()) - 1);
+		}
 #endif
 		package.matches[match_group_airline].emplace(group + " " + airline, static_cast<int>(package.planes.size()) - 1);
 	}
@@ -513,7 +522,11 @@ ParseLiveryCommand(
 	package.planes.back()->setLivery(icao, airline, livery);
 	std::string group = gGroupings[icao];
 #if USE_DEFAULTING
-	package.matches[match_icao				].emplace(icao,							   static_cast<int>(package.planes.size()) - 1);
+	// XPC for CAN: see ParseAirlineCommand - no @ livery as a type-only match
+	const bool civilian = airline.empty() || airline[0] != '@';
+	if (civilian) {
+		package.matches[match_icao				].emplace(icao,							   static_cast<int>(package.planes.size()) - 1);
+	}
 	package.matches[match_icao_airline 		].emplace(icao + " " + airline,			   static_cast<int>(package.planes.size()) - 1);
 #endif
 	package.matches[match_icao_airline_livery].emplace(icao + " " + airline + " " + livery,
@@ -522,7 +535,9 @@ ParseLiveryCommand(
 		static_cast<int>(package.planes.size()) - 1);
 	if (!group.empty()) {
 #if USE_DEFAULTING
-		package.matches[match_group		 		 ].emplace(group,							     static_cast<int>(package.planes.size()) - 1);
+		if (civilian) {
+			package.matches[match_group		 		 ].emplace(group,							     static_cast<int>(package.planes.size()) - 1);
+		}
 		package.matches[match_group_airline		 ].emplace(group + " " + airline,			     static_cast<int>(package.planes.size()) - 1);
 #endif
 		package.matches[match_group_airline_livery].emplace(group + " " + airline + " " + livery,

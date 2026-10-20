@@ -78,6 +78,11 @@ APP_NAME = "XPC for CAN"
 # 正式包和以前一样是纯版本号。
 VERSION = version.display()
 
+# 他机等机型等多久再匹配，以及至少要几个位置样本。照 swift 的
+# CAirspaceMonitor：MMMaxAgeMs = 6 s，remoteAircraftSituationsCount > 1。
+MATCH_WAIT = 6.0
+MATCH_MIN_SAMPLES = 2
+
 
 class Signals(QObject):
     """后台线程 → GUI 线程的唯一通道。"""
@@ -155,6 +160,8 @@ class XpcWindow(QMainWindow):
         self.traffic = bridge.SampleTable()
         self.bridge = bridge.BridgeSender()
         self.models = cslmatch.ModelSet()
+        # 呼号 -> 第一次等机型的时刻（_ready_for_matching）
+        self._waiting_for_type = {}
         self._model_cache = {}          # 呼号 -> (.obj 路径, 垂直偏移 米, 全部 .obj, 模型名)
         # 上一次推给插件的内容和时刻。没变就不推，但至少每 PUSH_HEARTBEAT 秒
         # 推一次，插件靠它判断客户端还活着。
@@ -720,6 +727,7 @@ class XpcWindow(QMainWindow):
         # prune 不受开关控制：关着渲染的话表会涨一整场
         for callsign in self.traffic.prune():
             self._model_cache.pop(callsign, None)
+            self._waiting_for_type.pop(callsign, None)
         if not self.settings.render_traffic:
             if self._last_pushed:
                 # 关掉时推一帧空的：插件现在自己积分，不清的话飞机会沿着最后
@@ -736,7 +744,10 @@ class XpcWindow(QMainWindow):
             max_range_nm=self.settings.traffic_range_nm or None)
 
         outgoing = []
+        now = traffic_module.clock()
         for entry in entries:
+            if not self._ready_for_matching(entry, now):
+                continue
             (entry["object"], entry["vert_offset"], entry["objects"],
              entry["model"]) = self._model_for(entry)
             # 原生插件照搬 swift：swift 的 xswiftbus 每帧收到的是客户端插值好的
@@ -748,13 +759,31 @@ class XpcWindow(QMainWindow):
 
         # 距离每拍都在变，只用来排序，不算"变了"
         content = [{k: v for k, v in e.items() if k != "range_nm"} for e in outgoing]
-        now = traffic_module.clock()
         if (content == self._last_pushed
                 and now - self._last_push_time < bridge.PUSH_HEARTBEAT):
             return
         self._last_pushed = content
         self._last_push_time = now
         self.bridge.send_traffic(outgoing, own=origin)
+
+    def _ready_for_matching(self, entry, now):
+        """这架飞机可以交给插件了吗。照 swift 的 CAirspaceMonitor::sendReadyForModelMatching。
+
+        swift 不会先拿个临时模型画上、等 #SB 回来再换：它等机型（最多
+        MMMaxAgeMs = 6 s），并且要至少两个位置样本，然后只匹配一次。先画后换
+        的结果是同一架飞机在眼前变来变去——对方每掉线重连一次就从"机型未知"
+        再来一遍。等不到机型的飞机，6 秒后照样按航司/默认机型画出来。
+        """
+        callsign = entry["callsign"]
+        if entry.get("received", 0) < MATCH_MIN_SAMPLES:
+            return False
+        if entry.get("equipment") or entry.get("csl"):
+            self._waiting_for_type.pop(callsign, None)
+            return True
+        first = self._waiting_for_type.setdefault(callsign, now)
+        if now - first < MATCH_WAIT:
+            return False
+        return True
 
     def _model_for(self, entry):
         """给一架飞机挑模型。匹配结果缓存住，别每帧都算。"""

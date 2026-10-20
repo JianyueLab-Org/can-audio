@@ -335,6 +335,21 @@ def main():
             window.fsd = None
     check("他机那一拍给 FSD 喂位置", traffic_tick_feeds_fsd)
 
+    def waits_for_the_type_like_swift():
+        # 照 swift：机型没到、样本不够两个时不交给插件，免得先画一架临时
+        # 模型再换；等满 MATCH_WAIT 还没有机型才照样画
+        ready = window._ready_for_matching
+        window._waiting_for_type.clear()
+        one = {"callsign": "CCA1111", "received": 1, "equipment": "A321"}
+        assert not ready(one, 100.0), "一个样本就匹配了"
+        known = {"callsign": "CCA1111", "received": 2, "equipment": "A321"}
+        assert ready(known, 100.0), "机型到了还在等"
+        unknown = {"callsign": "CES5123", "received": 2, "equipment": ""}
+        assert not ready(unknown, 100.0), "机型没到就匹配了"
+        assert not ready(unknown, 100.0 + gui.MATCH_WAIT - 0.1)
+        assert ready(unknown, 100.0 + gui.MATCH_WAIT), "等满了还不画"
+    check("等机型再匹配（swift）", waits_for_the_type_like_swift)
+
     print("指示灯：")
     check("TX 点亮", lambda: window.tx_light.set_lit(True))
     check("RX 点亮", lambda: window.rx_light.set_lit(True))
@@ -353,6 +368,8 @@ def main():
                                   traffic=window.traffic)
         pilot._send = lambda packet: True
         pilot._handle_packet(f"@N:CES2345:2000:1:31.2:121.6:34000:450:{pbh}:0")
+        # 两个位置样本：交给插件前至少要两个（swift 的 remoteAircraftSituationsCount > 1）
+        pilot._handle_packet(f"@N:CES2345:2000:1:31.201:121.601:34000:450:{pbh}:0")
         pilot._handle_packet("#SBCES2345:CCA1501:PI:GEN:EQUIPMENT=B738:AIRLINE=CCA")
         assert "CES2345" in window.traffic
     check("从 FSD 收到一架他机", traffic_from_fsd)
