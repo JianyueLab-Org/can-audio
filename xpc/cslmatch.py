@@ -89,13 +89,14 @@ DEFAULT_TYPE = "B738"
 class Model:
     """CSL 包里的一个模型。"""
 
-    __slots__ = ("name", "path", "icao", "airline", "livery", "package",
+    __slots__ = ("name", "path", "paths", "icao", "airline", "livery", "package",
                  "vert_offset")
 
     def __init__(self, name, path, package="", icao="", airline="", livery="",
-                 vert_offset=None):
+                 vert_offset=None, paths=None):
         self.name = name
         self.path = path
+        self.paths = list(paths or ([path] if path else []))
         self.package = package
         self.icao = icao.upper()
         self.airline = airline.upper()
@@ -141,10 +142,16 @@ def parse_package(directory):
             current = Model(parts[1], "", package=package)
             models.append(current)
         elif keyword == "OBJ8" and current is not None and len(parts) >= 4:
-            # OBJ8 <类型> <是否有动画> <路径>；只要 SOLID 的那条
+            # OBJ8 <类型> <是否有动画> <路径> [纹理...]
+            # IVAO_CSL 使用的路径含有 ':'（包目录:文件），和 swift 一样把它
+            # 规范化为目录分隔符；一个模型可能由机身、风扇等多个 OBJ 组成。
             if parts[1].upper() == "SOLID" and not current.path:
-                relative = " ".join(parts[3:]).replace("\\", "/")
+                relative = _package_relative_path(parts[3], directory)
                 current.path = os.path.normpath(os.path.join(directory, relative))
+                current.paths = [current.path]
+            elif parts[1].upper() == "SOLID" and current.path:
+                relative = _package_relative_path(parts[3], directory)
+                current.paths.append(os.path.normpath(os.path.join(directory, relative)))
         elif keyword == "VERT_OFFSET" and current is not None and len(parts) > 1:
             current.vert_offset = _float_or_none(parts[1])
         elif keyword == "OFFSET" and current is not None and len(parts) > 3:
@@ -165,6 +172,18 @@ def parse_package(directory):
              os.path.basename(directory), len(usable), len(models),
              len(models) - len(usable))
     return usable
+
+
+def _package_relative_path(value, directory):
+    """Resolve XSB paths, including IVAO's ``PACKAGE:file.obj`` form."""
+    value = value.replace("\\", "/")
+    if ":" in value:
+        package, value = value.split(":", 1)
+        package = package.strip("/")
+        if package and package.upper() != os.path.basename(directory).upper():
+            log.debug("CSL path package %s differs from %s", package,
+                      os.path.basename(directory))
+    return value.lstrip("/")
 
 
 def _float_or_none(text):

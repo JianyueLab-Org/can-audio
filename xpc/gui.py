@@ -154,7 +154,7 @@ class XpcWindow(QMainWindow):
         self.traffic = bridge.SampleTable()
         self.bridge = bridge.BridgeSender()
         self.models = cslmatch.ModelSet()
-        self._model_cache = {}          # 呼号 -> (匹配到的 .obj 路径, 垂直偏移 米)
+        self._model_cache = {}          # 呼号 -> (.obj 路径, 垂直偏移 米, 全部 .obj, 模型名)
         # 上一次推给插件的内容和时刻。没变就不推，但至少每 PUSH_HEARTBEAT 秒
         # 推一次，插件靠它判断客户端还活着。
         self._last_pushed = None
@@ -716,6 +716,7 @@ class XpcWindow(QMainWindow):
             self._last_pushed = None
             return
 
+        self.bridge.csl_path = (self.settings.csl_path or "").strip()
         origin = (snapshot["latitude"], snapshot["longitude"])
         entries = self.traffic.snapshot(
             origin=origin,
@@ -724,7 +725,12 @@ class XpcWindow(QMainWindow):
 
         outgoing = []
         for entry in entries:
-            entry["object"], entry["vert_offset"] = self._model_for(entry)
+            (entry["object"], entry["vert_offset"], entry["objects"],
+             entry["model"]) = self._model_for(entry)
+            # 原生插件照搬 swift：swift 的 xswiftbus 每帧收到的是客户端插值好的
+            # 位置，自己只在两次推送之间做一点平滑。所以积分到现在的位姿单独
+            # 放进 pose 送过去；target/velocity 照旧，给样本模型用。
+            entry["pose"] = [entry[key] for key in bridge.DRAWN_KEYS]
             outgoing.append(bridge.plugin_entry(entry))
         self.traffic_label.setText(t("radio.traffic", count=len(entries)))
 
@@ -748,9 +754,13 @@ class XpcWindow(QMainWindow):
             equipment=entry.get("equipment", ""),
             airline=entry.get("airline", ""),
             csl=entry.get("csl", ""))
-        path = cslmatch.obj_for_drawing(model.path) if model else ""
+        paths = [cslmatch.obj_for_drawing(path) for path in (model.paths if model else [])]
+        path = paths[0] if paths else ""
         offset = cslmatch.vert_offset(model) if model else 0.0
-        self._model_cache[callsign] = (path, offset)
+        # model 是 xsb_aircraft.txt 里 OBJ8_AIRCRAFT 的名字：原生插件拿它在
+        # 自己加载的 CSL 里找同一个模型，找不到再按机型/航司自己匹配
+        name = model.name if model else ""
+        self._model_cache[callsign] = (path, offset, paths, name)
         # 带上这次匹配用的机型/航司：#SB 的回复如果恰好落在快照之后、这里
         # 之前，无条件清标记会把那次更新吞掉
         self.traffic.mark_model_clean(callsign,
@@ -765,7 +775,7 @@ class XpcWindow(QMainWindow):
                      model.name, why)
         else:
             log.debug("no model available for %s: %s", callsign, why)
-        return path, offset
+        return path, offset, paths, name
 
     # ---------- 槽 ----------
     def on_sim_state(self, connected, message):
@@ -1464,7 +1474,7 @@ class SettingsDialog(QDialog):
         """探测一次，把三行文字和按钮的状态一起刷新。
 
         探测是纯读文件，很便宜，所以每次开对话框、每次选目录、每次装完都重来
-        一遍——记着上一次的结果会在用户中途装了 XPPython3 之后继续说"没装"。
+        一遍——记着上一次的结果会在用户中途手工拷了插件之后继续说"没装"。
         """
         status = xpinstall.inspect(self.settings.xplane_path)
         self._plugin = status
@@ -1479,15 +1489,18 @@ class SettingsDialog(QDialog):
                    xpinstall.CURRENT: "plugin.current"}[status.state]
             self.plugin_status.setText(t(key, path=status.root))
 
-        # 提示行按严重程度排：协议对不上是静默失效，最该先说；其次是没装
-        # XPPython3——那种情况下装了插件也不会被加载。
+        # 提示行按严重程度排：协议对不上是静默失效，最该先说；其次是这个包
+        # 根本没带插件；再次是旧的 Python 插件还在——它和原生插件抢端口。
         if status.protocol_mismatch:
             self.plugin_hint.setText(t("plugin.protocol_mismatch",
                                        installed=status.installed_protocol,
                                        bundled=status.bundled_protocol))
             self.plugin_hint.setStyleSheet(f"color: {theme.MUTED_COLOR};")
-        elif status.can_install and not status.xppython3:
-            self.plugin_hint.setText(t("plugin.no_xppython3"))
+        elif status.state not in (xpinstall.NO_ROOT, xpinstall.NOT_XPLANE) and not status.bundled:
+            self.plugin_hint.setText(t("plugin.not_bundled"))
+            self.plugin_hint.setStyleSheet(f"color: {theme.MUTED_COLOR};")
+        elif status.legacy_python:
+            self.plugin_hint.setText(t("plugin.legacy_python"))
             self.plugin_hint.setStyleSheet(f"color: {theme.ACTIVE_COLOR};")
         else:
             self.plugin_hint.setText("")

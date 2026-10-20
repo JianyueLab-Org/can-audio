@@ -364,6 +364,9 @@ def main():
         assert entry["callsign"] == "CES2345", entry
         assert entry["object"].endswith("b738_cca.obj"), entry["object"]
         assert "range_nm" in entry, "缺少距离，插件没法按远近取舍"
+        # 原生插件（swift 的做法）要的三样：插值好的位姿、模型名、CSL 目录
+        assert len(entry["pose"]) == 6, entry.get("pose")
+        assert entry["model"] == "B738_CCA", entry["model"]
     check("推给插件并匹配到模型", traffic_reaches_the_bridge)
 
     def label_updates():
@@ -612,24 +615,43 @@ def main():
         import tempfile
         import xpinstall
         from i18n import t
-        root = os.path.join(tempfile.mkdtemp(), "X-Plane 12")
+        from unittest import mock
+        base = tempfile.mkdtemp()
+        root = os.path.join(base, "X-Plane 12")
         os.makedirs(os.path.join(root, xpinstall.PLUGINS_DIR))
+        # 冒烟环境里没编原生插件，放一份假的随包插件
+        package = os.path.join(base, "bundle", xpinstall.PLUGIN_FOLDER)
+        for name in (xpinstall.PLUGIN_BINARY,) + xpinstall.LEGACY_FILES:
+            os.makedirs(os.path.dirname(os.path.join(package, name)), exist_ok=True)
+            with open(os.path.join(package, name), "wb") as f:
+                f.write(b"XPC_BRIDGE_PROTOCOL=3")
+        # 旧的 Python 插件还在：要提示，装的时候要删
+        legacy = xpinstall.legacy_python_path(root)
+        os.makedirs(os.path.dirname(legacy))
+        with open(legacy, "w") as f:
+            f.write("PROTOCOL_VERSION = 3\n")
         try:
-            dialog = gui.SettingsDialog(window.settings, window)
-            dialog.settings.xplane_path = root
-            dialog._refresh_plugin_status()
-            assert dialog._plugin.state == xpinstall.MISSING, dialog._plugin.state
-            assert dialog.plugin_button.text() == t("plugin.install")
-            assert dialog.plugin_button.isEnabled()
-            # 没装 XPPython3 时要明说，否则装了插件也不会被加载
-            assert t("plugin.no_xppython3") == dialog.plugin_hint.text()
+            with mock.patch.object(xpinstall, "bundled_package", return_value=package):
+                dialog = gui.SettingsDialog(window.settings, window)
+                dialog.settings.xplane_path = root
+                dialog._refresh_plugin_status()
+                assert dialog._plugin.state == xpinstall.MISSING, dialog._plugin.state
+                assert dialog.plugin_button.text() == t("plugin.install")
+                assert dialog.plugin_button.isEnabled()
+                assert t("plugin.legacy_python") == dialog.plugin_hint.text()
 
-            dialog._install_plugin()
-            assert os.path.isfile(xpinstall.plugin_path(root)), "插件没写进去"
-            assert dialog._plugin.state == xpinstall.CURRENT, dialog._plugin.state
-            assert dialog.plugin_button.text() == t("plugin.reinstall")
+                dialog._install_plugin()
+                assert os.path.isfile(xpinstall.plugin_path(root)), "插件没写进去"
+                assert not os.path.exists(legacy), "旧的 Python 插件没删"
+                assert dialog._plugin.state == xpinstall.CURRENT, dialog._plugin.state
+                assert dialog.plugin_button.text() == t("plugin.reinstall")
+            with mock.patch.object(xpinstall, "bundled_package",
+                                   return_value=os.path.join(base, "nothing")):
+                dialog._refresh_plugin_status()
+                assert not dialog.plugin_button.isEnabled(), "没带插件时不该能点"
+                assert t("plugin.not_bundled") == dialog.plugin_hint.text()
         finally:
-            shutil.rmtree(os.path.dirname(root), ignore_errors=True)
+            shutil.rmtree(base, ignore_errors=True)
             window.settings.xplane_path = ""
     check("从对话框装插件", the_plugin_can_be_installed_from_the_dialog)
 

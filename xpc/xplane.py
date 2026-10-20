@@ -118,6 +118,22 @@ XPDR_STANDBY = 1
 # 判"停着"的地速门槛（节）。和 fsdpilot 降低位置包频率用的是同一条线。
 PARKED_SPEED_KT = 1
 
+
+def bcd_squawk(raw):
+    """Convert X-Plane's packed BCD transponder code to decimal digits."""
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 2000
+    digits = []
+    for shift in (12, 8, 4, 0):
+        digits.append((value >> shift) & 0xF)
+    if any(d > 7 for d in digits):
+        # Some test tools and third-party aircraft expose the already-decoded
+        # value. Preserve a valid decimal octal code in that case.
+        return max(0, min(7777, value))
+    return (((digits[0] * 10 + digits[1]) * 10 + digits[2]) * 10 + digits[3])
+
 def xpdr_mode(raw_mode, on_ground, groundspeed_kt):
     """transponder_mode dataref -> 位置包要的应答机模式。
 
@@ -411,7 +427,7 @@ class XPlaneLink:
             "pitch": raw.get("pitch", 0.0),
             "bank": raw.get("bank", 0.0),
             "heading": raw.get("heading_true", 0.0) % 360.0,
-            "squawk": int(raw.get("squawk", 2000)),
+            "squawk": bcd_squawk(raw.get("squawk", 0x2000)),
             # 待机只在飞机确实停着的时候当真，理由见 xpdr_mode()。
             "xpdr_mode": xpdr_mode(raw.get("xpdr_mode"), on_ground, groundspeed),
             "com1": self._frequency(raw.get("com1"), raw.get("com1_legacy")),
