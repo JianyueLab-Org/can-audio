@@ -212,7 +212,7 @@ class SnapshotTest(unittest.TestCase):
         self.link.last_update = time.time() - simlink.STALE_AFTER - 0.1
         self.assertIsNone(self.link.snapshot())
 
-    def test_field_names_match_the_xplane_client(self):
+    def test_field_names_match_the_xpc_client(self):
         """和 xpc 共用 fsdpilot/voice，字段名对不上就会静默出错。"""
         required = {"latitude", "longitude", "altitude", "groundspeed",
                     "pitch", "bank", "heading", "squawk", "xpdr_mode",
@@ -242,7 +242,7 @@ class SnapshotTest(unittest.TestCase):
         self.assertAlmostEqual(snapshot["heading_rate"], 3.0)
         self.assertAlmostEqual(snapshot["bank_rate"], -2.0)
 
-    def test_the_xplane_client_reports_the_same_velocity_fields(self):
+    def test_the_xpc_client_reports_the_same_velocity_fields(self):
         """fsdpilot 是分叉的一对，快速位置包从两边的快照里取同样的键。"""
         path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             "xpc", "xplane.py")

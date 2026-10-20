@@ -12,19 +12,13 @@ There is no dependency manifest, test suite, or build script in the repo. Everyt
 
 | Directory | Entry point | Role |
 |---|---|---|
-| `client/` | `gui.py` | Pilot client for MSFS — reads COM1 via **SimConnect** (`AircraftRequests.get("COM_ACTIVE_FREQUENCY:1")`) |
-| `xplane_client/` | `gui.py` | Pilot client for X-Plane — reads COM1 via **X-Plane UDP** (`XPlaneRadio` in `radio.py`) |
 | `controller/` | `gui.py` | ATC client — a **stack of frequencies** modelled on [TrackAudio](https://github.com/pierr3/TrackAudio), each with RX/TX/XC |
 | `atis/` | `gui.py` | ATIS client modelled on [vATIS](https://github.com/vatis-project/vatis) — stations, presets, templates; broadcasts over Mumble |
 | `xpc/` | `gui.py` | **XPC for CAN** — X-Plane pilot client modelled on [xPilot](https://github.com/xpilot-project/xpilot): Mumble voice **and** an FSD connection |
 | `msfs/` | `gui.py` | **MSFS for CAN** — the same client for Microsoft Flight Simulator, over SimConnect |
 | `server/` | `login.py`, `ATIS/mumble.py` | Runs on the Mumble/Murmur host: Ice authenticator + server-side ATIS bot fleet |
 
-`client/` and `xplane_client/` are **near-duplicate forks** of each other — same `radio.py`/`settings.py`/`gui.py` layout, identical apart from where COM1 comes from, so a fix to audio or PTT logic has to be applied to both, every time. `controller/`, `atis/` and `xpc/` no longer share that shape: they were rebuilt around their own models (`radiostack.py` + `voice.py`, `profile.py` + `broadcast.py`, and `xplane.py` + `fsdpilot.py` + `voice.py`) and have no `radio.py`.
-
-**`client/` and `xplane_client/` are legacy and are no longer shipped.** `xpc/` supersedes `xplane_client/` and `msfs/` supersedes `client/` — same simulators, but those two also log in to FSD so the aircraft appears on the network, where the old pair is voice-only. The release workflow (`.github/workflows/release.yml`) builds only `controller`, `atis`, `xpc` and `msfs`; the legacy pair is deliberately absent from the build matrix, and the release notes say so.
-
-Legacy does not mean dead: both still run, still have `test_radio.py` and `smoke_gui.py`, and the CI **does** run their tests and smoke checks — a regression in them still has to be known about, because they share the `FREQ_*` channel contract and the Mumble handling that everything else depends on. What it means is that no packaged build is produced, so a fix landing there reaches nobody until someone builds it by hand. Prefer fixing `xpc/`/`msfs/` when the same bug exists in both.
+`controller/`, `atis/`, `xpc/` and `msfs/` are the shipped clients. Each component remains an independent directory so its PyInstaller spec and runtime configuration can be used from that directory.
 
 There is no shared package — each component is imported flat from its own directory, which is why `mumblecompat.py` and `applog.py` exist as per-component copies rather than one import. Keep that pattern when adding cross-cutting helpers; a shared parent module would need path juggling in every PyInstaller spec.
 
@@ -35,8 +29,6 @@ The pilot clients now carry `applog.py` too, so all five GUI components log rath
 Run each app **from inside its own directory** — icon paths (`.\favicon.ico`) and config files are resolved relative to the CWD:
 
 ```powershell
-cd client;        python gui.py     # MSFS pilot client (needs MSFS running)
-cd xplane_client; python gui.py     # X-Plane pilot client (needs X-Plane in a flight)
 cd controller;    python gui.py     # ATC client
 cd atis;          python gui.py     # ATIS client
 cd xpc;           python gui.py     # XPC for CAN — X-Plane pilot client (voice + FSD)
@@ -103,10 +95,6 @@ python -m unittest test_ptt
 python -m unittest test_msfs.RealWorldLayoutTest   # the ones a live install found
 python smoke_gui.py
 
-cd client            # 以及 xplane_client，两份基本一样
-python -m unittest test_radio -v         # 频道切换（超时/重试）、PTT 的进频道判据
-python smoke_gui.py                      # 登录/主界面/设置，以及切换不能卡 Qt 线程
-
 cd server\ATIS
 python -m unittest test_mumble -v        # 通播的建频道 / 进频道，含服务器不回话
 ```
@@ -130,7 +118,7 @@ python -m unittest test_mumble -v        # 通播的建频道 / 进频道，含�
 
 The dividing line is **where the string ends up**, not which module it lives in: anything that can reach a widget, a `QMessageBox`, a status label or an `i18n` key stays Chinese, including the `message` argument of the `_status()`/`_state()` callbacks — those are UI strings that happen to be echoed into the log, and that echo is deliberate (it puts what the user saw next to what the code was doing). A string that only ever goes to the log is English. So the `reject.*` / `denied.*` entries in each `i18n.py` are still Chinese (in the `zh` half) while every `log.*` call around the code that reads them is not — and `voice.py`'s `_skip()` reasons, which only ever reach the log, are English despite sitting between two translated `_status()` calls.
 
-`controller/`, `atis/`, `xpc/` and `msfs/` are converted. **`client/` and `xplane_client/` are not** — they are legacy and unshipped, so their log text is still Chinese; the exception is `version.py`, which `test_version.CopiesAgreeTest` requires to be byte-identical across all six components, so that one file was synced everywhere. New code follows the English rule regardless of which directory it lands in.
+`controller/`, `atis/`, `xpc/` and `msfs/` are converted. New code follows the English log rule regardless of which directory it lands in.
 
 `setup()` also replaces `sys.excepthook` **and** `threading.excepthook` — an uncaught exception in a Qt slot or a worker thread otherwise vanishes silently, leaving a frozen window and an empty log. `--debug` (or the settings checkbox, persisted as `debug`) drops the level to DEBUG, which is where the protocol traffic lives: every FSD packet in and out (with the `#AA` password redacted), channel-listener changes, voice-target changes, and the radio-stack sync.
 
@@ -152,15 +140,7 @@ Three environment facts that will cost an afternoon otherwise:
 
 X-Plane dataref diagnostics — useful when frequency reads come back wrong:
 
-```powershell
-cd xplane_client
-python xplane.py            # RREF, 0.01 MHz precision
-python xplane.py --833      # com1_frequency_hz_833 dataref, 0.001 MHz precision
-python xplane.py --probe    # try every candidate dataref and print raw + MHz
-python xplane.py --data     # DATA output row 3 (must be enabled in X-Plane settings)
-```
-
-Third-party packages used (install with pip — note the PyPI name for pymumble_py3 is **`pymumble`**): `PyQt6` + `PyQt6-Fluent-Widgets` (all four shipped clients), `pymumble`, `pyaudio`, `numpy`, `pynput` (keyboard and mouse PTT), `pygame` (joystick PTT), `keyboard` (only the two legacy pilot clients), `SimConnect` (`msfs/`), `edge-tts` + `requests` + `pyttsx3` + `scipy` (server ATIS), `zeroc-ice` + generated `MumbleServer` slice modules (server login — gitignored, must be generated from the host's `MumbleServer.ice`). `requirements-build.txt` is the authoritative list for the four packaged clients.
+Third-party packages used (install with pip — note the PyPI name for pymumble_py3 is **`pymumble`**): `PyQt6` + `PyQt6-Fluent-Widgets` (all four shipped clients), `pymumble`, `pyaudio`, `numpy`, `pynput` (keyboard and mouse PTT), `pygame` (joystick PTT), `SimConnect` (`msfs/`), `edge-tts` + `requests` + `pyttsx3` + `scipy` (server ATIS), `zeroc-ice` + generated `MumbleServer` slice modules (server login — gitignored, must be generated from the host's `MumbleServer.ice`). `requirements-build.txt` is the authoritative list for the four packaged clients.
 
 ## Cross-cutting conventions
 
@@ -273,7 +253,7 @@ That kick needs **two** Ice objects registered, which is easy to get wrong: `use
 
 `micgain.py`, `denoise.py` and `calibration.py` are byte-identical between `xpc/` and `msfs/` (`SharedCopyTest`); `controller/` carries its own copies.
 
-**PTT and indicators.** The three shipped clients that transmit share `ptt.py` (see above); the two legacy pilot clients still poll `keyboard.is_pressed()` plus a pygame joystick button in a background thread. RX indicators are lit from the `PYMUMBLE_CLBK_SOUNDRECEIVED` callback and cleared by a 0.5 s timeout loop.
+**PTT and indicators.** The three shipped clients that transmit share `ptt.py` (see above). RX indicators are lit from the `PYMUMBLE_CLBK_SOUNDRECEIVED` callback and cleared by a 0.5 s timeout loop.
 
 **pygame on Windows.** `os.environ['SDL_VIDEODRIVER'] = 'dummy'` and `SDL_AUDIODRIVER = 'dummy'` must be set *before* `import pygame` — that is why these lines sit above the imports in `gui.py`, `radio.py`, and `client/settings.py`. pygame is only used for joystick input; SDL video/audio must stay disabled so it does not fight PyQt6 and PyAudio.
 
@@ -638,18 +618,13 @@ Three integration points, all hardcoded here:
 
 **Which clients speak FSD.** Two do, and they are the only ones: `atis/fsdclient.py` logs a station in as an `_ATIS` controller (`#AA`), and `xpc/fsdpilot.py` logs an aircraft in as a pilot (`#AP`). Packet layouts for both come from can-fsd's `internal/fsd/conn.go`, `handler.go` and `docs/protocol.md`.
 
-The other three — `client/`, `xplane_client/`, `controller/` — speak **only** Mumble and never touch the FSD port. A controller's presence on the network comes from whatever ATC client they run (EuroScope and friends), exactly as TrackAudio does it; keep it that way, because the voice server has no roster check and an FSD login from `controller/` would imply one.
+The controller speaks **only** Mumble and never touches the FSD port. A controller's presence on the network comes from whatever ATC client they run (EuroScope and friends), exactly as TrackAudio does it; keep it that way, because the voice server has no roster check and an FSD login from `controller/` would imply one.
 
 In both FSD clients the ninth `$ID` field (challenge) is deliberately omitted so the server never starts a VATSIM `$ZC` challenge that only official clients hold keys for.
 
 No authorisation is shared: can-fsd checks the `division` roster before a controller may staff a position, but the voice server has no equivalent — any account that authenticates can join any `FREQ_*` channel.
 
 The naming has caught up: the network is **Cerulean Aviation Network (formerly AirwaySN)**, can-fsd takes its own name from `config.json`'s `version`, and this repo now hardcodes `ceruleanavi.net`, `data.ceruleanavi.net`, `fsd.ceruleanavi.net` and `audio.ceruleanavi.net` (the Mumble host, renamed from `hjdczy.top` and then from `audio.airwaysn.org`). **`airwaysn.org` no longer resolves at all**, which is why the rename could not stop at the defaults: `mumble_host`, `fsd_host`, `datafeed_url` and `config_url` are all *written back into the settings file*, so an existing install keeps using the dead domain and reports it as a connection timeout with every line in the settings dialog looking perfectly normal. `OLD_MUMBLE_HOSTS`/`OLD_FSD_HOSTS` in `xpc/settings.py` and `msfs/settings.py`, and `OLD_FSD_HOSTS`/`OLD_DATAFEED_URLS`/`OLD_CONFIG_URLS` in `atis/settings.py`, rewrite exactly those old values on load and leave anything else alone — a member who pointed a client at a test server or an intranet mirror meant it.
-
-## Reference docs
-
-- `xplane_client/API.md` — X-Plane UDP protocol notes (BECN discovery on `239.255.1.1:49707`, RREF requests, dataref precision) and a SimConnect-vs-X-Plane comparison table. Applies to `xpc/xplane.py` too, except that XPC subscribes rather than polls.
-- `client/API.md` — vendored upstream pymumble API reference, not project documentation.
 
 ## Credentials, versions and the update check
 

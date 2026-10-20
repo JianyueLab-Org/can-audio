@@ -1,6 +1,6 @@
 """Mumble 语音。
 
-对应 xPilot 的 audio 层。和 client/ xplane_client/ 里那两份最大的差别是：
+对应 xPilot 的 audio 层。和旧版飞行员端最大的差别是：
 **这里不自己去问频率**。XPlaneLink 已经在持续订阅 COM1 了，界面把频率喂进
 set_frequency() 就行，省掉一整套轮询和"频道对不对"的反复检查。
 
@@ -258,9 +258,9 @@ class Voice:
         self._pending = None               # 还没切过去的频率
         self._thread = None
 
-        # ---- 连接状态，照搬老飞行员端 client/radio.py 的做法 ----
+        # ---- 连接状态，沿用已验证的状态事件做法 ----
         # 由 pymumble 的 CONNECTED / DISCONNECTED 回调翻转，不去猜 mumble 内部
-        # 的线程状态。老客户端叫 _connection_established。
+        # 的线程状态。这里使用 _connection_established。
         self._connection_established = threading.Event()
         self._mumble_thread = None         # 我们自己拿着的 pymumble 主循环线程
         self._reject_reason = ""           # 服务器拒绝时的原因，来自 run() 的异常
@@ -296,8 +296,8 @@ class Voice:
         它就停在 2。循环已经没了、命令队列再没人抽，这里却照样报"已连接"，
         界面一路绿灯——那正是"进不了频道又不报错"的表象。
 
-        所以和老飞行员端一样，先看那个由回调翻转的独立标记
-        （client/radio.py 的 `_connection_established`）：CONNECTED 时置上、
+        所以先看那个由回调翻转的独立标记
+        （`_connection_established`）：CONNECTED 时置上、
         DISCONNECTED 时清掉，主循环线程退出时也清掉。**不要用
         `mumble.is_alive()`**——pymumble 的循环现在跑在我们自己的线程里
         （`mumble.run()`，不是 `start()`），它那个 Thread 从没启动过，
@@ -443,7 +443,7 @@ class Voice:
             self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_PERMISSIONDENIED,
                                                self._on_permission_denied)
             # 连接标记由这两条回调翻转，和老飞行员端一样
-            # （client/gui.py:398-414）。这一份原来两条都没接：DISCONNECTED 正是
+                # （见 pymumble 的回调定义）。这一份原来两条都没接：DISCONNECTED 正是
             # pymumble 主循环结束时走的那条，没人听的话连接已经彻底死了而界面
             # 还是绿的，日志里一个字都没有。
             self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_CONNECTED,
@@ -484,29 +484,28 @@ class Voice:
             #     现场诊断 ... 我在频道=0 频道表共4个 表里有没有目标=True
             #
             # 命令进了队列却没上线，服务器压根没收到，自然既不照做也不回
-            # PermissionDenied——"收得到、发不动、不报错"就是这么来的。老飞行员
-            # 端（client/radio.py）不犯这个错纯属走运：它的 Mumble 对象建在 GUI
+            # PermissionDenied——"收得到、发不动、不报错"就是这么来的。旧实现
+            # 不犯这个错纯属走运：它的 Mumble 对象建在 GUI
             # 线程里，跑 mumble.run() 的那个线程又自己阻塞着不退。
             #
-            # 老飞行员端的做法是让 Mumble 对象活在一个不会退的线程上；这里把
+            # 这里让 Mumble 对象活在一个不会退的线程上；
             # 它挑明：主线程活得和进程一样久，正好就是 pymumble 那句注释的本意。
             # 关闭不受影响——_release() 走 mumble.stop()，它自己会把 reconnect
             # 置空、exit 置真、socket 关掉，不靠 parent_thread 死。
             self.mumble.parent_thread = threading.main_thread()
 
-            # ---- 以下几处照搬 client/radio.py（老飞行员客户端）----
-            # 那一份在同一台服务器、同一个账号上是实测好用的。
+            # ---- 以下几处沿用已验证的连接生命周期 ----
 
             # pymumble 的 init_connection 要到 start() 之后才设 connected，
             # 中间这段空窗里读它会 AttributeError
             self.mumble.connected = 0
-            # ping 从默认 10 秒改成 1 秒。老客户端这么设的；服务器对久不 ping
+            # ping 从默认 10 秒改成 1 秒；服务器对久不 ping
             # 的连接可能有自己的处置，而我们建完频道要等的正是服务器的回话。
             pymumble.mumble.PYMUMBLE_PING_DELAY = 1
             pymumble.mumble.PYMUMBLE_CONNECTION_RETRY_INTERVAL = 2
 
             # **不用 mumble.start()，用我们自己的线程跑 mumble.run()。**
-            # 老飞行员端就是这么做的（client/gui.py 的 run_client）：Mumble 是
+            # 连接线程就是这么做的：Mumble 是
             # threading.Thread 的子类，start() 会另起一条我们看不见也拿不到的
             # 线程，run() 则让主循环跑在我们自己拿着的线程里——它活多久、什么
             # 时候退、退出时抛了什么，都在自己手上。
@@ -1092,7 +1091,7 @@ class Voice:
     def _on_user_removed(self, user, event=None):
         """有人离开了。只关心一种：**我们自己被踢了**。
 
-        pymumble 把这条回调的两种情形分得很清楚（见 client/API.md）：用户自己走
+        pymumble 把这条回调的两种情形分得很清楚：用户自己走
         的话 event 里只有 `session`；被踢或被封才会多出 `actor`、`reason` 和
         `ban`。所以"是不是被踢"是可以判的，而 DISCONNECTED 回调判不了 —— 它不
         带任何理由，被顶下线和网络抖动在那儿长得一模一样，于是客户端一律重连。

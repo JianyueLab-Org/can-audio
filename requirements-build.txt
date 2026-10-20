@@ -27,10 +27,6 @@ pyogg
 # 键盘和鼠标侧键走 pynput 的全局监听，摇杆走 pygame 轮询。
 pynput                          # 键盘 + 鼠标侧键 PTT
 pygame                          # 摇杆 PTT（SDL 的视频/音频驱动会被置成 dummy）
-# 只有 client/ 和 xplane_client/ 这两个不再出包的老客户端还在用它。留着是因为
-# CI 仍然跑它们的测试——那两个共享 FREQ_* 频道约定，坏了得有人知道。
-keyboard
-
 # ---- 模拟器 ----
 # SimConnect.dll 就在这个 wheel 里，msfs/gui.spec 从包目录把它捞出来打进
 # _internal/SimConnect/。少了它程序照常启动，只是永远读不到模拟器。

@@ -13,7 +13,7 @@ import unittest
 
 import version
 
-COMPONENTS = ("client", "xplane_client", "controller", "atis", "xpc", "msfs")
+COMPONENTS = ("controller", "atis", "xpc", "msfs")
 
 
 def repo_root():
