@@ -85,6 +85,9 @@ GENERIC_BY_PREFIX = (
 
 DEFAULT_TYPE = "B738"
 
+# 机型还不知道时先试的窄体，按网上常见程度排
+UNKNOWN_TYPE_FIRST = ("A320", "B738")
+
 
 class Model:
     """CSL 包里的一个模型。"""
@@ -371,6 +374,41 @@ def family_of(icao):
     return ()
 
 
+def airline_from_callsign(callsign):
+    """航司式呼号（三个字母加数字：CCA1111）的前三位，否则空串。
+
+    对方还没回 #SB、或者回了但没带 AIRLINE 时，涂装就靠它：swift、xPilot
+    也都是这么猜的。B-1234 这样的注册号、N123AB 这样的不算。
+    """
+    callsign = (callsign or "").upper()
+    if len(callsign) > 3 and callsign[:3].isalpha() and callsign[:3].isascii() and callsign[3].isdigit():
+        return callsign[:3]
+    return ""
+
+
+# neo / MAX、777-300ER / 200LR 和对应的老型号机身一样长，同族里先拿它们互相顶
+SAME_SIZE = {"A19N": "A319", "A20N": "A320", "A21N": "A321",
+             "B37M": "B737", "B38M": "B738", "B39M": "B739",
+             "B77W": "B773", "B77L": "B772"}
+
+
+def nearest_relatives(icao):
+    """同族里除了自己以外的机型，按机身大小离自己由近到远排。
+
+    同族表是按型号顺序写的（A318 … A321），直接从头找的话 A321 会先拿到
+    A318。大小一样的 neo/ceo 最近，其次是相邻的型号。
+    """
+    icao = (icao or "").upper()
+    family = family_of(icao)
+    if not family:
+        return ()
+    order = {t: i for i, t in enumerate(family)}
+    size = lambda t: order.get(SAME_SIZE.get(t, t), order[t])
+    mine = size(icao)
+    return tuple(sorted((t for t in family if t != icao),
+                        key=lambda t: (abs(size(t) - mine), order[t])))
+
+
 def category_of(icao):
     """机型属于哪一类机身。认不出返回空。"""
     icao = (icao or "").upper()
@@ -433,6 +471,18 @@ class ModelSet:
                 return model
         return None
 
+    def _any_of_airline(self, airline):
+        """这家航司的任意一个模型，按窄体、宽体、支线、通航的顺序；没有返回 None。"""
+        for category in ("窄体", "宽体", "支线", "通航"):
+            for icao in CATEGORIES[category]:
+                found = self._by_icao_airline.get((icao, airline))
+                if found:
+                    return found[0]
+        for (icao, owner), found in self._by_icao_airline.items():
+            if owner == airline and found:
+                return found[0]
+        return None
+
     def match(self, equipment="", airline="", csl=""):
         """挑一个模型。返回 (Model, 匹配层级说明) 或 (None, 原因)。
 
@@ -450,45 +500,67 @@ class ModelSet:
         equipment = (equipment or "").upper()
         airline = (airline or "").upper()
 
-        # 1. 机型 + 航司
-        if equipment and airline:
-            found = self._by_icao_airline.get((equipment, airline))
-            if found:
-                return found[0], "机型和航司都匹配"
+        # 优先级：航司 > 机型 > 机身大小。涂装认的是航司——国航的 A321 没有模型
+        # 时，国航的 A320 / 737 比别家的 A321 更像"那架飞机"；但窄体只拿窄体
+        # 顶、宽体只拿宽体顶，大小不能错。
+        #
+        # 机型还不知道（#SB 还没回来）时按窄体算：网上绝大多数是窄体，而且
+        # 先挑 A320 / B738 这两个最常见的。
+        category = category_of(equipment) if equipment else "窄体"
+        family = nearest_relatives(equipment)
+        in_category = tuple(CATEGORIES.get(category, ()))
+        if not equipment:
+            in_category = UNKNOWN_TYPE_FIRST + tuple(
+                t for t in in_category if t not in UNKNOWN_TYPE_FIRST)
+        in_category = tuple(t for t in in_category if t != equipment and t not in family)
 
-        # 2. 机型，任意涂装
+        if airline:
+            # 1. 机型 + 航司
+            if equipment:
+                found = self._by_icao_airline.get((equipment, airline))
+                if found:
+                    return found[0], "机型和航司都匹配"
+            # 2. 同族 + 航司
+            for relative in family:
+                found = self._by_icao_airline.get((relative, airline))
+                if found:
+                    return found[0], f"用同族 {relative} 顶替，航司正确"
+            # 3. 同类机身 + 航司
+            for candidate in in_category:
+                found = self._by_icao_airline.get((candidate, airline))
+                if found:
+                    return found[0], f"同为{category}，用 {airline} 的 {candidate} 顶替"
+            # 4. 只看航司：这家航司随便哪个机型都比别家的涂装强。机身大小这时
+            #    顾不上了，按窄体、宽体、支线、通航的顺序挑
+            found = self._any_of_airline(airline)
+            if found:
+                return found, f"只有航司对得上，用 {airline} 的 {found.icao}"
+
+        # 5. 机型，任意涂装
         if equipment:
             found = self._by_icao.get(equipment)
             if found:
                 return found[0], "机型匹配，涂装不对"
 
-        # 3. 同族近似机型；优先仍带正确航司的
-        for relative in family_of(equipment):
-            if relative == equipment:
-                continue
-            if airline:
-                found = self._by_icao_airline.get((relative, airline))
-                if found:
-                    return found[0], f"用同族 {relative} 顶替，航司正确"
+        # 6. 同族，任意涂装
+        for relative in family:
             found = self._by_icao.get(relative)
             if found:
                 return found[0], f"用同族 {relative} 顶替"
 
-        # 4. 同类机身。宽体顶宽体、支线顶支线，至少大小对得上。
+        # 7. 同类机身。宽体顶宽体、支线顶支线，至少大小对得上。
         #
         #    **这一级必须排在「通用机型」前面。** GENERIC_BY_PREFIX 是按两位前缀
         #    猜的，而 A3 / B7 这样的前缀同时盖住窄体和宽体：B77W 会被猜成 B738、
         #    A359 会被猜成 A320。把通用那级放前面的话，只要装了 B738 或 A320
         #    （最普及的两个模型），**所有宽体都会退成窄体**，这一级永远轮不到
         #    ——一架 777 在别人屏幕上变成 737，正是它本来要挡的那种情况。
-        category = category_of(equipment)
-        if category:
-            for candidate in CATEGORIES[category]:
-                found = self._by_icao.get(candidate)
-                if found:
-                    return found[0], f"同为{category}，用 {candidate} 顶替"
+        for candidate in in_category:
+            found = self._by_icao.get(candidate)
+            if found:
+                return found[0], f"同为{category}，用 {candidate} 顶替"
 
-        # 5. 同类别通用。走到这里说明机型码不在 CATEGORIES 里（新机型、打错的
+        # 8. 同类别通用。走到这里说明机型码不在 CATEGORIES 里（新机型、打错的
         #    代码），只能按前缀猜。猜出来的通用机型本身也可能没装（比如猜出
         #    A320 但包里只有 A20N），所以这一级同样要走一遍同族。
         generic = generic_for(equipment)
@@ -497,5 +569,5 @@ class ModelSet:
             if found:
                 return found[0], f"退到通用机型 {candidate}"
 
-        # 6. 兜底。看不见的飞机比涂装错的飞机危险得多。
+        # 9. 兜底。看不见的飞机比涂装错的飞机危险得多。
         return self.models[0], "没有近似机型，用了包里的第一个"

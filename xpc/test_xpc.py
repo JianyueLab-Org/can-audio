@@ -3159,6 +3159,79 @@ class ModelMatchingTest(unittest.TestCase):
         self.assertIn("B739", cslmatch.family_of("B738"))
         self.assertEqual(cslmatch.family_of("ZZZZ"), ())
 
+    def test_airline_beats_the_exact_type(self):
+        """国航 A321 没有模型：国航的窄体比别家的 A321 更像那架飞机。"""
+        models = cslmatch.ModelSet([
+            cslmatch.Model("A321_CES", "a321_ces.obj", icao="A321", airline="CES"),
+            cslmatch.Model("B738_CCA", "b738_cca.obj", icao="B738", airline="CCA"),
+        ])
+        model, why = models.match(equipment="A321", airline="CCA")
+        self.assertEqual(model.name, "B738_CCA", why)
+        self.assertIn("窄体", why)
+
+    def test_family_with_airline_comes_before_other_types_with_airline(self):
+        models = cslmatch.ModelSet([
+            cslmatch.Model("B738_CCA", "b738_cca.obj", icao="B738", airline="CCA"),
+            cslmatch.Model("A320_CCA", "a320_cca.obj", icao="A320", airline="CCA"),
+        ])
+        model, why = models.match(equipment="A321", airline="CCA")
+        self.assertEqual(model.name, "A320_CCA", why)
+        self.assertIn("同族", why)
+
+    def test_airline_only_comes_before_type_only(self):
+        """航司对得上的任意机型，排在只有机型对得上的前面——哪怕大小不一样。"""
+        models = cslmatch.ModelSet([
+            cslmatch.Model("B77W_UAE", "b77w_uae.obj", icao="B77W", airline="UAE"),
+            cslmatch.Model("A320_CCA", "a320_cca.obj", icao="A320", airline="CCA"),
+        ])
+        model, why = models.match(equipment="B77W", airline="CCA")
+        self.assertEqual(model.name, "A320_CCA", why)
+        self.assertIn("只有航司", why)
+
+    def test_airline_only_prefers_a_narrowbody(self):
+        models = cslmatch.ModelSet([
+            cslmatch.Model("B789_CCA", "b789_cca.obj", icao="B789", airline="CCA"),
+            cslmatch.Model("A320_CCA", "a320_cca.obj", icao="A320", airline="CCA"),
+        ])
+        model, why = models.match(equipment="C172", airline="CCA")
+        self.assertEqual(model.name, "A320_CCA", why)
+
+    def test_type_only_when_the_airline_has_no_models(self):
+        models = cslmatch.ModelSet([
+            cslmatch.Model("A320_CES", "a320_ces.obj", icao="A320", airline="CES"),
+            cslmatch.Model("B789_GEN", "b789.obj", icao="B789"),
+        ])
+        model, why = models.match(equipment="B77W", airline="CCA")
+        self.assertEqual(model.name, "B789_GEN", why)
+
+    def test_widebody_keeps_the_airline_when_it_can(self):
+        models = cslmatch.ModelSet([
+            cslmatch.Model("B789_GEN", "b789.obj", icao="B789"),
+            cslmatch.Model("A333_CCA", "a333_cca.obj", icao="A333", airline="CCA"),
+        ])
+        model, why = models.match(equipment="B77W", airline="CCA")
+        self.assertEqual(model.name, "A333_CCA", why)
+        self.assertIn("宽体", why)
+
+    def test_unknown_type_takes_the_airlines_a320(self):
+        """#SB 还没回：按窄体算，先挑这家航司的 A320，别随手拿一架别家的 737。"""
+        models = cslmatch.ModelSet([
+            cslmatch.Model("B738_IDS", "b738_ids.obj", icao="B738", airline="IDS"),
+            cslmatch.Model("B738_CCA", "b738_cca.obj", icao="B738", airline="CCA"),
+            cslmatch.Model("A320_CCA", "a320_cca.obj", icao="A320", airline="CCA"),
+        ])
+        model, why = models.match(airline="CCA")
+        self.assertEqual(model.name, "A320_CCA", why)
+
+    def test_airline_from_callsign(self):
+        self.assertEqual(cslmatch.airline_from_callsign("CCA1111"), "CCA")
+        self.assertEqual(cslmatch.airline_from_callsign("ces5123"), "CES")
+        self.assertEqual(cslmatch.airline_from_callsign("CCA"), "")
+        self.assertEqual(cslmatch.airline_from_callsign("B1234"), "")
+        self.assertEqual(cslmatch.airline_from_callsign("N123AB"), "")
+        self.assertEqual(cslmatch.airline_from_callsign("TEST1"), "")
+        self.assertEqual(cslmatch.airline_from_callsign(""), "")
+
 
 class BridgeTest(unittest.TestCase):
     """客户端和插件之间的分片协议。两边各有一份重组器，必须对称。"""
@@ -3416,6 +3489,41 @@ class ObjDataRefRewriteTest(unittest.TestCase):
                                                            newline=""),
                                                       PermissionError("read-only")]):
             self.assertEqual(cslmatch.obj_for_drawing(original), original)
+
+
+class FindCslTest(unittest.TestCase):
+    """没在设置里选 CSL 目录时，到 X-Plane 插件目录里找别的客户端装好的那份。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.plugins = os.path.join(self.tmp, xpinstall.PLUGINS_DIR)
+        os.makedirs(self.plugins)
+
+    def _package(self, *parts):
+        folder = os.path.join(self.plugins, *parts)
+        os.makedirs(folder)
+        with open(os.path.join(folder, "xsb_aircraft.txt"), "w") as f:
+            f.write("EXPORT_NAME A320\n")
+
+    def test_nothing_installed(self):
+        self.assertEqual(xpinstall.find_csl([self.tmp]), "")
+
+    def test_finds_ivao_csl(self):
+        self._package("IVAO_CSL", "CSL", "A320")
+        self.assertEqual(xpinstall.find_csl([self.tmp]),
+                         os.path.join(self.plugins, "IVAO_CSL", "CSL"))
+
+    def test_folder_without_packages_is_skipped(self):
+        os.makedirs(os.path.join(self.plugins, "IVAO_CSL", "CSL", "empty"))
+        self._package("xPilot", "Resources", "CSL", "Bluebell", "A320")
+        self.assertEqual(xpinstall.find_csl([self.tmp]),
+                         os.path.join(self.plugins, "xPilot", "Resources", "CSL"))
+
+    def test_bundled_folder_is_not_offered(self):
+        # 插件自己会加载 XPC_for_CAN/CSL，不该再当成用户的选择发回去
+        self._package("XPC_for_CAN", "CSL", "A320")
+        self.assertEqual(xpinstall.find_csl([self.tmp]), "")
 
 
 class PluginInstallTest(unittest.TestCase):

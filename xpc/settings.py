@@ -26,7 +26,6 @@ import ptt
 log = logging.getLogger("settings")
 
 SETTINGS_FILE = "xpc_settings.json"
-LOCAL_CSL_PATH = r"D:\SteamLibrary\steamapps\common\X-Plane 12\Resources\plugins\IVAO_CSL\CSL"
 
 MUMBLE_HOST = "audio.ceruleanavi.net"
 FSD_HOST = "fsd.ceruleanavi.net"
@@ -120,9 +119,6 @@ class Settings:
         # DEFAULTS 里的 {} 是模块级的同一个对象，直接 setattr 会让所有实例共享它
         self.mic_calibration = {}
         self.load()
-        if not (self.csl_path or "").strip() and os.path.isdir(LOCAL_CSL_PATH):
-            self.csl_path = LOCAL_CSL_PATH
-            log.info("using the local IVAO CSL package at %s", LOCAL_CSL_PATH)
         if self.ptt_bindings is None:
             # 全新安装，连配置文件都还没有：用默认的 PTT 键起一条绑定
             self.ptt_bindings = ptt.load(None, legacy_key=self.ptt_key,
@@ -148,9 +144,6 @@ class Settings:
             log.info("the FSD server was renamed, using %s instead of %s",
                      FSD_HOST, self.fsd_host)
             self.fsd_host = FSD_HOST
-        # This is the local IVAO CSL installation used by this workstation. Keep it
-        # as a best-effort default only when the folder is present; portable builds
-        # and other users continue to use the normal empty setting.
         # mic_volume 是叠在校准基准上的会话内乘数，从不落盘：不读旧配置，
         # 每次启动都是 100%（save() 也会把这个键从要写的字典里去掉）。
         self.mic_volume = 100

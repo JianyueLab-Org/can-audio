@@ -683,10 +683,20 @@ class XpcWindow(QMainWindow):
 
     # ---------- 他机 ----------
     def _load_models(self):
-        """把 CSL 模型包读进来。没配路径就只送 TCAS，不画模型。"""
+        """把 CSL 模型包读进来。
+
+        没在设置里选过目录的话，先到 X-Plane 的插件目录里找别的客户端装好的
+        那份（xpinstall.KNOWN_CSL_DIRS）；找到了就当作用户的设置，设置页里
+        看得到、改得掉。都找不到就只送 TCAS，不画模型。
+        """
         path = (self.settings.csl_path or "").strip()
         if not path:
-            return
+            roots = [self.settings.xplane_path] if self.settings.xplane_path else xpinstall.find_installs()
+            path = xpinstall.find_csl(roots)
+            if not path:
+                return
+            log.info("no CSL folder chosen, using the one found at %s", path)
+            self.settings.csl_path = path
         if not os.path.isdir(path):
             log.warning("the CSL directory does not exist: %s", path)
             return
@@ -750,9 +760,11 @@ class XpcWindow(QMainWindow):
         if not entry.get("model_dirty") and callsign in self._model_cache:
             return self._model_cache[callsign]
 
+        # 对方没报航司就按呼号猜（CCA1111 → CCA）：涂装比机型更像"那架飞机"
+        airline = entry.get("airline", "") or cslmatch.airline_from_callsign(callsign)
         model, why = self.models.match(
             equipment=entry.get("equipment", ""),
-            airline=entry.get("airline", ""),
+            airline=airline,
             csl=entry.get("csl", ""))
         paths = [cslmatch.obj_for_drawing(path) for path in (model.paths if model else [])]
         path = paths[0] if paths else ""
@@ -767,11 +779,10 @@ class XpcWindow(QMainWindow):
                                       equipment=entry.get("equipment", ""),
                                       airline=entry.get("airline", ""))
         if model:
-            # 机型还没问到时先用通用模型顶上，半秒后 #SB 回来会再匹配一次并覆盖
-            # 掉它。两行里只有后一行是结论，前一行降到 DEBUG。
-            level = log.debug if not entry.get("equipment") else log.info
-            level("%s (%s/%s) → %s: %s", callsign,
-                     entry.get("equipment") or "?", entry.get("airline") or "?",
+            # 机型还没问到时先用这个顶上，#SB 回来后会再匹配一次并覆盖。两行都
+            # 留在 INFO：#SB 一直不回的话，前一行就是用户看到的那架飞机
+            log.info("%s (%s/%s) → %s: %s", callsign,
+                     entry.get("equipment") or "机型未知", airline or "?",
                      model.name, why)
         else:
             log.debug("no model available for %s: %s", callsign, why)

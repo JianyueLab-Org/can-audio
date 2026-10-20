@@ -111,6 +111,44 @@ def find_installs():
     return found
 
 
+# 别的联飞客户端放 CSL 的地方，按顺序找。没在设置里选过 CSL 目录的人多半已经
+# 给 xPilot / IVAO 装过一份，直接用那一份，不用再占几个 GB。
+# XPC_for_CAN/CSL 不在里面：插件自己会加载它。
+KNOWN_CSL_DIRS = (
+    os.path.join("IVAO_CSL", "CSL"),
+    os.path.join("xPilot", "Resources", "CSL"),
+    os.path.join("LiveTraffic", "Resources", "CSL"),
+    os.path.join("XSquawkBox", "Resources", "CSL"),
+    "X-CSL",
+)
+
+
+def has_csl_package(path, depth=2):
+    """path 自己或往下 depth 层里有没有 xsb_aircraft.txt（一个 CSL 包）。"""
+    if not path or not os.path.isdir(path):
+        return False
+    try:
+        entries = list(os.scandir(path))
+    except OSError:
+        return False
+    for entry in entries:
+        if entry.is_file() and entry.name.lower() == "xsb_aircraft.txt":
+            return True
+    if depth <= 0:
+        return False
+    return any(entry.is_dir() and has_csl_package(entry.path, depth - 1) for entry in entries)
+
+
+def find_csl(roots):
+    """在这些 X-Plane 目录里找一个现成的 CSL 目录，找不到返回空串。"""
+    for root in roots:
+        for relative in KNOWN_CSL_DIRS:
+            path = os.path.join(root, PLUGINS_DIR, relative)
+            if has_csl_package(path):
+                return path
+    return ""
+
+
 def bundled_package():
     """随包带的那份原生插件目录（里面有 64/win.xpl 和 LegacyData/）。
 
