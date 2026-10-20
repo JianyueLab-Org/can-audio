@@ -61,6 +61,22 @@ namespace XpcNative
             auto u8 = p.generic_u8string();
             return std::string(u8.begin(), u8.end());
         }
+
+        //! Adds to `roots` the folder holding each package found below `dir`
+        //! (a package is a folder with an xsb_aircraft.txt). Packages are not
+        //! descended into.
+        void findPackageRoots(const fs::path &dir, int depth, std::set<std::string> &roots)
+        {
+            if (depth <= 0) { return; }
+            std::error_code ec;
+            for (fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec), end; !ec && it != end;
+                 it.increment(ec))
+            {
+                if (!it->is_directory(ec)) { continue; }
+                if (fs::is_regular_file(it->path() / "xsb_aircraft.txt", ec)) { roots.insert(pathString(dir)); }
+                else { findPackageRoots(it->path(), depth - 1, roots); }
+            }
+        }
     } // namespace
 
     CTraffic::Plane::Plane(void *id_, const std::string &callsign_, const std::string &aircraftIcao_,
@@ -177,23 +193,16 @@ namespace XpcNative
         // as packages. The client's CSL setting may point at the package
         // itself or at any parent of several, so collect every folder that
         // holds an xsb_aircraft.txt and hand xplanemp2 their parents.
+        //
+        // Only folders are listed and only xsb_aircraft.txt is looked up by
+        // name: a package folder is never descended into, because that is
+        // where the thousands of textures and .obj files are (walking all of
+        // X-CSL stalled X-Plane noticeably).
         std::set<std::string> roots;
         std::error_code ec;
         const fs::path base = utf8Path(path);
         if (fs::is_regular_file(base / "xsb_aircraft.txt", ec)) { roots.insert(pathString(base.parent_path())); }
-        if (fs::is_directory(base, ec))
-        {
-            for (fs::recursive_directory_iterator it(base, fs::directory_options::skip_permission_denied, ec), end;
-                 it != end; it.increment(ec))
-            {
-                if (ec) { break; }
-                if (it.depth() > 4) { it.disable_recursion_pending(); }
-                if (it->is_regular_file(ec) && upper(pathString(it->path().filename())) == "XSB_AIRCRAFT.TXT")
-                {
-                    roots.insert(pathString(it->path().parent_path().parent_path()));
-                }
-            }
-        }
+        else { findPackageRoots(base, 4, roots); }
 
         for (const auto &root : roots)
         {

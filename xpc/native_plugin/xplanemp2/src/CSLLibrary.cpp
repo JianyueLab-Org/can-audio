@@ -304,6 +304,22 @@ MakeTexturedObj(const std::string &objPath, std::string texture, std::string lit
 	return derived;
 }
 
+// convert an absolute path back to a relative one
+// XPC for CAN: only when it really is below the X-Plane folder. The upstream
+// code cut sys_len characters off unconditionally, which mangled every path of
+// a CSL library kept outside X-Plane (D:\CSL\X-CSL ...).
+// XPLMLoadObjectAsync takes absolute paths as well.
+static std::string
+RelativeToXPlane(std::string absolutePath)
+{
+	char xsystem[1024];
+	XPLMGetSystemPath(xsystem);
+	if (SameDirPrefix(absolutePath, xsystem)) {
+		absolutePath.erase(absolutePath.begin(), absolutePath.begin() + strlen(xsystem));
+	}
+	return absolutePath;
+}
+
 static bool
 ParseObj8Command(
 	const std::vector<std::string> &tokens, CSLPackage_t &package, const string &path, int lineNum, const string &line)
@@ -355,22 +371,20 @@ ParseObj8Command(
 	// X-CSL (and other packages made for XSB/XPMP2) express liveries - one
 	// .obj, a different texture per airline. Upstream xplanemp2 only takes
 	// three arguments, so every livery drew with the obj's own texture.
+	//
+	// The copy with the texture swapped is written when the model is first
+	// drawn, not here: doing it while parsing read every .obj of the library
+	// (X-CSL: thousands of liveries, ~450 KB each) on X-Plane's main thread.
+	std::shared_ptr<Obj8Attachment> att;
 	if (tokens.size() >= 5) {
-		absolutePath = MakeTexturedObj(absolutePath, tokens[4], tokens.size() >= 6 ? tokens[5] : string());
+		const string texture = tokens[4];
+		const string lit = tokens.size() >= 6 ? tokens[5] : string();
+		att = Obj8Attachment::getAttachmentPrepared(
+			absolutePath + "|" + texture + "|" + lit,
+			[absolutePath, texture, lit]() { return RelativeToXPlane(MakeTexturedObj(absolutePath, texture, lit)); });
+	} else {
+		att = Obj8Attachment::getAttachmentForFile(RelativeToXPlane(absolutePath));
 	}
-
-	// convert the absolute path back to a relative one
-	// XPC for CAN: only when it really is below the X-Plane folder. The
-	// upstream code cut sys_len characters off unconditionally, which mangled
-	// every path of a CSL library kept outside X-Plane (D:\\CSL\\X-CSL ...).
-	// XPLMLoadObjectAsync takes absolute paths as well.
-	char xsystem[1024];
-	XPLMGetSystemPath(xsystem);
-	if (SameDirPrefix(absolutePath, xsystem)) {
-		absolutePath.erase(absolutePath.begin(), absolutePath.begin() + strlen(xsystem));
-	}
-
-	auto att = Obj8Attachment::getAttachmentForFile(absolutePath);
 	myCSL->addAttachment(dt, std::move(att));
 
 	return true;

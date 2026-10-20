@@ -49,7 +49,7 @@ Obj8Attachment::loadCallback(XPLMObjectRef inObject, void *inRefcon)
         Obj8Attachment *nextAtt = loadQueue.front();
         loadQueue.pop();
         if (nextAtt) {
-            XPLMLoadObjectAsync(nextAtt->mFile.c_str(), &Obj8Attachment::loadCallback, reinterpret_cast<void *>(nextAtt));
+            nextAtt->startLoad();
         }
     }
 }
@@ -69,6 +69,22 @@ Obj8Attachment::getAttachmentForFile(const std::string &filename)
     return sp;
 }
 
+std::shared_ptr<Obj8Attachment>
+Obj8Attachment::getAttachmentPrepared(const std::string &key, std::function<std::string()> prepare)
+{
+    auto wpIter = sAttachmentCache.find(key);
+    if (wpIter != sAttachmentCache.end()) {
+        auto sp = wpIter->second.lock();
+        if (sp) {
+            return sp;
+        }
+    }
+    auto sp = std::shared_ptr<Obj8Attachment>(new Obj8Attachment(key));
+    sp->mPrepare = std::move(prepare);
+    sAttachmentCache[key] = sp;
+    return sp;
+}
+
 void
 Obj8Attachment::enqueueLoad() {
     if (mLoadState != Obj8LoadState::None) {
@@ -79,11 +95,21 @@ Obj8Attachment::enqueueLoad() {
     }
     mLoadState = Obj8LoadState::Loading;
     if (loadQueue.empty()) {
-        XPLMLoadObjectAsync(mFile.c_str(), &Obj8Attachment::loadCallback, reinterpret_cast<void *>(this));
+        startLoad();
     } else {
         loadQueue.push(this);
     }
 };
+
+void
+Obj8Attachment::startLoad() {
+    if (mPrepare) {
+        // XPC for CAN: write the livery copy now that the model is in use
+        mFile = mPrepare();
+        mPrepare = nullptr;
+    }
+    XPLMLoadObjectAsync(mFile.c_str(), &Obj8Attachment::loadCallback, reinterpret_cast<void *>(this));
+}
 
 
 Obj8Attachment::~Obj8Attachment()

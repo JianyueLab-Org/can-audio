@@ -30,6 +30,7 @@
 #include <queue>
 #include <memory>
 #include <unordered_map>
+#include <functional>
 
 #include <XPLMScenery.h>
 
@@ -47,10 +48,22 @@ public:
      */
     static std::shared_ptr<Obj8Attachment> getAttachmentForFile(const std::string &filename);
 
+    /** XPC for CAN: like getAttachmentForFile, but the file to load is only
+     * worked out when the attachment is first needed. `prepare` runs once,
+     * right before the load, and returns the path to load. X-CSL liveries
+     * use this so the per-texture .obj copy is written for the models that
+     * are actually drawn, not for every livery while the packages load.
+     *
+     * @param key unique name for the cache (the copy does not exist yet)
+     */
+    static std::shared_ptr<Obj8Attachment> getAttachmentPrepared(const std::string &key,
+                                                                 std::function<std::string()> prepare);
+
 	Obj8Attachment(const Obj8Attachment &copySrc) = delete;
 
 	Obj8Attachment(Obj8Attachment &&moveSrc) noexcept:
             mFile(std::move(moveSrc.mFile)),
+            mPrepare(std::move(moveSrc.mPrepare)),
             mHandle(moveSrc.mHandle),
             mLoadState(moveSrc.mLoadState)
     {
@@ -82,6 +95,7 @@ public:
 
 protected:
 	std::string			mFile;
+	std::function<std::string()> mPrepare;	// XPC for CAN: see getAttachmentPrepared
 	XPLMObjectRef		mHandle;
 	Obj8LoadState		mLoadState;
 
@@ -98,8 +112,10 @@ private:
     static void	loadCallback(XPLMObjectRef inObject, void *inRefcon);
     static std::queue<Obj8Attachment *>	loadQueue;
     void enqueueLoad();
+    void startLoad();
     void reset() {
         mFile = {};
+        mPrepare = nullptr;
         mHandle = nullptr;
         mLoadState = Obj8LoadState::None;
     }
