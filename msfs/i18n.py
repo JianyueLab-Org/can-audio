@@ -39,6 +39,16 @@ DEFAULT = "zh"
 LANGUAGES = {"zh": "中文", "en": "English"}
 
 TEXT = {
+    "server.audio": {"zh": "语音服务器（Mumble）", "en": "Voice server (Mumble)"},
+    "server.fsd": {"zh": "FSD 服务器", "en": "FSD server"},
+    "server.custom": {"zh": "自定义", "en": "Custom"},
+    "server.refresh": {"zh": "刷新列表", "en": "Refresh"},
+    "server.host": {"zh": "服务器地址", "en": "Server address"},
+    "server.locked": {"zh": "请先断开连接，再切换服务器。", "en": "Disconnect before switching servers."},
+    "server.loading": {"zh": "正在获取服务器列表…", "en": "Loading server list…"},
+    "server.failed": {"zh": "获取失败，可继续使用当前地址或自定义服务器。", "en": "Could not load the list. Use the current address or a custom server."},
+    "server.empty": {"zh": "暂无可用服务器，可手动填写地址。", "en": "No servers available. Enter a custom address."},
+    "server.ready": {"zh": "选择服务器，或手动填写自定义地址和端口。", "en": "Choose a server or enter a custom address and port."},
     # ---------- 通用 ----------
     "app.title":            {"zh": "MSFS for CAN", "en": "MSFS for CAN"},
     "app.name":             {"zh": "MSFS for CAN", "en": "MSFS for CAN"},

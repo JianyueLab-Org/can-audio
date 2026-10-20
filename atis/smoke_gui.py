@@ -55,6 +55,9 @@ QMessageBox.question = staticmethod(_question)
 import update
 update.check = lambda *args, **kwargs: None
 
+import serverdirectory
+serverdirectory.fetch = lambda *args, **kwargs: {"audio": [], "fsd": []}
+
 import gui
 import weather
 from profile import Station
@@ -491,8 +494,8 @@ def main():
         original_host = window.settings.mumble_host
         station = window.current_station()
         try:
-            assert settings_dialog.mumble_host_input.text() == original_host
-            settings_dialog.mumble_host_input.setText("  voice.example.net  ")
+            assert settings_dialog.audio_picker.host_edit.text() == original_host
+            settings_dialog.audio_picker.host_edit.setText("  voice.example.net  ")
             settings_dialog.save_and_close()
             assert window.settings.mumble_host == "voice.example.net"
             assert settings_module.Settings().mumble_host == "voice.example.net"
@@ -510,7 +513,7 @@ def main():
     def cancelling_keeps_the_voice_host():
         original_host = window.settings.mumble_host
         dialog = gui.SettingsDialog(window.settings, window)
-        dialog.mumble_host_input.setText("cancelled.example.net")
+        dialog.audio_picker.host_edit.setText("cancelled.example.net")
         dialog.reject()
         assert window.settings.mumble_host == original_host
     check("取消设置不改变语音地址", cancelling_keeps_the_voice_host)
@@ -518,11 +521,166 @@ def main():
     def blank_voice_host_restores_the_default():
         import settings as settings_module
         dialog = gui.SettingsDialog(window.settings, window)
-        dialog.mumble_host_input.setText("   ")
+        dialog.audio_picker.host_edit.setText("   ")
         dialog.save_and_close()
         assert window.settings.mumble_host == settings_module.DEFAULT_MUMBLE_HOST
         assert settings_module.Settings().mumble_host == settings_module.DEFAULT_MUMBLE_HOST
     check("语音地址留空恢复默认", blank_voice_host_restores_the_default)
+
+    def selected_server_endpoints_are_saved():
+        assert hasattr(settings_dialog, "audio_picker"), "audio server picker missing"
+        assert hasattr(settings_dialog, "fsd_picker"), "FSD server picker missing"
+        settings_dialog.audio_picker.host_edit.setText("voice.example")
+        settings_dialog.audio_picker.port_edit.setValue(16473)
+        settings_dialog.fsd_picker.host_edit.setText("fsd.example")
+        settings_dialog.fsd_picker.port_edit.setValue(16809)
+        settings_dialog.save_and_close()
+        assert (window.settings.mumble_host, window.settings.mumble_port) == \
+            ("voice.example", 16473)
+        assert (window.settings.fsd_host, window.settings.fsd_port) == \
+            ("fsd.example", 16809)
+    check("server selections persist", selected_server_endpoints_are_saved)
+
+    def either_active_connection_locks_server_selection():
+        states = (({}, {}), ({"ZSPD_ATIS": object()}, {}),
+                  ({}, {"ZSPD_ATIS": object()}))
+        original_broadcasters, original_fsd = window.broadcasters, window.fsd_clients
+        try:
+            for broadcasters, fsd_clients in states:
+                window.broadcasters, window.fsd_clients = broadcasters, fsd_clients
+
+                def inspect(dialog):
+                    locked = bool(broadcasters or fsd_clients)
+                    for picker in (dialog.audio_picker, dialog.fsd_picker):
+                        for control in (picker.host_edit, picker.port_edit,
+                                        picker.server_combo):
+                            assert control.isEnabled() is not locked
+                        if locked:
+                            assert not picker.refresh_button.isEnabled()
+                    return QDialog.DialogCode.Rejected
+
+                from PyQt6.QtWidgets import QDialog
+                with mock.patch.object(gui.SettingsDialog, "exec", inspect):
+                    window.open_settings()
+        finally:
+            window.broadcasters, window.fsd_clients = original_broadcasters, original_fsd
+    check("active connections lock server choices", either_active_connection_locks_server_selection)
+
+    def broadcasts_use_selected_audio_endpoint():
+        class Broadcaster:
+            def __init__(self, host, cid, password, station, port=64738, **kwargs):
+                self.endpoint = (host, port)
+
+            def start(self, text):
+                self.text = text
+
+            def stop(self):
+                pass
+
+        connect_fsd = window.settings.connect_fsd
+        window.settings.connect_fsd = False
+        station = window.profile.get("ZSPD_ATIS")
+        try:
+            with mock.patch.object(gui, "Broadcaster", Broadcaster):
+                window.start_broadcast(station, "1000", "pw")
+            assert window.broadcasters[station.callsign].endpoint == \
+                ("voice.example", 16473)
+        finally:
+            window.stop_broadcast(station.callsign)
+            window.settings.connect_fsd = connect_fsd
+    check("broadcast uses selected audio server", broadcasts_use_selected_audio_endpoint)
+
+    def a_connection_started_inside_settings_locks_and_preserves_endpoints(fsd_only):
+        from PyQt6.QtCore import QTimer
+
+        class Connection:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self, *args):
+                pass
+
+            def stop(self):
+                pass
+
+        keys = ("mumble_host", "mumble_port", "fsd_host", "fsd_port")
+        original = tuple(getattr(window.settings, key) for key in keys)
+        original_connect_fsd = window.settings.connect_fsd
+        window.settings.connect_fsd = fsd_only
+        original_exec = gui.SettingsDialog.exec
+        errors = []
+
+        def nested_exec(dialog):
+            dialog.audio_picker.host_edit.setText("pending-voice.example")
+            dialog.audio_picker.port_edit.setValue(16474)
+            dialog.fsd_picker.host_edit.setText("pending-fsd.example")
+            dialog.fsd_picker.port_edit.setValue(16810)
+
+            def finish_precheck():
+                try:
+                    try:
+                        window.start_broadcast(window.profile.get("ZSPD_ATIS"),
+                                               "1000", "pw")
+                    except RuntimeError as error:
+                        assert fsd_only and str(error) == "voice unavailable"
+                    assert bool(window.fsd_clients) is fsd_only
+                    assert bool(window.broadcasters) is not fsd_only
+                    controls_locked = all(
+                        not control.isEnabled()
+                        for picker in (dialog.audio_picker, dialog.fsd_picker)
+                        for control in (picker.host_edit, picker.port_edit,
+                                        picker.server_combo, picker.refresh_button))
+                    dialog.save_and_close()
+                    preserved = tuple(getattr(window.settings, key) for key in keys)
+                    assert controls_locked and preserved == original, \
+                        f"controls locked={controls_locked}, saved={preserved}"
+                except Exception as error:
+                    errors.append(error)
+                finally:
+                    dialog.reject()
+
+            QTimer.singleShot(0, finish_precheck)
+            return original_exec(dialog)
+
+        try:
+            def unavailable_voice(*args, **kwargs):
+                raise RuntimeError("voice unavailable")
+
+            with mock.patch.object(gui.SettingsDialog, "exec", nested_exec), \
+                    mock.patch.object(gui.fsdclient, "FSDClient", Connection), \
+                    mock.patch.object(gui, "Broadcaster",
+                                      unavailable_voice if fsd_only else Connection):
+                window.open_settings()
+            assert not errors, errors
+        finally:
+            window.stop_broadcast("ZSPD_ATIS")
+            window.settings.connect_fsd = original_connect_fsd
+            for key, value in zip(keys, original):
+                setattr(window.settings, key, value)
+
+    check("late voice connection locks settings and preserves endpoints",
+          lambda: a_connection_started_inside_settings_locks_and_preserves_endpoints(False))
+    check("late FSD-only connection locks settings and preserves endpoints",
+          lambda: a_connection_started_inside_settings_locks_and_preserves_endpoints(True))
+
+    def saving_rechecks_live_connections():
+        original = (window.settings.mumble_host, window.settings.mumble_port,
+                    window.settings.fsd_host, window.settings.fsd_port)
+        dialog = gui.SettingsDialog(window.settings, window)
+        dialog.audio_picker.host_edit.setText("pending-voice.example")
+        dialog.audio_picker.port_edit.setValue(16474)
+        dialog.fsd_picker.host_edit.setText("pending-fsd.example")
+        dialog.fsd_picker.port_edit.setValue(16810)
+        window.fsd_clients["pending"] = object()
+        try:
+            dialog.save_and_close()
+            assert (window.settings.mumble_host, window.settings.mumble_port,
+                    window.settings.fsd_host, window.settings.fsd_port) == original
+        finally:
+            window.fsd_clients.pop("pending")
+            (window.settings.mumble_host, window.settings.mumble_port,
+             window.settings.fsd_host, window.settings.fsd_port) = original
+    check("saving rechecks live connections", saving_rechecks_live_connections)
 
     print("导入 vATIS 配置：")
 

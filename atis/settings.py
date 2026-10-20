@@ -14,12 +14,14 @@ import netconfig
 import theme
 import weather
 from i18n import t
+from serverpicker import ServerPicker
 
 log = logging.getLogger("settings")
 
 DEFAULT_MUMBLE_HOST = "audio.ceruleanavi.net"
 DEFAULT_FSD_HOST = "fsd.ceruleanavi.net"
 DEFAULT_FSD_PORT = 6809
+DEFAULT_MUMBLE_PORT = 64738
 
 # 早期版本把 FSD 主机错填成了语音服务器的地址。那台机器上没有 FSD，
 # 留着只会一直连不上，所以读配置时直接换掉。语音服务器历来的三个域名都要认：
@@ -64,6 +66,7 @@ class Settings:
         # 和语音服务器（audio.ceruleanavi.net:64738）不是同一台。
         self.fsd_host = DEFAULT_FSD_HOST
         self.fsd_port = DEFAULT_FSD_PORT
+        self.mumble_port = DEFAULT_MUMBLE_PORT
         self.real_name = ""
         self.connect_fsd = True
         # FSD 登录用的等级。0 表示自动：登录前从数据源查本人此刻的等级，
@@ -104,6 +107,7 @@ class Settings:
                 self.cid = data.get("cid", "")
                 self.metar_url = data.get("metar_url") or weather.DEFAULT_METAR_URL
                 self.mumble_host = (data.get("mumble_host") or "").strip() or DEFAULT_MUMBLE_HOST
+                self.mumble_port = data.get("mumble_port", DEFAULT_MUMBLE_PORT)
                 self.fsd_host = data.get("fsd_host") or DEFAULT_FSD_HOST
                 if (self.fsd_host or "").strip().lower() in WRONG_FSD_HOSTS:
                     log.warning("the FSD host %s in the settings is the voice server, "
@@ -151,6 +155,7 @@ class Settings:
                     "cid": self.cid,
                     "metar_url": self.metar_url,
                     "mumble_host": self.mumble_host,
+                    "mumble_port": self.mumble_port,
                     "fsd_host": self.fsd_host,
                     "fsd_port": self.fsd_port,
                     "real_name": self.real_name,
@@ -182,7 +187,7 @@ def _find_data(combo, value):
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, settings, parent=None):
+    def __init__(self, settings, parent=None, locked=False):
         super().__init__(parent)
         self.settings = settings
         self.setWindowTitle(t("settings.title"))
@@ -190,35 +195,27 @@ class SettingsDialog(QDialog):
         self.setStyleSheet(theme.dialog_qss())
         self.setMinimumWidth(460)
         self.setup_ui()
+        self.set_servers_locked(locked)
+
+    def set_servers_locked(self, locked):
+        self._servers_locked = bool(locked)
+        self.audio_picker.set_locked(self._servers_locked)
+        self.fsd_picker.set_locked(self._servers_locked)
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
-
-        voice_row = QHBoxLayout()
-        self.mumble_host_input = LineEdit()
-        self.mumble_host_input.setText(self.settings.mumble_host)
-        self.mumble_host_input.setPlaceholderText(DEFAULT_MUMBLE_HOST)
-        self.mumble_host_input.setToolTip(t("settings.mumble_host_tip"))
-        voice_row.addWidget(BodyLabel(t("settings.mumble_host")))
-        voice_row.addWidget(self.mumble_host_input)
-        layout.addLayout(voice_row)
 
         self.connect_fsd = CheckBox(t("settings.connect_fsd")
                                     + t("settings.connect_fsd_note"))
         self.connect_fsd.setChecked(self.settings.connect_fsd)
         layout.addWidget(self.connect_fsd)
 
-        fsd_row = QHBoxLayout()
-        self.fsd_host_input = LineEdit()
-        self.fsd_host_input.setText(self.settings.fsd_host)
-        self.fsd_port_input = LineEdit()
-        self.fsd_port_input.setText(str(self.settings.fsd_port))
-        self.fsd_port_input.setFixedWidth(70)
-        fsd_row.addWidget(BodyLabel(t("settings.fsd_host")))
-        fsd_row.addWidget(self.fsd_host_input)
-        fsd_row.addWidget(BodyLabel(t("settings.fsd_port")))
-        fsd_row.addWidget(self.fsd_port_input)
-        layout.addLayout(fsd_row)
+        self.audio_picker = ServerPicker(
+            "audio", self.settings.mumble_host, self.settings.mumble_port, self)
+        self.fsd_picker = ServerPicker(
+            "fsd", self.settings.fsd_host, self.settings.fsd_port, self)
+        layout.addWidget(self.audio_picker)
+        layout.addWidget(self.fsd_picker)
 
         refresh_row = QHBoxLayout()
         self.refresh_input = ComboBox()
@@ -308,18 +305,19 @@ class SettingsDialog(QDialog):
         layout.addLayout(buttons)
 
     def save_and_close(self):
-        self.settings.mumble_host = (self.mumble_host_input.text().strip()
-                                     or DEFAULT_MUMBLE_HOST)
         self.settings.metar_url = (self.metar_input.text().strip()
                                    or weather.DEFAULT_METAR_URL)
         self.settings.metar_refresh = clamp_refresh(
             self.refresh_input.currentData())
         self.settings.connect_fsd = self.connect_fsd.isChecked()
-        self.settings.fsd_host = self.fsd_host_input.text().strip() or DEFAULT_FSD_HOST
-        try:
-            self.settings.fsd_port = int(self.fsd_port_input.text().strip())
-        except ValueError:
-            self.settings.fsd_port = DEFAULT_FSD_PORT
+        parent = self.parent()
+        active = (getattr(parent, "broadcasters", None)
+                  or getattr(parent, "fsd_clients", None))
+        if not (self._servers_locked or active):
+            self.settings.mumble_host = self.audio_picker.host() or DEFAULT_MUMBLE_HOST
+            self.settings.mumble_port = self.audio_picker.port()
+            self.settings.fsd_host = self.fsd_picker.host() or DEFAULT_FSD_HOST
+            self.settings.fsd_port = self.fsd_picker.port()
         self.settings.real_name = self.real_name_input.text().strip()
         self.settings.rating = self.rating_input.currentData()
         self.settings.debug = self.debug_checkbox.isChecked()
