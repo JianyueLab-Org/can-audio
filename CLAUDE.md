@@ -485,6 +485,8 @@ FSD, model matching and sample bookkeeping live client-side. Changing the plugin
 
 **Model matching must always return something.** `ModelSet.match()` degrades type+airline → type → same family → generic-by-category → first model in the package, and returns the reason so a "that aircraft looks wrong" report is diagnosable from the log. An aircraft you cannot see is far more dangerous than one with the wrong livery.
 
+`cslmatch.py` indexes every package's `EXPORT_NAME` aliases before resolving OBJ paths. Aliases resolve to the exporting manifest's directory, including cross-package references. Models with missing OBJ files are excluded. The plugin retries failed object loads after 5 seconds and keeps pending requests separate from loaded instances.
+
 **The plugin installs itself from the settings dialog** (`xpinstall.py`, XPC only — MSFS needs no plugin at all). X-Plane's install directory cannot come from the UDP link: the BECN beacon carries an address and a port, nothing else. So `find_installs()` reads the record X-Plane's own installer writes (`x-plane_install_12.txt`, one directory per line; `%LOCALAPPDATA%` on Windows, `~/Library/Preferences/` on macOS, `~/.x-plane/` on Linux), and the traffic tab always keeps a **choose-the-folder** button as well — those paths are best-effort, and anyone running a portable copy or who moved the install has no such record. A folder counts as X-Plane if it has `Resources/plugins`; deliberately not `PythonPlugins`, which does not exist until XPPython3 has run once, so testing for it would reject exactly the installs that most need the plugin.
 
 Three deliberate limits:

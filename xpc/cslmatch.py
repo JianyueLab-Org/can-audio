@@ -107,6 +107,25 @@ class Model:
         return f"<Model {self.name} {self.icao}/{self.airline or '-'}>"
 
 
+def _manifest_lines(directory):
+    manifest = os.path.join(directory, "xsb_aircraft.txt")
+    if not os.path.isfile(manifest):
+        return []
+    try:
+        with open(manifest, "r", encoding="utf-8", errors="replace") as f:
+            return f.readlines()
+    except OSError as e:
+        log.warning("cannot read %s: %s", manifest, e)
+        return []
+
+
+def _export_names(lines):
+    for raw in lines:
+        parts = raw.split("#", 1)[0].strip().split(maxsplit=1)
+        if len(parts) == 2 and parts[0].upper() == "EXPORT_NAME":
+            yield parts[1]
+
+
 def parse_package(directory):
     """读一个 CSL 包的 xsb_aircraft.txt，返回 Model 列表。
 
@@ -114,19 +133,16 @@ def parse_package(directory):
     是 `\\`，OBJ8 行的字段数不固定，注释用 `#`。宽松地读，认不出的行跳过就好
     ——一个包里一行有问题不该让整包用不了。
     """
-    manifest = os.path.join(directory, "xsb_aircraft.txt")
-    if not os.path.isfile(manifest):
-        return []
+    return _parse_package(directory, _manifest_lines(directory), {})
 
+
+def _parse_package(directory, lines, package_dirs):
+    package_dirs = dict(package_dirs)
+    for name in _export_names(lines):
+        package_dirs.setdefault(name, directory)
     models = []
     package = ""
     current = None
-    try:
-        with open(manifest, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except OSError as e:
-        log.warning("cannot read %s: %s", manifest, e)
-        return []
 
     for raw in lines:
         line = raw.split("#", 1)[0].strip()
@@ -136,15 +152,18 @@ def parse_package(directory):
         keyword = parts[0].upper()
 
         if keyword == "EXPORT_NAME" and len(parts) > 1:
-            package = parts[1]
+            package = line.split(maxsplit=1)[1]
         elif keyword in ("OBJ8_AIRCRAFT", "AIRCRAFT") and len(parts) > 1:
             current = Model(parts[1], "", package=package)
             models.append(current)
         elif keyword == "OBJ8" and current is not None and len(parts) >= 4:
             # OBJ8 <类型> <是否有动画> <路径>；只要 SOLID 的那条
             if parts[1].upper() == "SOLID" and not current.path:
-                relative = " ".join(parts[3:]).replace("\\", "/")
-                current.path = os.path.normpath(os.path.join(directory, relative))
+                relative = line.split(maxsplit=3)[3].replace("\\", "/")
+                name, separator, remainder = relative.partition("/")
+                base = package_dirs.get(name) if separator else None
+                current.path = os.path.normpath(os.path.join(
+                    base or directory, remainder if base else relative))
         elif keyword == "VERT_OFFSET" and current is not None and len(parts) > 1:
             current.vert_offset = _float_or_none(parts[1])
         elif keyword == "OFFSET" and current is not None and len(parts) > 3:
@@ -160,8 +179,16 @@ def parse_package(directory):
             current.airline = current.airline or parts[2].upper()
             current.livery = parts[3].upper()
 
-    usable = [m for m in models if m.path and m.icao]
-    log.info("%s: %d usable models (%d total, %d missing a path or type code)",
+    usable = []
+    for model in models:
+        if not model.path or not model.icao:
+            continue
+        if not os.path.isfile(model.path):
+            log.warning("CSL model %s has no existing OBJ file: %s",
+                        model.name, model.path)
+            continue
+        usable.append(model)
+    log.info("%s: %d usable models (%d total, %d unusable)",
              os.path.basename(directory), len(usable), len(models),
              len(models) - len(usable))
     return usable
@@ -398,9 +425,15 @@ class ModelSet:
     @classmethod
     def load(cls, root):
         """把一个目录下所有 CSL 包读进来。"""
+        manifests = [(directory, _manifest_lines(directory))
+                     for directory in find_packages(root)]
+        package_dirs = {}
+        for directory, lines in manifests:
+            for name in _export_names(lines):
+                package_dirs.setdefault(name, directory)
         models = []
-        for package in find_packages(root):
-            models.extend(parse_package(package))
+        for directory, lines in manifests:
+            models.extend(_parse_package(directory, lines, package_dirs))
         log.info("loaded %d models from %s", len(models), root)
         return cls(models)
 

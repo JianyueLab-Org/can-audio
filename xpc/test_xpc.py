@@ -2938,6 +2938,9 @@ class CslParsingTest(unittest.TestCase):
         return self.directory
 
     def test_reads_a_simple_package(self):
+        os.makedirs(os.path.join(self.directory, "A320"))
+        with open(os.path.join(self.directory, "A320", "A320_CCA.obj"), "w") as f:
+            f.write("I\n800\nOBJ\n")
         models = cslmatch.parse_package(self._write(
             "EXPORT_NAME BB_Airbus\n"
             "OBJ8_AIRCRAFT A320_CCA\n"
@@ -2950,17 +2953,24 @@ class CslParsingTest(unittest.TestCase):
         self.assertEqual(models[0].package, "BB_Airbus")
 
     def test_backslash_paths(self):
+        os.makedirs(os.path.join(self.directory, "A320"))
+        with open(os.path.join(self.directory, "A320", "A320.obj"), "w") as f:
+            f.write("I\n800\nOBJ\n")
         models = cslmatch.parse_package(self._write(
             "OBJ8_AIRCRAFT X\nOBJ8 SOLID YES A320\\A320.obj\nICAO A320\n"))
         self.assertTrue(models[0].path.endswith("A320.obj"))
 
     def test_comments_are_skipped(self):
+        with open(os.path.join(self.directory, "a.obj"), "w") as f:
+            f.write("I\n800\nOBJ\n")
         models = cslmatch.parse_package(self._write(
             "# 注释\nOBJ8_AIRCRAFT X   # 行尾注释\n"
             "OBJ8 SOLID YES a.obj\nICAO B738\n"))
         self.assertEqual(models[0].icao, "B738")
 
     def test_entries_without_a_path_are_dropped(self):
+        with open(os.path.join(self.directory, "a.obj"), "w") as f:
+            f.write("I\n800\nOBJ\n")
         models = cslmatch.parse_package(self._write(
             "OBJ8_AIRCRAFT Broken\nICAO B738\n"
             "OBJ8_AIRCRAFT Good\nOBJ8 SOLID YES a.obj\nICAO A320\n"))
@@ -5317,6 +5327,8 @@ class VertOffsetTest(unittest.TestCase):
         return path
 
     def test_vert_offset_line(self):
+        self.write("a.obj", "I\n800\nOBJ\n")
+        self.write("b.obj", "I\n800\nOBJ\n")
         self.write("xsb_aircraft.txt",
                    "OBJ8_AIRCRAFT A\nOBJ8 SOLID YES a.obj\nICAO A320\nVERT_OFFSET 2.5\n"
                    "OBJ8_AIRCRAFT B\nOBJ8 SOLID YES b.obj\nICAO B738\n"

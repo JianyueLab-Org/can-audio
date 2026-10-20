@@ -60,6 +60,7 @@ PLUGIN_PORT = 49900
 # 积分好的位置。v2：分片按字节切、负载 base64。和 bridge.py 保持一致（有测试
 # 钉着）。
 PROTOCOL_VERSION = 3
+MODEL_RETRY_INTERVAL = 5.0
 
 # TCAS 目标数组是 64 个位置（sim/cockpit2/tcas/targets/*，float[64]）。
 # 第 0 位是本机，所以他机最多 63 架。
@@ -625,6 +626,7 @@ class RenderedAircraft(NetworkAircraft):
         self.object_ref = None
         self.instance = None
         self.loading = False
+        self.model_retry_at = 0.0
         # 每发起一次异步加载加一。回调带着发起时的号回来，对不上就说明这次
         # 加载已经被更新的一次顶掉了——直接卸掉，别覆盖 instance（否则旧
         # instance 没人销毁，一架冻住的重影永远挂在天上）。
@@ -877,14 +879,30 @@ class PythonInterface:
         self.order = order
 
     def _ensure_model(self, aircraft, wanted):
-        if wanted and wanted != aircraft.object_path:
-            # 客户端换了匹配结果（多半是机型问到了），换模型
-            aircraft.destroy()
-            aircraft.object_path = wanted
-            aircraft.loading = True
-            aircraft.load_generation += 1
+        if not wanted:
+            return
+        changed = wanted != aircraft.object_path
+        if not changed and (aircraft.loading or aircraft.instance is not None
+                            or xp.getElapsedTime() < aircraft.model_retry_at):
+            return
+        # 换模型或重试失败的加载；等待中的请求不重复发送。
+        aircraft.destroy()
+        aircraft.object_path = wanted
+        aircraft.loading = True
+        aircraft.load_generation += 1
+        try:
             xp.loadObjectAsync(self._object_path(wanted), self._object_loaded,
-                               (aircraft.callsign, aircraft.load_generation))
+                               (aircraft, aircraft.load_generation))
+        except Exception as e:
+            self._model_failed(aircraft, str(e))
+
+    @staticmethod
+    def _model_failed(aircraft, reason):
+        aircraft.loading = False
+        aircraft.model_retry_at = xp.getElapsedTime() + MODEL_RETRY_INTERVAL
+        xp.log(f"could not load the CSL object for {aircraft.callsign}: "
+               f"{aircraft.object_path} ({reason}); retrying after "
+               f"{MODEL_RETRY_INTERVAL:g} seconds")
 
     def _terrain_elevation(self, latitude, longitude):
         """脚下本地地形的高度（英尺），探不到返回 None。xPilot 的 TerrainProbe。
@@ -955,21 +973,26 @@ class PythonInterface:
 
     def _object_loaded(self, object_ref, refcon):
         """loadObjectAsync 的回调。加载期间飞机可能已经走了，或又换过模型。"""
-        callsign, generation = refcon
-        aircraft = self.aircraft.get(callsign)
-        if (aircraft is None or object_ref is None
+        requested_aircraft, generation = refcon
+        aircraft = self.aircraft.get(requested_aircraft.callsign)
+        if (aircraft is not requested_aircraft
                 or generation != aircraft.load_generation):
             if object_ref is not None:
                 xp.unloadObject(object_ref)
-            if object_ref is None and aircraft is not None:
-                # 不留这行日志的话，"TCAS 有目标、窗外没飞机"完全没法查
-                xp.log(f"could not load the CSL object for {callsign}: "
-                       f"{aircraft.object_path}")
-                aircraft.loading = False
+            return
+        if object_ref is None:
+            self._model_failed(aircraft, "loader returned no object")
+            return
+        aircraft.object_ref = object_ref
+        try:
+            aircraft.instance = xp.createInstance(object_ref, ANIMATION_DATAREFS)
+            if aircraft.instance is None:
+                raise RuntimeError("instance creation returned no instance")
+        except Exception as e:
+            aircraft.destroy()
+            self._model_failed(aircraft, str(e))
             return
         aircraft.loading = False
-        aircraft.object_ref = object_ref
-        aircraft.instance = xp.createInstance(object_ref, ANIMATION_DATAREFS)
 
     @staticmethod
     def _animation_values(entry, surfaces=None):
