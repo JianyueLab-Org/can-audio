@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
@@ -92,6 +93,7 @@ namespace XpcNative
         m_viewX = XPLMFindDataRef("sim/graphics/view/view_x");
         m_viewY = XPLMFindDataRef("sim/graphics/view/view_y");
         m_viewZ = XPLMFindDataRef("sim/graphics/view/view_z");
+        m_terrainProbe = XPLMCreateProbe(xplm_ProbeY);
         XPLMRegisterDrawCallback(&CTraffic::drawLabels, xplm_Phase_Window, 0, this);
     }
 
@@ -99,6 +101,7 @@ namespace XpcNative
     {
         XPLMUnregisterDrawCallback(&CTraffic::drawLabels, xplm_Phase_Window, 0, this);
         cleanup();
+        if (m_terrainProbe) { XPLMDestroyProbe(m_terrainProbe); }
     }
 
     bool CTraffic::initialize(const std::string &pluginDir)
@@ -210,16 +213,22 @@ namespace XpcNative
             const std::string name(mixedcase);
             m_modelStrings[upper(name)] = name;
             // xplanemp2 names a model "<package folder> <OBJ8_AIRCRAFT name>";
-            // the client only knows the second half.
-            const auto space = name.find_last_of(' ');
-            const std::string suffix = upper(space == std::string::npos ? name : name.substr(space + 1));
-            m_modelSuffixes.emplace(suffix, name);
+            // the client only knows the second half, and only up to its first
+            // space (X-CSL has names like "F5:F5  @TA").
+            const auto space = name.find(' ');
+            const std::string objectName = upper(space == std::string::npos ? name : name.substr(space + 1));
+            m_modelSuffixes.emplace(objectName, name);
+            m_modelSuffixes.emplace(objectName.substr(0, objectName.find(' ')), name);
         }
         if (roots.empty()) { WARNING_LOG("no CSL package (xsb_aircraft.txt) found below " + path); }
         return XPMPGetNumberOfInstalledModels();
     }
 
-    void CTraffic::setDefaultIcao(const std::string &defaultIcao) { XPMPSetDefaultPlaneICAO(defaultIcao.c_str()); }
+    void CTraffic::setDefaultIcao(const std::string &defaultIcao)
+    {
+        m_defaultIcao = defaultIcao;
+        XPMPSetDefaultPlaneICAO(defaultIcao.c_str());
+    }
 
     void CTraffic::setDrawingLabels(bool drawing) { m_drawLabels = drawing; }
 
@@ -240,29 +249,43 @@ namespace XpcNative
         auto planeIt = m_planesByCallsign.find(callsign);
         if (planeIt != m_planesByCallsign.end()) { return; }
 
-        const std::string icao = aircraftIcao.empty() ? std::string("????") : aircraftIcao;
+        // Type not known yet (no flight plan / #SB reply so far): the default
+        // type, not "????" - xplanemp2 matches that against anything and
+        // came up with an F-5. The real type arrives later and re-adds it.
+        const std::string icao = aircraftIcao.empty() ? m_defaultIcao : aircraftIcao;
+        // No airline from the client: take it from an airline-style callsign
+        // (CCA1111 -> CCA), as swift does
+        std::string airline = airlineIcao;
+        if (airline.empty() && callsign.size() > 3 && std::isdigit(static_cast<unsigned char>(callsign[3])) &&
+            std::all_of(callsign.begin(), callsign.begin() + 3,
+                        [](char c) { return std::isupper(static_cast<unsigned char>(c)) != 0; }))
+        {
+            airline = callsign.substr(0, 3);
+        }
         const std::string resolved = resolveModelName(modelName);
         XPMPPlaneID id = nullptr;
         if (resolved.empty())
         {
             DEBUG_LOG("Model " + modelName + " is unknown, falling back to basic xpmp2 model matching");
-            id = XPMPCreatePlane(icao.c_str(), airlineIcao.c_str(), livery.c_str());
+            id = XPMPCreatePlane(icao.c_str(), airline.c_str(), livery.c_str());
         }
         else
         {
-            id = XPMPCreatePlaneWithModelName(resolved.c_str(), icao.c_str(), airlineIcao.c_str(), livery.c_str());
+            id = XPMPCreatePlaneWithModelName(resolved.c_str(), icao.c_str(), airline.c_str(), livery.c_str());
         }
 
         if (!id)
         {
-            WARNING_LOG("could not add " + callsign + " (" + icao + "/" + airlineIcao + ")");
+            WARNING_LOG("could not add " + callsign + " (" + icao + "/" + airline + ")");
             return;
         }
 
+        // the client's own values, so applyFrame notices when they change
         Plane *plane = new Plane(id, callsign, aircraftIcao, airlineIcao, livery, modelName);
         m_planesByCallsign[callsign] = plane;
         m_planesById[id] = plane;
-        INFO_LOG("added " + callsign + " (" + icao + "/" + (airlineIcao.empty() ? "-" : airlineIcao) + ") as " +
+        INFO_LOG("added " + callsign + " (" + icao + "/" + (airline.empty() ? "-" : airline) +
+                 (aircraftIcao.empty() ? ", type not known yet" : "") + ") as " +
                  (resolved.empty() ? std::string("best xpmp match") : resolved));
     }
 
@@ -343,12 +366,16 @@ namespace XpcNative
         plane->positions[2].pitch = static_cast<float>(state.pitchDeg);
         plane->positions[2].roll = static_cast<float>(state.rollDeg);
         plane->positions[2].heading = static_cast<float>(state.headingDeg);
-        plane->positions[2].offsetScale = 1.0f;
+        // The reported altitude is the sender's reference point, already the
+        // right height in the air. Only on the ground is the model lifted by
+        // its VERT_OFFSET, from the terrain (see placeOnGround).
+        plane->positions[2].offsetScale = state.onGround ? 1.0f : 0.0f;
         plane->positions[2].clampToGround = true;
         plane->positionTimes[2] = std::chrono::steady_clock::now();
 
         if (first)
         {
+            logFirstPosition(plane, state);
             // Nothing to interpolate from yet: start the history here so the
             // first frame is drawn where the aircraft is, not at 0/0.
             for (int i = 0; i < 2; ++i)
@@ -369,6 +396,25 @@ namespace XpcNative
         }
 
         plane->isOnGround = state.onGround;
+    }
+
+    void CTraffic::logFirstPosition(const Plane *plane, const PlaneState &state)
+    {
+        // Where the aircraft is relative to the user's: the first thing to
+        // check when one "does not show up".
+        static XPLMDataRef ownX = XPLMFindDataRef("sim/flightmodel/position/local_x");
+        static XPLMDataRef ownY = XPLMFindDataRef("sim/flightmodel/position/local_y");
+        static XPLMDataRef ownZ = XPLMFindDataRef("sim/flightmodel/position/local_z");
+        double x = 0, y = 0, z = 0;
+        XPLMWorldToLocal(state.latitudeDeg, state.longitudeDeg, state.altitudeFt * 0.3048, &x, &y, &z);
+        const double dx = x - XPLMGetDatad(ownX);
+        const double dy = y - XPLMGetDatad(ownY);
+        const double dz = z - XPLMGetDatad(ownZ);
+        char line[256];
+        std::snprintf(line, sizeof(line), "%s at %.5f %.5f, %.0f ft: %.1f km from you, %+.0f m above you%s",
+                      plane->callsign.c_str(), state.latitudeDeg, state.longitudeDeg, state.altitudeFt,
+                      std::sqrt(dx * dx + dz * dz) / 1000.0, dy, state.onGround ? " (on ground)" : "");
+        INFO_LOG(line);
     }
 
     void CTraffic::setPlaneSurfaces(Plane *plane, const PlaneState &state)
@@ -416,6 +462,7 @@ namespace XpcNative
             Plane *plane = pair.second;
             if (plane->positionTimes[2].time_since_epoch().count() == 0) { continue; } // never positioned
             interpolatePosition(plane);
+            if (plane->isOnGround) { placeOnGround(plane); }
             interpolateGear(plane);
             XPMPUpdate_t update = { plane->id, &plane->positions[3], &plane->surfaces, &plane->surveillance,
                                     plane->isOnGround };
@@ -447,6 +494,28 @@ namespace XpcNative
         plane->positions[3].lat = plane->positions[0].lat + dLat * ratio;
         plane->positions[3].lon = plane->positions[0].lon + dLon * ratio;
         plane->positions[3].elevation = plane->positions[0].elevation + dAlt * ratio;
+    }
+
+    void CTraffic::placeOnGround(Plane *plane)
+    {
+        // Like xPilot: an aircraft on the ground sits on our terrain, not at
+        // the altitude its sender reported. Their scenery, altimeter setting
+        // and CG height all differ from ours; xplanemp2 then adds the model's
+        // VERT_OFFSET so the wheels touch.
+        if (!m_terrainProbe) { return; }
+        XPMPPlanePosition_t &pos = plane->positions[3];
+        double x = 0, y = 0, z = 0;
+        XPLMWorldToLocal(pos.lat, pos.lon, pos.elevation * 0.3048, &x, &y, &z);
+        XPLMProbeInfo_t info {};
+        info.structSize = sizeof(info);
+        if (XPLMProbeTerrainXYZ(m_terrainProbe, static_cast<float>(x), static_cast<float>(y), static_cast<float>(z), &info) !=
+            xplm_ProbeHitTerrain)
+        {
+            return;
+        }
+        double lat = 0, lon = 0, alt = 0;
+        XPLMLocalToWorld(info.locationX, info.locationY, info.locationZ, &lat, &lon, &alt);
+        pos.elevation = alt / 0.3048;
     }
 
     void CTraffic::interpolateGear(Plane *plane)

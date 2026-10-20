@@ -5,18 +5,10 @@
 #    define NOMINMAX
 #endif
 
-#include "bridge.h"
-#include "utils.h"
-
-#include <nlohmann/json.hpp>
-
-#include <algorithm>
-#include <cmath>
-
+// winsock2.h must come before anything that pulls in <windows.h>: XPLMDefs.h
+// (via bridge.h -> traffic.h) includes it, which drags in the old winsock.h
+// and makes winsock2.h redefine every socket type.
 #ifdef _WIN32
-#    ifndef WIN32_LEAN_AND_MEAN
-#        define WIN32_LEAN_AND_MEAN
-#    endif
 #    include <winsock2.h>
 #    include <ws2tcpip.h>
 #else
@@ -26,6 +18,14 @@
 #    include <sys/socket.h>
 #    include <unistd.h>
 #endif
+
+#include "bridge.h"
+#include "utils.h"
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cmath>
 
 using json = nlohmann::json;
 

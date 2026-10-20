@@ -54,7 +54,10 @@ using namespace xpmp;
 #define		DEBUG_CSL_LOADING 0
 
 // Set this to 1 to cause AIRLINE and LIVERY to create ICAO codes automatically
-#define		USE_DEFAULTING 0
+// XPC for CAN: on. X-CSL has no ICAO lines, only AIRLINE/LIVERY, so with
+// this off a type without an airline matched nothing and fell through to the
+// WTC fallback (an A320 came out as an F-5).
+#define		USE_DEFAULTING 1
 
 enum
 {
@@ -175,11 +178,18 @@ ParseObj8AircraftCommand(
 	const std::vector<std::string> &tokens, CSLPackage_t &package, const string &path, int lineNum, const string &line)
 {
 	// OBJ8_AIRCRAFT <path>
-	if (tokens.size() != 2) {
+	if (tokens.size() < 2) {
 		XPLMDump(path, lineNum, line) << XPMP_CLIENT_NAME " WARNING: OBJ8_AIRCRAFT command takes 1 argument.\n";
+		return false;
+	}
+	// XPC for CAN: X-CSL has names with spaces ("F5:F5  @TA"); keep the whole
+	// name like XPMP2 does instead of cutting it at the first space.
+	std::string name = tokens[1];
+	for (size_t i = 2; i < tokens.size(); ++i) {
+		name += " " + tokens[i];
 	}
 
-	auto csl = new Obj8CSL({package.path.substr(package.path.find_last_of('/') + 1)}, tokens[1]);
+	auto csl = new Obj8CSL({package.path.substr(package.path.find_last_of('/') + 1)}, name);
 	package.planes.push_back(csl);
 
 #if DEBUG_CSL_LOADING
@@ -229,6 +239,16 @@ MakeTexturedObj(const std::string &objPath, std::string texture, std::string lit
 		std::string name = file.substr(file.find_last_of('/') == std::string::npos ? 0 : file.find_last_of('/') + 1);
 		return name.substr(0, name.find_last_of('.'));
 	};
+	// A copy pointing at a texture that is not there draws the aircraft
+	// without any texture at all; the obj's own livery is the better fallback.
+	if (!DoesFileExist(dir + texture)) {
+		XPLMDump() << XPMP_CLIENT_NAME " WARNING: texture " << dir << texture << " not found - drawing "
+				   << objFile << " with its own texture (is the CSL package complete?)\n";
+		return objPath;
+	}
+	if (!litTexture.empty() && !DoesFileExist(dir + litTexture)) {
+		litTexture.clear();
+	}
 	if (litTexture.empty()) {
 		// <texture>_LIT.<ext> beside the texture, if the package has one
 		const size_t dot = texture.find_last_of('.');
@@ -448,11 +468,11 @@ ParseAirlineCommand(
 	std::string group = gGroupings[icao];
 	package.matches[match_icao_airline].emplace(icao + " " + airline, static_cast<int>(package.planes.size()) - 1);
 #if USE_DEFAULTING
-	package.matches[match_icao		].emplace(icao,				package.planes.size() - 1);
+	package.matches[match_icao		].emplace(icao,				static_cast<int>(package.planes.size()) - 1);
 #endif
 	if (!group.empty()) {
 #if USE_DEFAULTING
-		package.matches[match_group	     ].emplace(group,				  package.planes.size() - 1);
+		package.matches[match_group	     ].emplace(group,				  static_cast<int>(package.planes.size()) - 1);
 #endif
 		package.matches[match_group_airline].emplace(group + " " + airline, static_cast<int>(package.planes.size()) - 1);
 	}
@@ -479,8 +499,8 @@ ParseLiveryCommand(
 	package.planes.back()->setLivery(icao, airline, livery);
 	std::string group = gGroupings[icao];
 #if USE_DEFAULTING
-	package.matches[match_icao				].emplace(icao,							   package.planes.size() - 1);
-	package.matches[match_icao_airline 		].emplace(icao + " " + airline,			   package.planes.size() - 1);
+	package.matches[match_icao				].emplace(icao,							   static_cast<int>(package.planes.size()) - 1);
+	package.matches[match_icao_airline 		].emplace(icao + " " + airline,			   static_cast<int>(package.planes.size()) - 1);
 #endif
 	package.matches[match_icao_airline_livery].emplace(icao + " " + airline + " " + livery,
 		static_cast<int>(package.planes.size()) - 1);
@@ -488,8 +508,8 @@ ParseLiveryCommand(
 		static_cast<int>(package.planes.size()) - 1);
 	if (!group.empty()) {
 #if USE_DEFAULTING
-		package.matches[match_group		 		 ].emplace(group,							     package.planes.size() - 1);
-		package.matches[match_group_airline		 ].emplace(group + " " + airline			     package.planes.size() - 1);
+		package.matches[match_group		 		 ].emplace(group,							     static_cast<int>(package.planes.size()) - 1);
+		package.matches[match_group_airline		 ].emplace(group + " " + airline,			     static_cast<int>(package.planes.size()) - 1);
 #endif
 		package.matches[match_group_airline_livery].emplace(group + " " + airline + " " + livery,
 			static_cast<int>(package.planes.size()) - 1);

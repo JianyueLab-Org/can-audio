@@ -77,9 +77,20 @@ CSL/                               ← 选法 A 就是 XPC_for_CAN\CSL；选法 
   「CSL 模型目录」选 `D:\CSL`、`D:\CSL\X-CSL`，甚至直接选某一个包的文件夹，都能读到。
 - 客户端连上之后，每一帧都会把「CSL 模型目录」告诉插件；改了目录不用重启
   X-Plane，下一帧就会加载新目录，已有的飞机会重新匹配一次。
-- `XPC_for_CAN\CSL` 在插件启动时就会加载，不用等客户端。
-- 两处可以同时用。**但同一个模型包不要放两份**：包名（`EXPORT_NAME`）重复时第二份
-  会被跳过，Log.txt 里会有 `Package name … already in use`。
+- 收到客户端第一帧时加载：先加载「CSL 模型目录」，最后才加载 `XPC_for_CAN\CSL`。
+- 两处可以同时用。**但同一个模型包不要放两份**：包名（`EXPORT_NAME`）重复时后加载的
+  那份会被跳过，Log.txt 里会有 `Package name … already in use`。所以
+  `XPC_for_CAN\CSL` 里残缺的旧拷贝不会顶掉「CSL 模型目录」里完整的包。
+- 包里缺贴图时（`OBJ8 SOLID YES A319:A319fCFM.obj CCA.png` 而 `CCA.png` 不在），
+  这一款涂装退回 `.obj` 自带的贴图，Log.txt 里有 `texture … not found`。
+
+不连客户端也能测插件：X-Plane 进到飞行里之后，关掉客户端，运行
+`python native_plugin/scripts/spawn_test.py`，会在你正前方 150 m 放一架 CCA 的 A320。
+插件给每架飞机第一次定位时都会在 Log.txt 里记一行「离你多远」：
+
+```text
+XPC for CAN: XPCTEST at 40.07612 116.59731, 115 ft: 0.2 km from you, +0 m above you (on ground)
+```
 - 路径里有中文没关系（`D:\游戏\X-Plane 12\…` 可以）。
 
 几条容易踩的坑：

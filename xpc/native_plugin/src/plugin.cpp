@@ -106,7 +106,13 @@ namespace
             if (auto frame = g_bridge->poll())
             {
                 if (!frame->defaultIcao.empty()) { g_traffic->setDefaultIcao(frame->defaultIcao); }
-                if (!frame->cslPaths.empty()) { loadCsl(frame->cslPaths); }
+                // The client's CSL folder first, the bundled one last: xplanemp2
+                // skips a package whose name is already loaded, so a stale or
+                // partial copy in XPC_for_CAN/CSL must not shadow the user's
+                // library.
+                std::vector<std::string> paths = frame->cslPaths;
+                paths.push_back(g_pluginDir + "/CSL");
+                loadCsl(paths);
                 if (frame->labels)
                 {
                     g_traffic->setDrawingLabels(*frame->labels);
@@ -152,8 +158,8 @@ PLUGIN_API int XPluginEnable()
         ERROR_LOG("could not initialise the renderer; is LegacyData/ next to the 64/ folder in " + g_pluginDir + "?");
     }
     g_traffic->setDefaultIcao(kDefaultIcao);
-    // CSL packages the installer copied next to the plugin
-    g_traffic->loadPlanesPackage(g_pluginDir + "/CSL");
+    // CSL packages are loaded with the first frame (see flightLoop), so the
+    // client's folder can go before XPC_for_CAN/CSL
     g_cslPaths.clear();
 
     std::string owner;

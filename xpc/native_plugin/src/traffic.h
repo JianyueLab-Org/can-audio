@@ -19,6 +19,7 @@
 #include <XPLMCamera.h>
 #include <XPLMDataAccess.h>
 #include <XPLMDisplay.h>
+#include <XPLMScenery.h>
 
 #include <array>
 #include <chrono>
@@ -131,6 +132,7 @@ namespace XpcNative
         };
 
         void setPlanePosition(Plane *plane, const PlaneState &state);
+        void logFirstPosition(const Plane *plane, const PlaneState &state);
         void setPlaneSurfaces(Plane *plane, const PlaneState &state);
         void setPlaneTransponder(Plane *plane, const PlaneState &state);
         std::string resolveModelName(const std::string &modelName) const;
@@ -138,6 +140,7 @@ namespace XpcNative
         void doPlaneUpdates();
         void interpolatePosition(Plane *);
         void interpolateGear(Plane *);
+        void placeOnGround(Plane *);
 
         static int drawLabels(XPLMDrawingPhase phase, int isBefore, void *refcon);
         void drawLabels();
@@ -145,6 +148,8 @@ namespace XpcNative
         bool m_initialized = false;
         bool m_enabledMultiplayer = false;
         bool m_drawLabels = true;
+        std::string m_defaultIcao = "A320";
+        XPLMProbeRef m_terrainProbe = nullptr;
         XPMPConfiguration_t m_configuration = {};
 
         std::set<std::string> m_loadedPackageRoots;
