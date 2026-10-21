@@ -435,8 +435,10 @@ class VoiceClient:
             self.mumble = bounded_mumble()(self.server, self.cid,
                                            password=self.password,
                                            port=self.port,
-                                           udp=True,
                                            reconnect=True)
+            # 不传 udp=：pymumble-udp 默认就是 udp=True（加密 UDP，不通就退回
+            # TCP 隧道），而 PyPI 的 pymumble 不认这个参数——显式传的话，用旧
+            # 环境从源码跑的人语音会直接 TypeError，界面上只看到"连接失败"。
             self.mumble.reconnect_limit = self.reconnect_limit
             self.mumble.on_reconnect = self._on_reconnect_attempt
             self.mumble.set_receive_sound(True)

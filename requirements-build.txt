@@ -14,7 +14,12 @@ PyQt6-Fluent-Widgets            # 四个客户端共用的 Fluent 深色外观�
 # ---- 语音 ----
 # 使用 pymumble_udp 的 Mumble 1.5+ protobuf UDP 音频格式；导入名仍是
 # pymumble_py3。不要改回 PyPI 的 pymumble，它只有 TCP audio tunnel。
-pymumble @ git+https://github.com/JianyueLab-Org/pymumble_udp.git@pymumble_py3
+# 发行名是 pymumble-udp（它 setup.py 里的 name）——写成 `pymumble @ …` 的话
+# pip 会因为名字对不上直接拒装。钉在提交上而不是分支上：分支一动，下一次发版
+# 就悄悄换了一份语音库。升级时改这个哈希，并重新跑 mumblecompat 的测试——
+# 证书指纹校验挂在它的 _wrap_socket 上。和 PyPI 的 pymumble 装的是同一个
+# pymumble_py3 目录，旧环境先 `pip uninstall pymumble` 再装。
+pymumble-udp @ git+https://github.com/JianyueLab-Org/pymumble_udp.git@168f2c846d37088902bbfe48f8ea76cb95bf7dd7
 pyaudio
 numpy
 
