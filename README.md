@@ -16,8 +16,6 @@ COM1 频率决定他坐在哪个 Mumble 频道，管制员用一个电台栈同�
 
 | 目录 | 入口 | 是什么 |
 |---|---|---|
-| `client/` | `gui.py` | MSFS 飞行员客户端，用 SimConnect 读 COM1 |
-| `xplane_client/` | `gui.py` | X-Plane 飞行员客户端，用 X-Plane UDP 读 COM1 |
 | `controller/` | `gui.py` | 管制客户端，一个电台栈，每个频率有 RX/TX/XC |
 | `atis/` | `gui.py` | 情报通播客户端，仿 vATIS：席位、预设、模板 |
 | `xpc/` | `gui.py` | **XPC for CAN** — X-Plane 客户端，语音 **+** FSD，能看到他机 |
@@ -25,7 +23,7 @@ COM1 频率决定他坐在哪个 Mumble 频道，管制员用一个电台栈同�
 | `server/` | `login.py`、`ATIS/mumble.py` | 跑在 Mumble 主机上：Ice 认证器 + 服务端通播机队 |
 
 `xpc/` 和 `msfs/` 是功能最全的两个：除了语音还会登录 FSD，所以飞机会出现在
-网络上、也能看到别人。`client/` 和 `xplane_client/` 只有语音，更轻量。
+网络上、也能看到别人。
 
 每个组件都是**从自己的目录独立运行**的——图标路径和配置文件都按当前目录解析。
 组件之间靠**复制**共享代码，不是 import（`mumblecompat.py`、`applog.py`、
@@ -61,8 +59,6 @@ pymumble 通过 ctypes 加载原生的 **opus** 库，找不到就 `Could not fi
 library`。仓库里各组件目录下有 `opus.dll`，把那个目录加进 `PATH` 即可。
 
 ```powershell
-cd client;        python gui.py     # 需要 MSFS 已启动
-cd xplane_client; python gui.py     # 需要 X-Plane 已进入飞行
 cd controller;    python gui.py
 cd atis;          python gui.py
 cd xpc;           python gui.py
@@ -83,8 +79,6 @@ cd atis;          python -m unittest test_atis test_applog test_mumblecompat -v
                   python smoke_gui.py
 cd xpc;           python -m unittest test_xpc -v;  python smoke_gui.py
 cd msfs;          python -m unittest test_msfs -v; python smoke_gui.py
-cd client;        python -m unittest test_radio -v; python smoke_gui.py
-cd xplane_client; python -m unittest test_radio -v; python smoke_gui.py
 cd server;        python -m unittest test_login test_serverconf -v
 cd server\ATIS;   python -m unittest test_mumble -v
 ```
