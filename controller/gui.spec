@@ -78,6 +78,7 @@ a = Analysis(
     # 管制端不做语音合成，不需要 scipy / pyttsx3 的隐式导入
     hiddenimports=[
         'pymumble_py3',
+        'pymumble_py3.MumbleUDP_pb2',
         'google.protobuf',
         'qfluentwidgets',
         'qframelesswindow',

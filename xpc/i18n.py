@@ -119,6 +119,8 @@ TEXT = {
     "net.other":            {"zh": "网络：{state}", "en": "Network: {state}"},
     "voicebar.disconnected": {"zh": "语音：未连接", "en": "Voice: not connected"},
     "voicebar.online":      {"zh": "语音：已连接", "en": "Voice: connected"},
+      "voicebar.online_transport": {"zh": "语音：已连接（{transport}） · {latency} ms",
+                                                   "en": "Voice: connected ({transport}) · {latency} ms"},
     "voicebar.reconnecting": {"zh": "语音：重连中", "en": "Voice: reconnecting"},
     "voicebar.offline":     {"zh": "语音：已下线", "en": "Voice: offline"},
     "voicebar.other":       {"zh": "语音：{state}", "en": "Voice: {state}"},

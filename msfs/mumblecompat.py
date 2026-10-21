@@ -224,10 +224,10 @@ def send_stats():
 class _RetryingSocket:
     """给非阻塞 socket 的 `send()` 补上"等它可写再续发"。
 
-    **这是语音"一发话就掉线"的病根。** pymumble 没有 UDP 通道：话音被塞进
-    `UDPTUNNEL` 消息，和控制消息走**同一条 TCP**（soundoutput.py 的
-    `tcppacket = ... # encapsulate in tcp tunnel`）。而那条 socket 在
-    `connect()` 里被设成了非阻塞，发送循环却是照 C 的写法兜错的：
+    **这是 TCP 控制/回退通道"一发话就掉线"的病根。** pymumble_udp 默认使用
+    加密 UDP 发送音频；UDP 尚未探测成功或不可用时，音频会塞进 `UDPTUNNEL`
+    消息，和控制消息走**同一条 TCP**（soundoutput.py 的 TCP fallback）。而那条
+    socket 在 `connect()` 里被设成了非阻塞，发送循环却是照 C 的写法兜错的：
 
         sent = self.mumble_object.control_socket.send(tcppacket)
         if sent < 0:                     # Python 里 send 是抛异常，不是返回 -1

@@ -364,6 +364,17 @@ class VoiceClient:
             except Exception as e:
                 log.warning(f"status callback raised: {e}")
 
+    def transport_status(self):
+        """Return the active audio transport and its latest keepalive RTT."""
+        mumble = self.mumble
+        if mumble is None:
+            return None, None
+        if getattr(mumble, "udp_active", False):
+            stats = getattr(mumble, "udp_ping_stats", {})
+            return "UDP", stats.get("avg")
+        stats = getattr(mumble, "ping_stats", {})
+        return "TCP", stats.get("avg")
+
     # ---------- 被踢 ----------
     def _on_user_removed(self, user, event=None):
         """有人离开了。只关心一种：**我们自己被踢了**。
@@ -424,6 +435,7 @@ class VoiceClient:
             self.mumble = bounded_mumble()(self.server, self.cid,
                                            password=self.password,
                                            port=self.port,
+                                           udp=True,
                                            reconnect=True)
             self.mumble.reconnect_limit = self.reconnect_limit
             self.mumble.on_reconnect = self._on_reconnect_attempt

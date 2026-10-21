@@ -283,6 +283,17 @@ class Voice:
             except Exception as e:
                 log.warning("status callback raised: %s", e)
 
+    def transport_status(self):
+        """Return the active audio transport and its latest keepalive RTT."""
+        mumble = self.mumble
+        if mumble is None:
+            return None, None
+        if getattr(mumble, "udp_active", False):
+            stats = getattr(mumble, "udp_ping_stats", {})
+            return "UDP", stats.get("avg")
+        stats = getattr(mumble, "ping_stats", {})
+        return "TCP", stats.get("avg")
+
     @property
     def connected(self):
         """真的连上了才算。

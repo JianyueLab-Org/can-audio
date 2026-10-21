@@ -49,11 +49,13 @@ COM1 频率决定他坐在哪个 Mumble 频道，管制员用一个电台栈同�
 需要 **Python 3.12**（3.13+ 没有 PyAudio 的 wheel）。
 
 ```powershell
-pip install PyQt6 pymumble pyaudio numpy pygame keyboard pynput SimConnect
+pip install -r requirements-build.txt
 ```
 
 按需再装：`edge-tts requests pyttsx3 scipy`（服务端通播）、`zeroc-ice`（服务端认证器）。
-注意 pymumble 在 PyPI 上的包名就是 **`pymumble`**。
+客户端使用仓库的 `pymumble_udp` 分支，而不是 PyPI 上只有 TCP tunnel 的旧版
+`pymumble`。它对外仍导入为 `pymumble_py3`，并会在 Mumble 1.5+ 服务端上使用
+加密 UDP 音频；UDP 不可用时自动回退到 TCP tunnel。
 
 pymumble 通过 ctypes 加载原生的 **opus** 库，找不到就 `Could not find Opus
 library`。仓库里各组件目录下有 `opus.dll`，把那个目录加进 `PATH` 即可。
