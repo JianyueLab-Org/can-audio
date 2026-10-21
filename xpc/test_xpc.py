@@ -11,6 +11,7 @@ import inspect
 import json
 import math
 import os
+import re
 import shutil
 import struct
 import sys
@@ -132,6 +133,14 @@ class CallsignTest(unittest.TestCase):
 
     def test_lowercase_is_normalised(self):
         self.assertIsNone(fsdpilot.callsign_problem("cca1501"))
+
+
+class SquawkBcdTest(unittest.TestCase):
+    def test_xplane_bcd_code_is_decoded(self):
+        self.assertEqual(xplane.bcd_squawk(0x1200), 1200)
+
+    def test_default_bcd_code_is_2000(self):
+        self.assertEqual(xplane.bcd_squawk(0x2000), 2000)
 
 
 class SanitizeTest(unittest.TestCase):
@@ -2949,6 +2958,15 @@ class CslParsingTest(unittest.TestCase):
         self.assertEqual(models[0].airline, "CCA")
         self.assertEqual(models[0].package, "BB_Airbus")
 
+    def test_keeps_all_obj8_parts_of_an_ivao_model(self):
+        models = cslmatch.parse_package(self._write(
+            "OBJ8_AIRCRAFT A320:A320CCA\n"
+            "OBJ8 SOLID YES A320:A320fan.obj\n"
+            "OBJ8 SOLID YES A320:A320.obj CCA.png\n"
+            "ICAO A320\nAIRLINE A320 CCA\n"))
+        self.assertEqual([os.path.basename(p) for p in models[0].paths],
+                         ["A320fan.obj", "A320.obj"])
+
     def test_backslash_paths(self):
         models = cslmatch.parse_package(self._write(
             "OBJ8_AIRCRAFT X\nOBJ8 SOLID YES A320\\A320.obj\nICAO A320\n"))
@@ -3140,6 +3158,112 @@ class ModelMatchingTest(unittest.TestCase):
     def test_family_lookup(self):
         self.assertIn("B739", cslmatch.family_of("B738"))
         self.assertEqual(cslmatch.family_of("ZZZZ"), ())
+
+    def test_airline_beats_the_exact_type(self):
+        """国航 A321 没有模型：国航的窄体比别家的 A321 更像那架飞机。"""
+        models = cslmatch.ModelSet([
+            cslmatch.Model("A321_CES", "a321_ces.obj", icao="A321", airline="CES"),
+            cslmatch.Model("B738_CCA", "b738_cca.obj", icao="B738", airline="CCA"),
+        ])
+        model, why = models.match(equipment="A321", airline="CCA")
+        self.assertEqual(model.name, "B738_CCA", why)
+        self.assertIn("窄体", why)
+
+    def test_family_with_airline_comes_before_other_types_with_airline(self):
+        models = cslmatch.ModelSet([
+            cslmatch.Model("B738_CCA", "b738_cca.obj", icao="B738", airline="CCA"),
+            cslmatch.Model("A320_CCA", "a320_cca.obj", icao="A320", airline="CCA"),
+        ])
+        model, why = models.match(equipment="A321", airline="CCA")
+        self.assertEqual(model.name, "A320_CCA", why)
+        self.assertIn("同族", why)
+
+    def test_airline_only_comes_before_type_only(self):
+        """航司对得上的任意机型，排在只有机型对得上的前面——哪怕大小不一样。"""
+        models = cslmatch.ModelSet([
+            cslmatch.Model("B77W_UAE", "b77w_uae.obj", icao="B77W", airline="UAE"),
+            cslmatch.Model("A320_CCA", "a320_cca.obj", icao="A320", airline="CCA"),
+        ])
+        model, why = models.match(equipment="B77W", airline="CCA")
+        self.assertEqual(model.name, "A320_CCA", why)
+        self.assertIn("只有航司", why)
+
+    def test_airline_only_prefers_a_narrowbody(self):
+        models = cslmatch.ModelSet([
+            cslmatch.Model("B789_CCA", "b789_cca.obj", icao="B789", airline="CCA"),
+            cslmatch.Model("A320_CCA", "a320_cca.obj", icao="A320", airline="CCA"),
+        ])
+        model, why = models.match(equipment="C172", airline="CCA")
+        self.assertEqual(model.name, "A320_CCA", why)
+
+    def test_type_only_when_the_airline_has_no_models(self):
+        models = cslmatch.ModelSet([
+            cslmatch.Model("A320_CES", "a320_ces.obj", icao="A320", airline="CES"),
+            cslmatch.Model("B789_GEN", "b789.obj", icao="B789"),
+        ])
+        model, why = models.match(equipment="B77W", airline="CCA")
+        self.assertEqual(model.name, "B789_GEN", why)
+
+    def test_widebody_keeps_the_airline_when_it_can(self):
+        models = cslmatch.ModelSet([
+            cslmatch.Model("B789_GEN", "b789.obj", icao="B789"),
+            cslmatch.Model("A333_CCA", "a333_cca.obj", icao="A333", airline="CCA"),
+        ])
+        model, why = models.match(equipment="B77W", airline="CCA")
+        self.assertEqual(model.name, "A333_CCA", why)
+        self.assertIn("宽体", why)
+
+    def test_unknown_type_takes_the_airlines_a320(self):
+        """#SB 还没回：按窄体算，先挑这家航司的 A320，别随手拿一架别家的 737。"""
+        models = cslmatch.ModelSet([
+            cslmatch.Model("B738_IDS", "b738_ids.obj", icao="B738", airline="IDS"),
+            cslmatch.Model("B738_CCA", "b738_cca.obj", icao="B738", airline="CCA"),
+            cslmatch.Model("A320_CCA", "a320_cca.obj", icao="A320", airline="CCA"),
+        ])
+        model, why = models.match(airline="CCA")
+        self.assertEqual(model.name, "A320_CCA", why)
+
+    def test_a_civilian_never_gets_a_military_livery_by_type(self):
+        """X-CSL 的 B738 包第一条是 @IDS（印尼空军）。只按机型挑的时候不能拿它。"""
+        models = cslmatch.ModelSet([
+            cslmatch.Model("B738:B738@IDS", "ids.obj", icao="B738", airline="@ID", livery="S"),
+            cslmatch.Model("B738:B738CES", "ces.obj", icao="B738", airline="CES"),
+        ])
+        model, why = models.match(equipment="B738", airline="UAL")
+        self.assertEqual(model.name, "B738:B738CES", why)
+
+    def test_the_generic_livery_comes_first_by_type(self):
+        models = cslmatch.ModelSet([
+            cslmatch.Model("B738:B738@IDS", "ids.obj", icao="B738", airline="@ID"),
+            cslmatch.Model("B738:B738CES", "ces.obj", icao="B738", airline="CES"),
+            cslmatch.Model("B738:B738", "gen.obj", icao="B738"),
+        ])
+        model, _ = models.match(equipment="B738")
+        self.assertEqual(model.name, "B738:B738")
+
+    def test_a_military_livery_is_used_when_it_is_all_there_is(self):
+        models = cslmatch.ModelSet([
+            cslmatch.Model("F5:F5@TA", "f5.obj", icao="F5", airline="@TA"),
+        ])
+        model, _ = models.match(equipment="F5")
+        self.assertEqual(model.name, "F5:F5@TA")
+
+    def test_the_last_resort_is_not_military_either(self):
+        models = cslmatch.ModelSet([
+            cslmatch.Model("F5:F5@TA", "f5.obj", icao="F5", airline="@TA"),
+            cslmatch.Model("C172:C172", "c172.obj", icao="C172"),
+        ])
+        model, _ = models.match(equipment="ZZZZ")
+        self.assertEqual(model.name, "C172:C172")
+
+    def test_airline_from_callsign(self):
+        self.assertEqual(cslmatch.airline_from_callsign("CCA1111"), "CCA")
+        self.assertEqual(cslmatch.airline_from_callsign("ces5123"), "CES")
+        self.assertEqual(cslmatch.airline_from_callsign("CCA"), "")
+        self.assertEqual(cslmatch.airline_from_callsign("B1234"), "")
+        self.assertEqual(cslmatch.airline_from_callsign("N123AB"), "")
+        self.assertEqual(cslmatch.airline_from_callsign("TEST1"), "")
+        self.assertEqual(cslmatch.airline_from_callsign(""), "")
 
 
 class BridgeTest(unittest.TestCase):
@@ -3400,11 +3524,47 @@ class ObjDataRefRewriteTest(unittest.TestCase):
             self.assertEqual(cslmatch.obj_for_drawing(original), original)
 
 
-class PluginInstallTest(unittest.TestCase):
-    """把他机插件装进 X-Plane。
+class FindCslTest(unittest.TestCase):
+    """没在设置里选 CSL 目录时，到 X-Plane 插件目录里找别的客户端装好的那份。"""
 
-    全程在临时目录里搭一棵假的 X-Plane 目录树，不碰真的模拟器，也不读本机上
-    那份安装记录（`inspect()` 明确传 root，就不会去自动探测）。
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.plugins = os.path.join(self.tmp, xpinstall.PLUGINS_DIR)
+        os.makedirs(self.plugins)
+
+    def _package(self, *parts):
+        folder = os.path.join(self.plugins, *parts)
+        os.makedirs(folder)
+        with open(os.path.join(folder, "xsb_aircraft.txt"), "w") as f:
+            f.write("EXPORT_NAME A320\n")
+
+    def test_nothing_installed(self):
+        self.assertEqual(xpinstall.find_csl([self.tmp]), "")
+
+    def test_finds_ivao_csl(self):
+        self._package("IVAO_CSL", "CSL", "A320")
+        self.assertEqual(xpinstall.find_csl([self.tmp]),
+                         os.path.join(self.plugins, "IVAO_CSL", "CSL"))
+
+    def test_folder_without_packages_is_skipped(self):
+        os.makedirs(os.path.join(self.plugins, "IVAO_CSL", "CSL", "empty"))
+        self._package("xPilot", "Resources", "CSL", "Bluebell", "A320")
+        self.assertEqual(xpinstall.find_csl([self.tmp]),
+                         os.path.join(self.plugins, "xPilot", "Resources", "CSL"))
+
+    def test_bundled_folder_is_not_offered(self):
+        # 插件自己会加载 XPC_for_CAN/CSL，不该再当成用户的选择发回去
+        self._package("XPC_for_CAN", "CSL", "A320")
+        self.assertEqual(xpinstall.find_csl([self.tmp]), "")
+
+
+class PluginInstallTest(unittest.TestCase):
+    """把原生他机插件装进 X-Plane。
+
+    全程在临时目录里搭一棵假的 X-Plane 目录树和一份假的随包插件，不碰真的
+    模拟器，也不读本机上那份安装记录（`inspect()` 明确传 root，就不会去自动
+    探测）。
     """
 
     def setUp(self):
@@ -3412,16 +3572,25 @@ class PluginInstallTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.root = os.path.join(self.tmp, "X-Plane 12")
         os.makedirs(os.path.join(self.root, xpinstall.PLUGINS_DIR))
+        self.package = os.path.join(self.tmp, "bundle", xpinstall.PLUGIN_FOLDER)
+        self._write(os.path.join(self.package, xpinstall.PLUGIN_BINARY),
+                    b"MZ...XPC_BRIDGE_PROTOCOL=%d\0..." % bridge.PROTOCOL_VERSION)
+        for name in xpinstall.LEGACY_FILES:
+            self._write(os.path.join(self.package, name), b"A320 A321\n")
+        patcher = mock.patch.object(xpinstall, "bundled_package",
+                                    return_value=self.package)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-    def _install_xppython3(self):
-        os.makedirs(os.path.join(self.root, xpinstall.XPPYTHON3_DIR))
+    @staticmethod
+    def _write(path, data):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
 
-    def _write_plugin(self, text):
-        target = xpinstall.plugin_path(self.root)
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(text)
-        return target
+    def _write_installed(self, data):
+        return self._write(xpinstall.plugin_path(self.root), data)
 
     # ---------- 目录识别 ----------
     def test_a_folder_with_resources_plugins_is_xplane(self):
@@ -3432,11 +3601,6 @@ class PluginInstallTest(unittest.TestCase):
         self.assertFalse(xpinstall.is_xplane_root(""))
 
     def test_the_check_does_not_require_pythonplugins(self):
-        """没装 XPPython3 的机器上 PythonPlugins 是不存在的。
-
-        拿它当判据会把一个完好的 X-Plane 目录判成"不是 X-Plane"，而那恰恰是
-        最需要装插件的那批人。
-        """
         self.assertFalse(os.path.isdir(
             os.path.join(self.root, xpinstall.PYTHON_PLUGINS_DIR)))
         self.assertTrue(xpinstall.is_xplane_root(self.root))
@@ -3452,80 +3616,85 @@ class PluginInstallTest(unittest.TestCase):
         self.assertEqual(status.state, xpinstall.NOT_XPLANE)
         self.assertFalse(status.can_install)
 
-    def test_xppython3_is_detected(self):
-        self.assertFalse(xpinstall.inspect(self.root).xppython3)
-        self._install_xppython3()
-        self.assertTrue(xpinstall.inspect(self.root).xppython3)
-
     def test_installing_then_inspecting_reports_current(self):
-        xpinstall.install(self.root)
+        target = xpinstall.install(self.root)
+        self.assertEqual(target, xpinstall.plugin_path(self.root))
+        # X-Plane 加载的是 <plugin>/64/win.xpl，LegacyData 要跟着过去，
+        # 否则 xplanemp2 没有 related.txt / Doc8643.txt，按机型族的匹配全废
+        for name in (xpinstall.PLUGIN_BINARY,) + xpinstall.LEGACY_FILES:
+            self.assertTrue(os.path.isfile(
+                os.path.join(xpinstall.plugin_dir(self.root), name)), name)
         status = xpinstall.inspect(self.root)
         self.assertEqual(status.state, xpinstall.CURRENT)
         self.assertEqual(status.installed_protocol, bridge.PROTOCOL_VERSION)
         self.assertFalse(status.protocol_mismatch)
 
-    def test_a_different_file_reports_outdated(self):
-        self._write_plugin("PROTOCOL_VERSION = %d\n# 老版本\n"
-                           % bridge.PROTOCOL_VERSION)
+    def test_a_different_binary_reports_outdated(self):
+        xpinstall.install(self.root)
+        self._write_installed(b"XPC_BRIDGE_PROTOCOL=%d old build" % bridge.PROTOCOL_VERSION)
+        self.assertEqual(xpinstall.inspect(self.root).state, xpinstall.OUTDATED)
+
+    def test_missing_legacy_data_reports_outdated(self):
+        xpinstall.install(self.root)
+        os.remove(os.path.join(xpinstall.plugin_dir(self.root), xpinstall.LEGACY_FILES[0]))
         self.assertEqual(xpinstall.inspect(self.root).state, xpinstall.OUTDATED)
 
     def test_installing_over_an_old_copy_brings_it_current(self):
-        self._write_plugin("# 很旧的一份\n")
+        self._write_installed(b"very old")
         self.assertEqual(xpinstall.inspect(self.root).state, xpinstall.OUTDATED)
         xpinstall.install(self.root)
         self.assertEqual(xpinstall.inspect(self.root).state, xpinstall.CURRENT)
 
-    def test_install_creates_pythonplugins_if_it_is_missing(self):
-        # 装了 XPPython3 也不一定已经有这个目录，它是第一次用时才建的
-        target = xpinstall.install(self.root)
-        self.assertTrue(os.path.isfile(target))
-        self.assertEqual(os.path.basename(target), xpinstall.PLUGIN_NAME)
+    # ---------- 旧的 Python 插件 ----------
+    def test_the_old_python_plugin_is_reported_and_removed(self):
+        """它和原生插件绑同一个端口，留着的话谁先起来谁收数据。"""
+        legacy = self._write(xpinstall.legacy_python_path(self.root), b"PROTOCOL_VERSION = 3\n")
+        status = xpinstall.inspect(self.root)
+        self.assertTrue(status.legacy_python)
+        xpinstall.install(self.root)
+        self.assertFalse(os.path.exists(legacy))
+        status = xpinstall.inspect(self.root)
+        self.assertFalse(status.legacy_python)
+        self.assertEqual(status.state, xpinstall.CURRENT)
+
+    def test_a_current_plugin_beside_the_old_one_is_not_current(self):
+        xpinstall.install(self.root)
+        self._write(xpinstall.legacy_python_path(self.root), b"# old\n")
+        self.assertEqual(xpinstall.inspect(self.root).state, xpinstall.OUTDATED)
 
     # ---------- 协议号 ----------
     def test_a_protocol_mismatch_is_reported_on_its_own(self):
-        """协议对不上时插件是**静默**丢帧的。
-
-        `PI_XpcTraffic.py` 收到 v 不一样的包直接 return，不记日志；用户看到的
-        只有"他机一架都不出现"。所以这条必须能单独报出来，不能混在"版本旧"里
-        ——两者的后果差得远。
-        """
-        self._write_plugin("PROTOCOL_VERSION = %d\n" % (bridge.PROTOCOL_VERSION + 1))
+        self._write_installed(b"XPC_BRIDGE_PROTOCOL=%d" % (bridge.PROTOCOL_VERSION + 1))
         status = xpinstall.inspect(self.root)
         self.assertEqual(status.state, xpinstall.OUTDATED)
         self.assertTrue(status.protocol_mismatch)
         self.assertEqual(status.installed_protocol, bridge.PROTOCOL_VERSION + 1)
 
     def test_an_unreadable_protocol_is_not_a_mismatch(self):
-        # 抠不出版本号（用户改坏了）时别谎报成"协议不一致"——那会把人引到
-        # 一个不存在的原因上
-        self._write_plugin("# 什么都没有\n")
+        self._write_installed(b"no marker at all")
         status = xpinstall.inspect(self.root)
         self.assertIsNone(status.installed_protocol)
         self.assertFalse(status.protocol_mismatch)
 
-    def test_the_bundled_plugin_and_the_bridge_agree(self):
-        """随包这份插件和客户端必须说同一版协议。
-
-        两边各存一份常量，改了一边忘了另一边的话，打出来的包一装上去就是
-        "他机一架都不出现"，而且不报错。
-        """
-        self.assertEqual(xpinstall.protocol_version(xpinstall.bundled_plugin()),
-                         bridge.PROTOCOL_VERSION)
+    def test_the_native_plugin_and_the_bridge_agree(self):
+        """插件源码里的协议号和客户端必须一致，否则装上去他机一架都不出现。"""
+        header = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "native_plugin", "src", "bridge.h")
+        with open(header, encoding="utf-8") as f:
+            match = re.search(r"#define XPC_BRIDGE_PROTOCOL (\d+)", f.read())
+        self.assertIsNotNone(match)
+        self.assertEqual(int(match.group(1)), bridge.PROTOCOL_VERSION)
 
     # ---------- 出错 ----------
-    def test_a_missing_source_does_not_report_current(self):
-        """打包漏了 datas 时，绝不能说"已是最新"。
-
-        那会让用户以为装好了，然后去查 X-Plane 那边为什么不出飞机。
-        """
-        self._write_plugin("# 随便什么\n")
-        with mock.patch.object(xpinstall, "bundled_plugin",
-                               return_value=os.path.join(self.tmp, "没有这个文件")):
-            self.assertEqual(xpinstall.inspect(self.root).state, xpinstall.OUTDATED)
-
-    def test_install_raises_when_the_source_is_missing(self):
-        with mock.patch.object(xpinstall, "bundled_plugin",
-                               return_value=os.path.join(self.tmp, "没有这个文件")):
+    def test_a_missing_bundle_cannot_be_installed_or_reported_current(self):
+        """打包漏了插件时，绝不能说"已是最新"，也不能让按钮点得动。"""
+        xpinstall.install(self.root)
+        with mock.patch.object(xpinstall, "bundled_package",
+                               return_value=os.path.join(self.tmp, "没有这个目录")):
+            status = xpinstall.inspect(self.root)
+            self.assertEqual(status.state, xpinstall.OUTDATED)
+            self.assertFalse(status.bundled)
+            self.assertFalse(status.can_install)
             with self.assertRaises(OSError):
                 xpinstall.install(self.root)
 

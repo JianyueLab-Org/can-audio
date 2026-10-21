@@ -78,6 +78,11 @@ APP_NAME = "XPC for CAN"
 # 正式包和以前一样是纯版本号。
 VERSION = version.display()
 
+# 他机等机型等多久再匹配，以及至少要几个位置样本。照 swift 的
+# CAirspaceMonitor：MMMaxAgeMs = 6 s，remoteAircraftSituationsCount > 1。
+MATCH_WAIT = 6.0
+MATCH_MIN_SAMPLES = 2
+
 
 class Signals(QObject):
     """后台线程 → GUI 线程的唯一通道。"""
@@ -155,7 +160,9 @@ class XpcWindow(QMainWindow):
         self.traffic = bridge.SampleTable()
         self.bridge = bridge.BridgeSender()
         self.models = cslmatch.ModelSet()
-        self._model_cache = {}          # 呼号 -> (匹配到的 .obj 路径, 垂直偏移 米)
+        # 呼号 -> 第一次等机型的时刻（_ready_for_matching）
+        self._waiting_for_type = {}
+        self._model_cache = {}          # 呼号 -> (.obj 路径, 垂直偏移 米, 全部 .obj, 模型名)
         # 上一次推给插件的内容和时刻。没变就不推，但至少每 PUSH_HEARTBEAT 秒
         # 推一次，插件靠它判断客户端还活着。
         self._last_pushed = None
@@ -685,10 +692,20 @@ class XpcWindow(QMainWindow):
 
     # ---------- 他机 ----------
     def _load_models(self):
-        """把 CSL 模型包读进来。没配路径就只送 TCAS，不画模型。"""
+        """把 CSL 模型包读进来。
+
+        没在设置里选过目录的话，先到 X-Plane 的插件目录里找别的客户端装好的
+        那份（xpinstall.KNOWN_CSL_DIRS）；找到了就当作用户的设置，设置页里
+        看得到、改得掉。都找不到就只送 TCAS，不画模型。
+        """
         path = (self.settings.csl_path or "").strip()
         if not path:
-            return
+            roots = [self.settings.xplane_path] if self.settings.xplane_path else xpinstall.find_installs()
+            path = xpinstall.find_csl(roots)
+            if not path:
+                return
+            log.info("no CSL folder chosen, using the one found at %s", path)
+            self.settings.csl_path = path
         if not os.path.isdir(path):
             log.warning("the CSL directory does not exist: %s", path)
             return
@@ -710,6 +727,7 @@ class XpcWindow(QMainWindow):
         # prune 不受开关控制：关着渲染的话表会涨一整场
         for callsign in self.traffic.prune():
             self._model_cache.pop(callsign, None)
+            self._waiting_for_type.pop(callsign, None)
         if not self.settings.render_traffic:
             if self._last_pushed:
                 # 关掉时推一帧空的：插件现在自己积分，不清的话飞机会沿着最后
@@ -718,6 +736,7 @@ class XpcWindow(QMainWindow):
             self._last_pushed = None
             return
 
+        self.bridge.csl_path = (self.settings.csl_path or "").strip()
         origin = (snapshot["latitude"], snapshot["longitude"])
         entries = self.traffic.snapshot(
             origin=origin,
@@ -725,14 +744,21 @@ class XpcWindow(QMainWindow):
             max_range_nm=self.settings.traffic_range_nm or None)
 
         outgoing = []
+        now = traffic_module.clock()
         for entry in entries:
-            entry["object"], entry["vert_offset"] = self._model_for(entry)
+            if not self._ready_for_matching(entry, now):
+                continue
+            (entry["object"], entry["vert_offset"], entry["objects"],
+             entry["model"]) = self._model_for(entry)
+            # 原生插件照搬 swift：swift 的 xswiftbus 每帧收到的是客户端插值好的
+            # 位置，自己只在两次推送之间做一点平滑。所以积分到现在的位姿单独
+            # 放进 pose 送过去；target/velocity 照旧，给样本模型用。
+            entry["pose"] = [entry[key] for key in bridge.DRAWN_KEYS]
             outgoing.append(bridge.plugin_entry(entry))
         self.traffic_label.setText(t("radio.traffic", count=len(entries)))
 
         # 距离每拍都在变，只用来排序，不算"变了"
         content = [{k: v for k, v in e.items() if k != "range_nm"} for e in outgoing]
-        now = traffic_module.clock()
         if (content == self._last_pushed
                 and now - self._last_push_time < bridge.PUSH_HEARTBEAT):
             return
@@ -740,34 +766,58 @@ class XpcWindow(QMainWindow):
         self._last_push_time = now
         self.bridge.send_traffic(outgoing, own=origin)
 
+    def _ready_for_matching(self, entry, now):
+        """这架飞机可以交给插件了吗。照 swift 的 CAirspaceMonitor::sendReadyForModelMatching。
+
+        swift 不会先拿个临时模型画上、等 #SB 回来再换：它等机型（最多
+        MMMaxAgeMs = 6 s），并且要至少两个位置样本，然后只匹配一次。先画后换
+        的结果是同一架飞机在眼前变来变去——对方每掉线重连一次就从"机型未知"
+        再来一遍。等不到机型的飞机，6 秒后照样按航司/默认机型画出来。
+        """
+        callsign = entry["callsign"]
+        if entry.get("received", 0) < MATCH_MIN_SAMPLES:
+            return False
+        if entry.get("equipment") or entry.get("csl"):
+            self._waiting_for_type.pop(callsign, None)
+            return True
+        first = self._waiting_for_type.setdefault(callsign, now)
+        if now - first < MATCH_WAIT:
+            return False
+        return True
+
     def _model_for(self, entry):
         """给一架飞机挑模型。匹配结果缓存住，别每帧都算。"""
         callsign = entry["callsign"]
         if not entry.get("model_dirty") and callsign in self._model_cache:
             return self._model_cache[callsign]
 
+        # 对方没报航司就按呼号猜（CCA1111 → CCA）：涂装比机型更像"那架飞机"
+        airline = entry.get("airline", "") or cslmatch.airline_from_callsign(callsign)
         model, why = self.models.match(
             equipment=entry.get("equipment", ""),
-            airline=entry.get("airline", ""),
+            airline=airline,
             csl=entry.get("csl", ""))
-        path = cslmatch.obj_for_drawing(model.path) if model else ""
+        paths = [cslmatch.obj_for_drawing(path) for path in (model.paths if model else [])]
+        path = paths[0] if paths else ""
         offset = cslmatch.vert_offset(model) if model else 0.0
-        self._model_cache[callsign] = (path, offset)
+        # model 是 xsb_aircraft.txt 里 OBJ8_AIRCRAFT 的名字：原生插件拿它在
+        # 自己加载的 CSL 里找同一个模型，找不到再按机型/航司自己匹配
+        name = model.name if model else ""
+        self._model_cache[callsign] = (path, offset, paths, name)
         # 带上这次匹配用的机型/航司：#SB 的回复如果恰好落在快照之后、这里
         # 之前，无条件清标记会把那次更新吞掉
         self.traffic.mark_model_clean(callsign,
                                       equipment=entry.get("equipment", ""),
                                       airline=entry.get("airline", ""))
         if model:
-            # 机型还没问到时先用通用模型顶上，半秒后 #SB 回来会再匹配一次并覆盖
-            # 掉它。两行里只有后一行是结论，前一行降到 DEBUG。
-            level = log.debug if not entry.get("equipment") else log.info
-            level("%s (%s/%s) → %s: %s", callsign,
-                     entry.get("equipment") or "?", entry.get("airline") or "?",
+            # 机型还没问到时先用这个顶上，#SB 回来后会再匹配一次并覆盖。两行都
+            # 留在 INFO：#SB 一直不回的话，前一行就是用户看到的那架飞机
+            log.info("%s (%s/%s) → %s: %s", callsign,
+                     entry.get("equipment") or "机型未知", airline or "?",
                      model.name, why)
         else:
             log.debug("no model available for %s: %s", callsign, why)
-        return path, offset
+        return path, offset, paths, name
 
     # ---------- 槽 ----------
     def on_sim_state(self, connected, message):
@@ -1471,7 +1521,7 @@ class SettingsDialog(QDialog):
         """探测一次，把三行文字和按钮的状态一起刷新。
 
         探测是纯读文件，很便宜，所以每次开对话框、每次选目录、每次装完都重来
-        一遍——记着上一次的结果会在用户中途装了 XPPython3 之后继续说"没装"。
+        一遍——记着上一次的结果会在用户中途手工拷了插件之后继续说"没装"。
         """
         status = xpinstall.inspect(self.settings.xplane_path)
         self._plugin = status
@@ -1486,15 +1536,18 @@ class SettingsDialog(QDialog):
                    xpinstall.CURRENT: "plugin.current"}[status.state]
             self.plugin_status.setText(t(key, path=status.root))
 
-        # 提示行按严重程度排：协议对不上是静默失效，最该先说；其次是没装
-        # XPPython3——那种情况下装了插件也不会被加载。
+        # 提示行按严重程度排：协议对不上是静默失效，最该先说；其次是这个包
+        # 根本没带插件；再次是旧的 Python 插件还在——它和原生插件抢端口。
         if status.protocol_mismatch:
             self.plugin_hint.setText(t("plugin.protocol_mismatch",
                                        installed=status.installed_protocol,
                                        bundled=status.bundled_protocol))
             self.plugin_hint.setStyleSheet(f"color: {theme.MUTED_COLOR};")
-        elif status.can_install and not status.xppython3:
-            self.plugin_hint.setText(t("plugin.no_xppython3"))
+        elif status.state not in (xpinstall.NO_ROOT, xpinstall.NOT_XPLANE) and not status.bundled:
+            self.plugin_hint.setText(t("plugin.not_bundled"))
+            self.plugin_hint.setStyleSheet(f"color: {theme.MUTED_COLOR};")
+        elif status.legacy_python:
+            self.plugin_hint.setText(t("plugin.legacy_python"))
             self.plugin_hint.setStyleSheet(f"color: {theme.ACTIVE_COLOR};")
         else:
             self.plugin_hint.setText("")

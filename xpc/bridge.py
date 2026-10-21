@@ -1,21 +1,28 @@
 """客户端和 X-Plane 插件之间的本地通道。
 
-插件为什么要单独一个进程：X-Plane 的绘图 API 只有插件够得着，而插件跑在
-X-Plane 自己的 Python 里（XPPython3），装的包和我们客户端那套不是一回事——
-把 PyQt6、pymumble、pyaudio 塞进 X-Plane 进程里既装不动也不该装。
+插件为什么要单独一个进程：X-Plane 的绘图 API 只有插件够得着。插件现在是
+原生的 `native_plugin/`（XPC_for_CAN，照搬 swift 的 xswiftbus + xplanemp2），
+X-Plane 直接加载，不需要 XPPython3；PyQt6、pymumble、pyaudio 本来也不该进
+X-Plane 的进程。
 
-所以分工是：
+所以分工和 swift 一样：
 
-    客户端  收 FSD、算插值、匹配模型      ← 复杂的部分，在这里能测
-    插件    照着给的数据画 + 写 TCAS      ← 薄，改动少，不用反复重启 X-Plane
+    客户端  收 FSD、算插值、挑模型名        ← 复杂的部分，在这里能测
+    插件    按 CSL 包加载/匹配模型、画、写 TCAS
+
+每一帧带上设置里的 CSL 目录（`csl`），每架飞机带上积分到现在的位姿
+（`pose`）、xsb_aircraft.txt 里的模型名（`model`）和机型/航司/涂装——swift
+的 addPlane / setPlanesPositions / setPlanesSurfaces / setPlanesTransponders
+那几个 D-Bus 调用，换成了这里的一帧 JSON。
 
 协议是**每行一个 JSON**，UDP 发到本机。选 UDP 不选 TCP 是因为这是纯位置流：
 丢一帧下一帧就补上了，为了可靠性去排队反而会积压出延迟。插件那边永远只认最后
 收到的一帧。
 
-每架飞机送的是它**最新的样本**，不是积分好的位置：上报的位置姿态（`target`）、
-速度、角速度，加两个序号。插件自己按 xPilot 的运动模型逐帧积分——只有它知道
-每一帧什么时候画。序号的意思见 `SampleTable`。
+每架飞机同时带着它**最新的样本**：上报的位置姿态（`target`）、速度、角速度，
+加两个序号（序号的意思见 `SampleTable`）。旧的 Python 插件（plugin/，已不再
+随包分发）靠这些自己逐帧积分；原生插件用 `pose`，只在 `pose` 缺失时退回
+`target`。
 
 一帧超过一个 UDP 包时按 seq/part/total 分片——64 架飞机的 JSON 能到十几 KB，
 本机回环 MTU 通常够，但不能赌。
@@ -140,6 +147,10 @@ class BridgeSender:
         self.address = (host, port)
         self.sequence = 0
         self._socket = None
+        # 设置里的 CSL 目录。原生插件（xplanemp2）自己加载模型、自己匹配，
+        # 所以每一帧都带上它：插件晚于客户端启动、或者用户中途改了目录，
+        # 下一帧就能跟上
+        self.csl_path = ""
 
     def _ensure(self):
         if self._socket is None:
@@ -160,7 +171,10 @@ class BridgeSender:
             return False
 
     def send_traffic(self, entries, own=None):
-        return self.send({"type": "traffic", "aircraft": entries, "own": own})
+        message = {"type": "traffic", "aircraft": entries, "own": own}
+        if self.csl_path:
+            message["csl"] = self.csl_path
+        return self.send(message)
 
     def close(self):
         if self._socket:

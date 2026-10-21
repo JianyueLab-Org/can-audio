@@ -21,3 +21,6 @@ rnnoise.dll
 librnnoise.dylib
 native/rnnoise/work/
 native/rnnoise/out/
+
+# 原生 X-Plane 插件的 cmake 输出
+xpc/native_plugin/build/
