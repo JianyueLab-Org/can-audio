@@ -209,7 +209,11 @@ jobs:
           Invoke-WebRequest -Uri "https://developer.x-plane.com/wp-content/plugins/code-sample-generation/sdk_zip_files/XPSDK430.zip" -OutFile "$env:RUNNER_TEMP\XPSDK430.zip"
           Expand-Archive "$env:RUNNER_TEMP\XPSDK430.zip" -DestinationPath "$env:RUNNER_TEMP\xpsdk" -Force
           $sdk = Get-ChildItem "$env:RUNNER_TEMP\xpsdk" -Directory | Select-Object -First 1
-          cmake -S native_plugin -B native_plugin/build -DXPLANE_SDK="$($sdk.FullName)" -G "Visual Studio 17 2022" -A x64
+          # 不写 -G：windows-latest 已换成 windows-2025-vs2026，上面没有 VS 2022，
+          # 写死 "Visual Studio 17 2022" 会在配置阶段直接报找不到。让 CMake 挑机器
+          # 上最新的 VS，和 native/rnnoise/build.ps1 一样。
+          cmake -S native_plugin -B native_plugin/build -DXPLANE_SDK="$($sdk.FullName)" -A x64
+          if ($LASTEXITCODE -ne 0) { throw "原生插件 cmake 配置失败" }
           cmake --build native_plugin/build --config Release
           if ($LASTEXITCODE -ne 0) { throw "原生插件编译失败" }
           if (-not (Test-Path native_plugin/build/package/XPC_for_CAN/64/win.xpl)) {
