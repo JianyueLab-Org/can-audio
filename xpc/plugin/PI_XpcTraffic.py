@@ -624,6 +624,10 @@ class RenderedAircraft(NetworkAircraft):
         self.object_path = ""
         self.object_ref = None
         self.instance = None
+        self.object_refs = []
+        self.instances = []
+        self.pending_objects = 0
+        self.loaded_objects = []
         self.loading = False
         # 每发起一次异步加载加一。回调带着发起时的号回来，对不上就说明这次
         # 加载已经被更新的一次顶掉了——直接卸掉，别覆盖 instance（否则旧
@@ -631,18 +635,22 @@ class RenderedAircraft(NetworkAircraft):
         self.load_generation = 0
 
     def destroy(self):
-        if self.instance is not None and xp:
-            try:
-                xp.destroyInstance(self.instance)
-            except Exception:
-                pass
+        if xp:
+            for instance in self.instances or ([self.instance] if self.instance is not None else []):
+                try:
+                    xp.destroyInstance(instance)
+                except Exception:
+                    pass
         self.instance = None
-        if self.object_ref is not None and xp:
-            try:
-                xp.unloadObject(self.object_ref)
-            except Exception:
-                pass
+        self.instances = []
+        if xp:
+            for object_ref in self.object_refs or ([self.object_ref] if self.object_ref is not None else []):
+                try:
+                    xp.unloadObject(object_ref)
+                except Exception:
+                    pass
         self.object_ref = None
+        self.object_refs = []
 
 
 class PythonInterface:
@@ -870,21 +878,39 @@ class PythonInterface:
                 aircraft = RenderedAircraft(callsign)
                 self.aircraft[callsign] = aircraft
             aircraft.accept(entry, now)
-            self._ensure_model(aircraft, entry.get("object") or "")
+            self._ensure_model(aircraft, entry.get("objects") or entry.get("object") or "")
 
         for callsign in [c for c in self.aircraft if c not in order]:
             self.aircraft.pop(callsign).destroy()
         self.order = order
 
     def _ensure_model(self, aircraft, wanted):
-        if wanted and wanted != aircraft.object_path:
+        if isinstance(wanted, str):
+            wanted = [wanted] if wanted else []
+        wanted = [path for path in wanted if path]
+        model_key = "\x00".join(wanted)
+        if model_key and model_key != aircraft.object_path:
             # 客户端换了匹配结果（多半是机型问到了），换模型
             aircraft.destroy()
-            aircraft.object_path = wanted
+            aircraft.object_path = model_key
             aircraft.loading = True
             aircraft.load_generation += 1
-            xp.loadObjectAsync(self._object_path(wanted), self._object_loaded,
-                               (aircraft.callsign, aircraft.load_generation))
+            aircraft.pending_objects = len(wanted)
+            aircraft.loaded_objects = []
+            for path in wanted:
+                xp.loadObjectAsync(self._object_path(path), self._object_loaded,
+                               (aircraft.callsign, aircraft.load_generation, path))
+
+    def _drop_failed_model(self, aircraft, generation):
+        if generation == aircraft.load_generation:
+            for _, object_ref in aircraft.loaded_objects:
+                try:
+                    xp.unloadObject(object_ref)
+                except Exception:
+                    pass
+            aircraft.loading = False
+            aircraft.pending_objects = 0
+            aircraft.loaded_objects = []
 
     def _terrain_elevation(self, latitude, longitude):
         """脚下本地地形的高度（英尺），探不到返回 None。xPilot 的 TerrainProbe。
@@ -920,7 +946,9 @@ class PythonInterface:
             x, y, z = xp.worldToLocal(state["latitude"], state["longitude"],
                                       state["altitude"] * METRES_PER_FOOT)
             drawn.append((aircraft, state, (x, y, z)))
-            if aircraft.instance is None:
+            instances = aircraft.instances or ([aircraft.instance]
+                                                if aircraft.instance is not None else [])
+            if not instances:
                 continue
             # CSL 模型的原点不在轮子底下：VERT_OFFSET（米）把它抬到起落架上
             # （XPMP2 的 GetVertOfs）。只抬画的那份，TCAS 用真高。
@@ -929,10 +957,10 @@ class PythonInterface:
             except (TypeError, ValueError):
                 lift = 0.0
             # 注意顺序是 (x, y, z, pitch, heading, roll)——heading 在 roll 前面
-            xp.instanceSetPosition(
-                aircraft.instance,
-                (x, y + lift, z, state["pitch"], state["heading"], state["bank"]),
-                self._animation_values(aircraft.entry, aircraft.surfaces()))
+            position = (x, y + lift, z, state["pitch"], state["heading"], state["bank"])
+            values = self._animation_values(aircraft.entry, aircraft.surfaces())
+            for instance in instances:
+                xp.instanceSetPosition(instance, position, values)
         self._write_tcas(drawn[:MAX_TCAS_TARGETS])
 
     @staticmethod
@@ -955,7 +983,7 @@ class PythonInterface:
 
     def _object_loaded(self, object_ref, refcon):
         """loadObjectAsync 的回调。加载期间飞机可能已经走了，或又换过模型。"""
-        callsign, generation = refcon
+        callsign, generation, path = refcon
         aircraft = self.aircraft.get(callsign)
         if (aircraft is None or object_ref is None
                 or generation != aircraft.load_generation):
@@ -965,11 +993,17 @@ class PythonInterface:
                 # 不留这行日志的话，"TCAS 有目标、窗外没飞机"完全没法查
                 xp.log(f"could not load the CSL object for {callsign}: "
                        f"{aircraft.object_path}")
-                aircraft.loading = False
+                self._drop_failed_model(aircraft, generation)
+            return
+        aircraft.loaded_objects.append((path, object_ref))
+        if len(aircraft.loaded_objects) < aircraft.pending_objects:
             return
         aircraft.loading = False
-        aircraft.object_ref = object_ref
-        aircraft.instance = xp.createInstance(object_ref, ANIMATION_DATAREFS)
+        aircraft.object_refs = [ref for _, ref in aircraft.loaded_objects]
+        aircraft.instances = [xp.createInstance(ref, ANIMATION_DATAREFS)
+                              for ref in aircraft.object_refs]
+        aircraft.object_ref = aircraft.object_refs[0]
+        aircraft.instance = aircraft.instances[0]
 
     @staticmethod
     def _animation_values(entry, surfaces=None):

@@ -1,0 +1,137 @@
+name: XPC test release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: xpc-test-release
+  cancel-in-progress: false
+
+env:
+  PYTHONUTF8: '1'
+
+jobs:
+  build:
+    name: Build XPC for CAN
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      - name: Build rnnoise
+        shell: pwsh
+        run: |
+          ./native/rnnoise/build.ps1 -Out native/rnnoise/out
+          Copy-Item native/rnnoise/out/rnnoise.dll xpc/rnnoise.dll
+
+      - name: Download X-Plane SDK
+        shell: pwsh
+        run: |
+          Invoke-WebRequest `
+            -Uri "https://developer.x-plane.com/wp-content/plugins/code-sample-generation/sdk_zip_files/XPSDK430.zip" `
+            -OutFile "$env:RUNNER_TEMP\XPSDK430.zip"
+          Expand-Archive "$env:RUNNER_TEMP\XPSDK430.zip" `
+            -DestinationPath "$env:RUNNER_TEMP\xpsdk" -Force
+          $sdk = Get-ChildItem "$env:RUNNER_TEMP\xpsdk" -Directory | Select-Object -First 1
+          "XPLANE_SDK=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8
+
+      - name: Build native X-Plane plugin
+        working-directory: xpc
+        shell: pwsh
+        # Before pyinstaller: gui.spec bundles native_plugin/build/package/XPC_for_CAN
+        run: |
+          # No -G: windows-latest is windows-2025-vs2026 and has no VS 2022;
+          # let CMake pick the newest Visual Studio, as native/rnnoise/build.ps1 does.
+          cmake -S native_plugin -B native_plugin/build `
+            -DXPLANE_SDK="$env:XPLANE_SDK" -A x64
+          if ($LASTEXITCODE -ne 0) { throw "native X-Plane plugin failed to configure" }
+          cmake --build native_plugin/build --config Release
+          if ($LASTEXITCODE -ne 0) { throw "native X-Plane plugin failed to compile" }
+          if (-not (Test-Path native_plugin/build/package/XPC_for_CAN/64/win.xpl)) {
+            throw "native X-Plane plugin was not built"
+          }
+
+      - name: Build XPC client
+        working-directory: xpc
+        env:
+          CAN_VERSION: 2.2.0-test.${{ github.run_number }}
+        shell: pwsh
+        run: pyinstaller gui.spec --noconfirm --clean
+
+      - name: Assemble test package
+        working-directory: xpc
+        shell: pwsh
+        run: |
+          $root = "dist/xpc-for-can"
+          $plugins = "$root/X-Plane plugin"
+          New-Item -ItemType Directory -Force -Path $plugins | Out-Null
+          Copy-Item -Recurse -Force native_plugin/build/package/XPC_for_CAN $plugins
+          Copy-Item native_plugin/README.md "$plugins/README.md"
+          Compress-Archive -Path "$root/*" -DestinationPath "dist/xpc-for-can-test.zip" -Force
+          Compress-Archive -Path "$plugins/*" -DestinationPath "dist/XPC_for_CAN-plugin.zip" -Force
+
+      - name: Verify package
+        working-directory: xpc
+        shell: pwsh
+        run: |
+          $missing = @()
+          if (-not (Test-Path dist/xpc-for-can/xpc-for-can.exe)) { $missing += "xpc-for-can.exe" }
+          foreach ($f in @("64/win.xpl", "LegacyData/related.txt", "LegacyData/Doc8643.txt")) {
+            if (-not (Test-Path "dist/xpc-for-can/_internal/native_plugin/XPC_for_CAN/$f")) {
+              $missing += "_internal/native_plugin/XPC_for_CAN/$f"
+            }
+            if (-not (Test-Path "dist/xpc-for-can/X-Plane plugin/XPC_for_CAN/$f")) {
+              $missing += "X-Plane plugin/XPC_for_CAN/$f"
+            }
+          }
+          $xpl = [System.IO.File]::ReadAllBytes((Resolve-Path "dist/xpc-for-can/X-Plane plugin/XPC_for_CAN/64/win.xpl"))
+          if (-not ([System.Text.Encoding]::ASCII.GetString($xpl) -match "XPC_BRIDGE_PROTOCOL=\d+")) {
+            $missing += "protocol marker in win.xpl"
+          }
+          if (-not (Test-Path dist/xpc-for-can-test.zip)) { $missing += "xpc-for-can-test.zip" }
+          if ($missing.Count) { throw "missing from the package: $($missing -join ', ')" }
+
+      - name: Create test release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: xpc-test-${{ github.run_number }}
+          # Tag the commit that was built, not the default branch
+          target_commitish: ${{ github.sha }}
+          name: XPC for CAN test ${{ github.run_number }}
+          prerelease: true
+          generate_release_notes: true
+          body: |
+            Test-only XPC for CAN build.
+
+            This release contains only the X-Plane client and the native X-Plane
+            plugin (swift xswiftbus/xplanemp2 port, no XPPython3 needed).
+            It does not deploy or update the voice server.
+
+            - `xpc-for-can-test.zip` — the client; install the plugin from
+              Settings → Traffic, or copy `X-Plane plugin/XPC_for_CAN` by hand.
+            - `XPC_for_CAN-plugin.zip` — the plugin folder alone, with the
+              README on where to put CSL models (X-CSL etc.).
+          files: |
+            xpc/dist/xpc-for-can-test.zip
+            xpc/dist/XPC_for_CAN-plugin.zip

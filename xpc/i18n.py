@@ -271,13 +271,14 @@ TEXT = {
                                        "version {installed}, this client speaks "
                                        "{bundled} — until it is updated no traffic will "
                                        "appear at all, and nothing will report an error."},
-    "plugin.no_xppython3":  {"zh": "还没装 XPPython3，装了插件也不会被加载。"
-                                   "X-Plane 12 装 v4.x，X-Plane 11.52 装 v3.1.5"
-                                   "（v4 不兼容 XP11）：https://xppython3.readthedocs.io",
-                             "en": "XPPython3 is not installed, so the plugin will not be "
-                                   "loaded. X-Plane 12 needs v4.x, X-Plane 11.52 needs "
-                                   "v3.1.5 (v4 does not work on XP11): "
-                                   "https://xppython3.readthedocs.io"},
+    "plugin.legacy_python": {"zh": "检测到旧的 Python 插件（PythonPlugins/PI_XpcTraffic.py），"
+                                   "它和原生插件抢同一个端口。安装时会把它删掉。",
+                             "en": "The old Python plugin (PythonPlugins/PI_XpcTraffic.py) "
+                                   "is installed and takes the same port as the native "
+                                   "plugin. Installing removes it."},
+    "plugin.not_bundled":   {"zh": "这个版本没有带原生插件（打包时没编译出来），装不了。",
+                             "en": "This build does not include the native plugin (it was "
+                                   "not compiled when packaging), so it cannot be installed."},
     "plugin.installed":     {"zh": "已装好", "en": "Installed"},
     "plugin.installed_body": {"zh": "插件已装到\n{path}\n\n重启 X-Plane 后生效。",
                               "en": "The plugin was installed to\n{path}\n\nRestart "
@@ -370,30 +371,34 @@ TEXT = {
     "settings.csl_pick":    {"zh": "选择 CSL 模型目录", "en": "Choose the CSL model folder"},
     "settings.range":       {"zh": "显示范围", "en": "Range"},
     "settings.range_suffix": {"zh": " 海里", "en": " NM"},
-    "settings.traffic_note": {"zh": "他机要画进 X-Plane，得先装 XPPython3——装哪个版本"
-                                    "取决于模拟器：\n"
-                                    "    X-Plane 12    → XPPython3 v4.x\n"
-                                    "    X-Plane 11.52 → XPPython3 v3.1.5（v4 不兼容 XP11）\n"
-                                    "插件本身用下面那个按钮装，不用自己拷文件。\n\n"
+    "settings.traffic_note": {"zh": "他机由原生插件画进 X-Plane（XPC_for_CAN，"
+                                    "用的是 swift 的 xplanemp2 渲染），不需要 XPPython3。\n"
+                                    "插件本身用下面那个按钮装，不用自己拷文件。\n"
+                                    "上面的 CSL 模型目录会在连上之后交给插件加载，"
+                                    "机型、航司、涂装由插件按 CSL 包自己匹配。\n"
+                                    "没选的话，自动用 X-Plane 插件目录里给 IVAO / xPilot "
+                                    "装好的那份（IVAO_CSL\\CSL、xPilot\\Resources\\CSL 等）。"
+                                    "换了目录要重启 X-Plane 才完全生效。\n\n"
                                     "没装模型也能用——他机仍然会出现在 TCAS 和 ND 上，"
                                     "只是看不到机身。\n"
-                                    "TCAS 需要 X-Plane 11.50 以上；更老的版本只会把飞机"
-                                    "画出来。\n"
                                     "同时开着 LiveTraffic 之类的插件会互相抢 AI 机位，"
                                     "建议只开一个。",
-                              "en": "To draw other aircraft in X-Plane you first need "
-                                    "XPPython3 — which version depends on the "
-                                    "simulator:\n"
-                                    "    X-Plane 12    → XPPython3 v4.x\n"
-                                    "    X-Plane 11.52 → XPPython3 v3.1.5 (v4 does not "
-                                    "work on XP11)\n"
+                              "en": "Other aircraft are drawn by a native X-Plane plugin "
+                                    "(XPC_for_CAN, rendering with swift's xplanemp2) — "
+                                    "XPPython3 is not needed.\n"
                                     "The plugin itself installs with the button below — "
-                                    "no need to copy files by hand.\n\n"
+                                    "no need to copy files by hand.\n"
+                                    "The CSL folder above is handed to the plugin once "
+                                    "connected; it matches type, airline and livery "
+                                    "against the CSL packages itself.\n"
+                                    "If none is chosen, the one already installed for "
+                                    "IVAO / xPilot in X-Plane's plugins folder is used "
+                                    "(IVAO_CSL\\CSL, xPilot\\Resources\\CSL, ...). After "
+                                    "switching folders, restart X-Plane for it to fully "
+                                    "apply.\n\n"
                                     "It works without models too — other aircraft still "
                                     "show up on TCAS and the ND,\nyou just cannot see the "
                                     "airframe.\n"
-                                    "TCAS needs X-Plane 11.50 or newer; older versions "
-                                    "only draw the aircraft.\n"
                                     "Running LiveTraffic or a similar plugin at the same "
                                     "time fights over the AI slots —\nbetter to run only "
                                     "one."},
