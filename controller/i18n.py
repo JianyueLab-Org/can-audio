@@ -56,8 +56,10 @@ TEXT = {
     "login.failed":         {"zh": "连接失败", "en": "Connection failed"},
 
     # ---------- 主界面顶栏 ----------
-    "main.connected":       {"zh": "已连接", "en": "Connected"},
-    "main.disconnected":    {"zh": "已断开", "en": "Disconnected"},
+    "main.connected":       {"zh": "语音：已连接", "en": "Voice: connected"},
+    "main.connected_transport": {"zh": "语音：已连接（{transport}） · {latency} ms",
+                                  "en": "Voice: connected ({transport}) · {latency} ms"},
+    "main.disconnected":    {"zh": "语音：已断开", "en": "Voice: disconnected"},
     "main.pin":             {"zh": "置顶", "en": "Pin"},
     "main.pin_tip":         {"zh": "让窗口一直显示在其它窗口上面",
                              "en": "Keep this window above all others"},

@@ -364,11 +364,22 @@ class VoiceClient:
             except Exception as e:
                 log.warning(f"status callback raised: {e}")
 
+    def transport_status(self):
+        """Return the active audio transport and its latest keepalive RTT."""
+        mumble = self.mumble
+        if mumble is None:
+            return None, None
+        if getattr(mumble, "udp_active", False):
+            stats = getattr(mumble, "udp_ping_stats", {})
+            return "UDP", stats.get("avg")
+        stats = getattr(mumble, "ping_stats", {})
+        return "TCP", stats.get("avg")
+
     # ---------- 被踢 ----------
     def _on_user_removed(self, user, event=None):
         """有人离开了。只关心一种：**我们自己被踢了**。
 
-        pymumble 把这条回调的两种情形分得很清楚（见 client/API.md）：用户自己走
+        pymumble 把这条回调的两种情形分得很清楚：用户自己走
         的话 event 里只有 `session`；被踢或被封才会多出 `actor`、`reason` 和
         `ban`。所以"是不是被踢"是可以判的，而 DISCONNECTED 回调判不了 —— 它不
         带任何理由，被顶下线和网络抖动在那儿长得一模一样，于是客户端一律重连。
@@ -425,6 +436,9 @@ class VoiceClient:
                                            password=self.password,
                                            port=self.port,
                                            reconnect=True)
+            # 不传 udp=：pymumble-udp 默认就是 udp=True（加密 UDP，不通就退回
+            # TCP 隧道），而 PyPI 的 pymumble 不认这个参数——显式传的话，用旧
+            # 环境从源码跑的人语音会直接 TypeError，界面上只看到"连接失败"。
             self.mumble.reconnect_limit = self.reconnect_limit
             self.mumble.on_reconnect = self._on_reconnect_attempt
             self.mumble.set_receive_sound(True)

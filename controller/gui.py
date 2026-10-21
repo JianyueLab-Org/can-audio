@@ -446,6 +446,9 @@ class ControllerWindow(QMainWindow):
 
         self.datafeed_timer = QTimer(self)
         self.datafeed_timer.timeout.connect(self.refresh_datafeed)
+        self.voice_status_timer = QTimer(self)
+        self.voice_status_timer.timeout.connect(self.refresh_voice_status)
+        self.voice_status_timer.start(1000)
 
         self.setup_ui()
         self.setup_ptt()
@@ -737,8 +740,27 @@ class ControllerWindow(QMainWindow):
     def _set_connection_style(self, connected):
         color = ONLINE_COLOR if connected else OFFLINE_COLOR
         self.conn_indicator.set_color(color)
-        self.conn_label.setText(t("main.connected") if connected else t("main.disconnected"))
+        self.conn_label.setText(self._voice_connection_text() if connected
+                                else t("main.disconnected"))
         self.conn_label.setStyleSheet(f"color: {color};")
+
+    def _voice_connection_text(self):
+        if not self.voice:
+            return t("main.connected")
+        try:
+            status = self.voice.transport_status()
+            if not isinstance(status, tuple) or len(status) != 2:
+                return t("main.connected")
+            transport, rtt = status
+        except (AttributeError, TypeError, ValueError):
+            return t("main.connected")
+        if transport is None:
+            return t("main.connected")
+        return t("main.connected_transport", transport=transport,
+                 latency="--" if rtt is None else f"{rtt:.0f}")
+
+    def refresh_voice_status(self):
+        self._set_connection_style(bool(self.voice and self.voice.connected))
 
     def _set_ptt_style(self, active):
         self.ptt_indicator.set_color(ACTIVE_COLOR if active else IDLE_COLOR)
@@ -1112,6 +1134,7 @@ class ControllerWindow(QMainWindow):
         if self.voice:
             self.voice.disconnect()
             self.voice = None
+        self.refresh_voice_status()
         # 值班锁和发话许可来自数据源，而数据源定时器刚停了：不复位的话，
         # 上一班锁住的频率断开后还是删不掉，提示写着"你正在扇区里管它"。
         self.stack.set_locked(None)

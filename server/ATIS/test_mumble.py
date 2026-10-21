@@ -415,8 +415,7 @@ class CompatPatchTest(unittest.TestCase):
     # server/ATIS ↔ xpc，于是两个 legacy 飞行员端悄悄停在了老版本上——只有
     # ssl.wrap_socket 那一半，没有 patch_send()，也就是说"一发话就掉线"那个病
     # 在它们身上一直还在，而没有任何测试会发现。
-    COMPONENTS = ("client", "xplane_client", "controller", "atis",
-                  "xpc", "msfs")
+    COMPONENTS = ("controller", "atis", "xpc", "msfs")
 
     def test_the_copy_matches_the_clients(self):
         """mumblecompat.py 必须和**每一个**客户端那份逐字节相同。

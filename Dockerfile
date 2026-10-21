@@ -28,9 +28,11 @@
 #    `import serverconf`，缺了它容器起来就退出；而 login.py 不在的时候
 #    Murmur 会回落到自己的空账号库，所有人登录被拒、客户端显示的是"密码错误"。
 #
-# 基础镜像刻意钉死版本而不是用 latest：整份文件依赖 mumble-server ≥ 1.4
-# （频道监听的 Listen 权限是 1.4 才有的，1.3 上管制端听不到非主频道），而
-# latest 会漂。换别的基础镜像只有这一条要求，下面的 RUN 会当场校验。
+# 基础镜像刻意钉死版本而不是用 latest：整份文件依赖 mumble-server ≥ 1.5
+# （频道监听的 Listen 权限是 1.4 才有的，1.3 上管制端听不到非主频道；客户端
+# 用的 pymumble-udp 只发 1.5 的 protobuf 音频格式，1.4 收到也不认，所有人
+# 互相听不见），而 latest 会漂。换别的基础镜像只有这一条要求，下面的 RUN 会
+# 当场校验。
 FROM ubuntu:26.04
 
 # 避免交互式提示
@@ -87,10 +89,10 @@ RUN set -eu; \
         echo "读不出 mumble-server 的版本号（不是 dpkg 装的？），跳过版本校验" >&2; \
     else \
         major="${ver%%.*}"; rest="${ver#*.}"; minor="${rest%%.*}"; \
-        if [ "$major" -lt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -lt 4 ]; }; then \
-            echo "mumble-server $ver 太老。频道监听（Listen 权限）是 1.4 才加的," >&2; \
-            echo "在 1.3 上管制端除了主频道以外全是静音，而且客户端毫无提示。" >&2; \
-            echo "换一个带 mumble-server >= 1.4 的基础镜像。" >&2; \
+        if [ "$major" -lt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -lt 5 ]; }; then \
+            echo "mumble-server $ver 太老。客户端只发 1.5 的 protobuf 音频格式，" >&2; \
+            echo "更老的服务器收到也不认，所有人互相听不见，而且客户端毫无提示。" >&2; \
+            echo "换一个带 mumble-server >= 1.5 的基础镜像。" >&2; \
             exit 1; \
         fi; \
     fi; \

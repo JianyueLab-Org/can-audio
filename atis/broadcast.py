@@ -616,7 +616,7 @@ class Broadcaster:
     def _on_user_removed(self, user, event=None):
         """有人离开了。只关心一种：**我们自己被踢了**。
 
-        pymumble 把这条回调的两种情形分得很清楚（见 client/API.md）：用户自己走
+        pymumble 把这条回调的两种情形分得很清楚：用户自己走
         的话 event 里只有 `session`；被踢或被封才会多出 `actor`、`reason` 和
         `ban`。所以"是不是被踢"是可以判的，而 DISCONNECTED 回调判不了 —— 它不
         带任何理由，被顶下线和网络抖动在那儿长得一模一样，于是客户端一律重连。

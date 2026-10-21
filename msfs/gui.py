@@ -570,6 +570,9 @@ class MsfsWindow(QMainWindow):
     # ---------- 定时 ----------
     def tick(self):
         """每 0.5 秒：把模拟器的数据分发到 FSD 和语音。"""
+        if self.voice and getattr(self.voice, "connected", True):
+            self.voice_label.setText(self._voice_connection_text())
+
         # FSDPilot keeps its public running flag for its reconnect loop. A first
         # connection failure can end that worker without clearing the flag, so
         # use the worker thread as the liveness source before recovery.
@@ -906,8 +909,11 @@ class MsfsWindow(QMainWindow):
                   'offline': theme.MUTED_COLOR}.get(state, theme.ACTIVE_COLOR)
         keys = {'online': "voicebar.online", 'reconnecting': "voicebar.reconnecting",
                 'offline': "voicebar.offline"}
-        self.voice_label.setText(t(keys[state]) if state in keys
-                                 else t("voicebar.other", state=state))
+        if state == 'online':
+            self.voice_label.setText(self._voice_connection_text(source))
+        else:
+            self.voice_label.setText(t(keys[state]) if state in keys
+                                     else t("voicebar.other", state=state))
         self.voice_label.setStyleSheet(f"color: {colour};")
         self.add_message(t("msg.voice", message=message), colour)
 
@@ -941,6 +947,22 @@ class MsfsWindow(QMainWindow):
                 threading.Thread(target=voice.stop, daemon=True).start()
             self.connect_button.setText(
                 t("connect.disconnect") if self.fsd else t("connect.connect"))
+
+    def _voice_connection_text(self, source=None):
+        voice = source or self.voice
+        if voice is None:
+            return t("voicebar.online")
+        try:
+            status = voice.transport_status()
+            if not isinstance(status, tuple) or len(status) != 2:
+                return t("voicebar.online")
+            transport, rtt = status
+        except (AttributeError, TypeError, ValueError):
+            return t("voicebar.online")
+        if transport is None:
+            return t("voicebar.online")
+        return t("voicebar.online_transport", transport=transport,
+                 latency="--" if rtt is None else f"{rtt:.0f}")
 
     def _link_gone(self, key):
         """一条链路彻底下线之后：另一条还在就说一句、留着它；都没了才整个断开。"""

@@ -12,9 +12,8 @@
 # 而那个提交又会触发这个工作流，自己咬自己。数标签没有这个问题——标签就是
 # 已发布版本的唯一事实来源。
 #
-# 打包的四个：client/ 和 xplane_client/ 是早期的纯语音飞行员端，已经被 xpc/
-# 和 msfs/ 取代（那两个还会登录 FSD 让飞机出现在网络上），不再出包。但它们的
-# 测试照跑——共享 FREQ_* 频道约定和 Mumble 处理，回归了同样要知道。
+# 打包的四个：controller/、atis/、xpc/ 和 msfs/。它们覆盖管制、通播、X-Plane
+# 飞行员和 MSFS 飞行员客户端。
 #
 # 只能在 Windows 上打：PyAudio、SimConnect、opus.dll 都是 Windows 的，
 # PyInstaller 也不支持交叉编译。
@@ -119,14 +118,12 @@ jobs:
         run: |
           # opuslib 是运行时用 ctypes 加载 opus 的。组件目录里各自带了一份
           # opus.dll，但那不在 DLL 搜索路径上，CI 上 find_library 也找不到系统
-          # 的——client / xplane_client / server\ATIS 的测试会在收集阶段就
-          # "Could not find Opus library" 整个模块失败。pyogg 的 wheel 里带着
-          # Windows 版的，指给它。
+          # 的——server\ATIS 的测试会在收集阶段就 "Could not find Opus library"
+          # 整个模块失败。pyogg 的 wheel 里带着 Windows 版的，指给它。
           $pyogg = python -c "import os, pyogg; print(os.path.dirname(pyogg.__file__))"
           $env:PATH = "$pyogg;$env:PATH"
 
-          $dirs = @("atis", "client", "controller", "msfs", "server",
-                    "server/ATIS", "xpc", "xplane_client")
+          $dirs = @("atis", "controller", "msfs", "server", "server/ATIS", "xpc")
           $failed = @()
           foreach ($d in $dirs) {
             Write-Output "::group::$d"
@@ -146,7 +143,7 @@ jobs:
           $pyogg = python -c "import os, pyogg; print(os.path.dirname(pyogg.__file__))"
           $env:PATH = "$pyogg;$env:PATH"
 
-          foreach ($d in @("atis", "controller", "client", "msfs", "xpc", "xplane_client")) {
+          foreach ($d in @("atis", "controller", "msfs", "xpc")) {
             Write-Output "::group::$d smoke"
             Push-Location $d
             python smoke_gui.py

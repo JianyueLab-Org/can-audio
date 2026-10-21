@@ -100,6 +100,7 @@ a = Analysis(
     ] + find_native_plugin(),
     hiddenimports=[
         'pymumble_py3',
+        'pymumble_py3.MumbleUDP_pb2',
         'google.protobuf',
         # Fluent 外观
         'qfluentwidgets',

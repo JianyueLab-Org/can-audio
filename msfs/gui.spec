@@ -102,6 +102,7 @@ a = Analysis(
     datas=[('favicon.ico', '.'), ('buildinfo.json', '.')],
     hiddenimports=[
         'pymumble_py3',
+        'pymumble_py3.MumbleUDP_pb2',
         'google.protobuf',
         # Fluent 外观
         'qfluentwidgets',

@@ -1655,7 +1655,7 @@ class KickedTest(unittest.TestCase):
     完 —— 构造上的死循环。Murmur 那边看到同一个 IP 每几秒连一次，最后 autoban
     把它整个封掉，于是那台机器彻底连不上。
 
-    能判出"被踢"是因为 pymumble 把两种情形分开了（client/API.md）：自己走的话
+    能判出"被踢"是因为 pymumble 把两种情形分开了：自己走的话
     UserRemove 里只有 session，被踢才会多出 actor / reason / ban。DISCONNECTED
     回调判不了这个 —— 它不带任何理由，被顶下线和网络抖动在那儿一模一样。
     """
