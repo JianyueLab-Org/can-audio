@@ -199,6 +199,23 @@ jobs:
         shell: pwsh
         run: Copy-Item native/rnnoise/out/rnnoise.dll ${{ matrix.component }}/
 
+      - name: 构建 X-Plane 原生插件
+        if: matrix.component == 'xpc'
+        shell: pwsh
+        working-directory: xpc
+        # 必须在 pyinstaller 之前：gui.spec 把 native_plugin/build/package/XPC_for_CAN
+        # 打进 _internal，设置里的"安装插件"就是从那里拷的。
+        run: |
+          Invoke-WebRequest -Uri "https://developer.x-plane.com/wp-content/plugins/code-sample-generation/sdk_zip_files/XPSDK430.zip" -OutFile "$env:RUNNER_TEMP\XPSDK430.zip"
+          Expand-Archive "$env:RUNNER_TEMP\XPSDK430.zip" -DestinationPath "$env:RUNNER_TEMP\xpsdk" -Force
+          $sdk = Get-ChildItem "$env:RUNNER_TEMP\xpsdk" -Directory | Select-Object -First 1
+          cmake -S native_plugin -B native_plugin/build -DXPLANE_SDK="$($sdk.FullName)" -G "Visual Studio 17 2022" -A x64
+          cmake --build native_plugin/build --config Release
+          if ($LASTEXITCODE -ne 0) { throw "原生插件编译失败" }
+          if (-not (Test-Path native_plugin/build/package/XPC_for_CAN/64/win.xpl)) {
+            throw "原生插件没有编出来"
+          }
+
       - name: 打包 ${{ matrix.output }}
         working-directory: ${{ matrix.component }}
         env:
@@ -211,13 +228,15 @@ jobs:
         if: matrix.component == 'xpc'
         working-directory: ${{ matrix.component }}
         shell: pwsh
-        # 插件本来就随包分发（gui.spec 的 datas），但它落在 _internal/plugin/ 下，
+        # 插件本来就随包分发（gui.spec 的 datas），但它落在 _internal/ 下，
         # 那是 PyInstaller 的运行时目录，正常用户不会去翻，README 也不好指。
         # 客户端设置里能一键装，这一份是给装不成的人手工拷的——权限不够、
         # 绿色版探测不到目录、或者 X-Plane 装在另一台机器上。
         run: |
-          New-Item -ItemType Directory -Force -Path "dist/${{ matrix.output }}/plugin" | Out-Null
-          Copy-Item "plugin/PI_XpcTraffic.py" "dist/${{ matrix.output }}/plugin/"
+          $plugins = "dist/${{ matrix.output }}/X-Plane plugin"
+          New-Item -ItemType Directory -Force -Path $plugins | Out-Null
+          Copy-Item -Recurse -Force native_plugin/build/package/XPC_for_CAN $plugins
+          Copy-Item native_plugin/README.md "$plugins/README.md"
 
       - name: 验原生库和版本号
         working-directory: ${{ matrix.component }}
@@ -240,14 +259,16 @@ jobs:
           }
           if ("${{ matrix.component }}" -eq "xpc") {
             # _internal 里那份是设置里"安装插件"按钮真正拷过去的源文件
-            # （xpinstall.bundled_plugin() 走 sys._MEIPASS）。漏了的话程序照常
-            # 启动，只是一点安装就报"随包的插件不见了"。
-            if (-not (Test-Path "$root/plugin/PI_XpcTraffic.py")) {
-              $missing += "_internal/plugin/PI_XpcTraffic.py"
-            }
-            # 顶层那份是给手工安装用的
-            if (-not (Test-Path "dist/${{ matrix.output }}/plugin/PI_XpcTraffic.py")) {
-              $missing += "plugin/PI_XpcTraffic.py"
+            # （xpinstall.bundled_package() 走 sys._MEIPASS）。漏了的话程序照常
+            # 启动，只是一点安装就报"这个版本没有带原生插件"。
+            foreach ($f in @("64/win.xpl", "LegacyData/related.txt", "LegacyData/Doc8643.txt")) {
+              if (-not (Test-Path "$root/native_plugin/XPC_for_CAN/$f")) {
+                $missing += "_internal/native_plugin/XPC_for_CAN/$f"
+              }
+              # 顶层那份是给手工安装用的
+              if (-not (Test-Path "dist/${{ matrix.output }}/X-Plane plugin/XPC_for_CAN/$f")) {
+                $missing += "X-Plane plugin/XPC_for_CAN/$f"
+              }
             }
           }
           if ($missing.Count) { throw "包里缺这些运行时必需的文件: $($missing -join ', ')" }
@@ -331,17 +352,19 @@ jobs:
 
             ### X-Plane 的他机插件
 
-            `xpc-for-can` 包里带了 `plugin/PI_XpcTraffic.py`。**一般不用管它**
-            ——在客户端的 设置 → 他机 里点「安装插件」就行，它会自己找到
-            X-Plane 目录并拷过去，之后重启 X-Plane 生效。
+            `xpc-for-can` 包里带了原生插件 `X-Plane plugin/XPC_for_CAN/`
+            （照搬 swift 的 xswiftbus + xplanemp2 渲染，**不再需要 XPPython3**）。
+            **一般不用管它**——在客户端的 设置 → 他机 里点「安装插件」就行，
+            它会自己找到 X-Plane 目录、拷过去、并删掉旧的 Python 插件，之后
+            重启 X-Plane 生效。
 
-            那一份是留给自动安装不成的情况的（X-Plane 装在需要管理员权限的
-            位置、绿色版探测不到目录），手工拷到
+            自动安装不成的话（X-Plane 装在需要管理员权限的位置、绿色版探测
+            不到目录），把整个 `XPC_for_CAN` 文件夹手工拷到
 
-                <X-Plane>/Resources/plugins/PythonPlugins/PI_XpcTraffic.py
+                <X-Plane>/Resources/plugins/XPC_for_CAN/64/win.xpl
 
-            插件要先装 XPPython3 才会被加载，**版本取决于模拟器**：X-Plane 12
-            用 v4.x，X-Plane 11.52 用 v3.1.5（v4 是拿 SDK 420 编的，不兼容 XP11）。
+            并删掉 `<X-Plane>/Resources/plugins/PythonPlugins/PI_XpcTraffic.py`。
+            CSL 模型（例如 X-CSL）怎么放，见那个文件夹里的 README.md。
 
             早期的纯语音飞行员端（`client` / `xplane_client`）不再出包，
             功能已并入 `xpc-for-can` 和 `msfs-for-can`。

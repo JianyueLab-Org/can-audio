@@ -70,6 +70,25 @@ def find_rnnoise():
     return []
 
 
+def find_native_plugin():
+    """原生他机插件（native_plugin/，cmake 编出来的 XPC_for_CAN 目录）。
+
+    设置对话框里的"安装插件"从这里复制：64/win.xpl 加 LegacyData/。和 opus.dll
+    一样，漏了也照样打得出包、程序照样能启动，只是他机永远画不出来——所以
+    这里要警告、发布流程要验 _internal/native_plugin/XPC_for_CAN/64/win.xpl。
+    """
+    package = os.path.join(os.path.dirname(os.path.abspath(SPEC)),
+                           'native_plugin', 'build', 'package', 'XPC_for_CAN')
+    binary = os.path.join(package, '64', 'win.xpl')
+    if os.path.isfile(binary):
+        return [(binary, 'native_plugin/XPC_for_CAN/64'),
+                (os.path.join(package, 'LegacyData'),
+                 'native_plugin/XPC_for_CAN/LegacyData')]
+    print('警告: 原生 X-Plane 插件还没编译（native_plugin/build/package/XPC_for_CAN），'
+          '打出来的包装不了他机插件。')
+    return []
+
+
 a = Analysis(
     ['gui.py'],
     pathex=[],
@@ -77,11 +96,8 @@ a = Analysis(
     datas=[
         # 窗口图标要随程序分发，否则打包后运行时取不到
         ('favicon.ico', '.'),
-        # X-Plane 插件。它不在这个进程里跑——是给用户复制到
-        # <X-Plane>/Resources/plugins/PythonPlugins/ 的，所以只是随包带上。
-        ('plugin/PI_XpcTraffic.py', 'plugin'),
         ('buildinfo.json', '.'),
-    ],
+    ] + find_native_plugin(),
     hiddenimports=[
         'pymumble_py3',
         'google.protobuf',
