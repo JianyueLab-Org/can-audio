@@ -61,9 +61,11 @@ jobs:
         shell: pwsh
         # Before pyinstaller: gui.spec bundles native_plugin/build/package/XPC_for_CAN
         run: |
+          # No -G: windows-latest is windows-2025-vs2026 and has no VS 2022;
+          # let CMake pick the newest Visual Studio, as native/rnnoise/build.ps1 does.
           cmake -S native_plugin -B native_plugin/build `
-            -DXPLANE_SDK="$env:XPLANE_SDK" `
-            -G "Visual Studio 17 2022" -A x64
+            -DXPLANE_SDK="$env:XPLANE_SDK" -A x64
+          if ($LASTEXITCODE -ne 0) { throw "native X-Plane plugin failed to configure" }
           cmake --build native_plugin/build --config Release
           if ($LASTEXITCODE -ne 0) { throw "native X-Plane plugin failed to compile" }
           if (-not (Test-Path native_plugin/build/package/XPC_for_CAN/64/win.xpl)) {
