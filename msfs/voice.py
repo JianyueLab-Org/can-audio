@@ -345,7 +345,8 @@ class Voice:
             frames_per_buffer=self._chunk, input_device_index=input_index)
         self._output = self._audio.open(
             format=FORMAT, channels=CHANNELS, rate=self._rate, output=True,
-            frames_per_buffer=self._chunk, output_device_index=output_index)
+            frames_per_buffer=self._chunk, output_device_index=output_index,
+            stream_callback=self._playback_callback)
         # 把真正打开的设备名记下来。"听不到/说不出"最常见的原因就是选错了
         # 设备（比如麦克风指到了不存在的虚拟声卡），只报采样率看不出来。
         devices = (self._rate, self._chunk,
@@ -573,8 +574,7 @@ class Voice:
         self._status('online', t("voice.online", username=self.username))
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        self._rx_mix_thread = threading.Thread(target=self._rx_mix_loop, daemon=True)
-        self._rx_mix_thread.start()
+        # 输出由 PortAudio 按设备时钟拉取，不再启动定时播放线程。
         self._channel_thread = threading.Thread(target=self._channel_loop,
                                                 daemon=True)
         self._channel_thread.start()
@@ -654,6 +654,21 @@ class Voice:
     @staticmethod
     def _mix_received_frames(frames):
         return rxmix.mix(frames)
+
+    def _playback_callback(self, in_data, frame_count, time_info, status):
+        """按声卡实际请求混音；实时回调内不写声卡、不记日志。"""
+        try:
+            size = max(1, int(round(frame_count * 48000 / self._rate)))
+            with self._rx_mix_wakeup:
+                mixed = rxmix.take(self._rx_mix_frames, size)
+            if mixed is None:
+                return bytes(frame_count * 2), pyaudio.paContinue
+            data = rxmix.output_frame(mixed, frame_count).tobytes()
+            self._received_frames += 1
+            self._received_total += 1
+            return data, pyaudio.paContinue
+        except Exception:
+            return bytes(frame_count * 2), pyaudio.paContinue
 
     def _rx_mix_loop(self):
         """按固定帧长混合所有正在收到的发话者音频，再写入一次声卡。"""

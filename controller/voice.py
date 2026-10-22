@@ -499,8 +499,7 @@ class VoiceClient:
 
         self._rx_monitor = threading.Thread(target=self._rx_monitor_loop, daemon=True)
         self._rx_monitor.start()
-        self._rx_mix_thread = threading.Thread(target=self._rx_mix_loop, daemon=True)
-        self._rx_mix_thread.start()
+        # 输出由 PortAudio 回调按设备时钟拉取，不再由 Python 定时线程推送。
         self._connection_thread = threading.Thread(target=self._connection_monitor, daemon=True)
         self._connection_thread.start()
 
@@ -758,7 +757,20 @@ class VoiceClient:
             self.output_stream = self.audio.open(
                 format=self.FORMAT, channels=self.CHANNELS, rate=self.RATE,
                 output=True, frames_per_buffer=self.CHUNK,
-                output_device_index=self._output_device)
+                output_device_index=self._output_device,
+                stream_callback=self._playback_callback)
+
+    def _playback_callback(self, in_data, frame_count, time_info, status):
+        """声卡需要多少采样就混多少；不在实时回调里等待、写声卡或记日志。"""
+        try:
+            size = max(1, int(round(frame_count * 48000 / self.RATE)))
+            with self._rx_mix_wakeup:
+                mixed = rxmix.take(self._rx_mix_frames, size)
+            if mixed is None:
+                return bytes(frame_count * 2), pyaudio.paContinue
+            return rxmix.output_frame(mixed, frame_count).tobytes(), pyaudio.paContinue
+        except Exception:
+            return bytes(frame_count * 2), pyaudio.paContinue
 
     def _close_streams(self):
         with self._stream_lock:

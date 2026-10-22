@@ -144,6 +144,43 @@ Third-party packages used (install with pip — note the PyPI name for pymumble_
 
 ## Cross-cutting conventions
 
+### Receive playback: device-clock callbacks (controller / xpc / msfs)
+
+The three listening clients open their PyAudio output with
+`stream_callback=self._playback_callback`. PortAudio requests `frame_count` samples;
+the callback consumes the corresponding 48 kHz PCM from each speaker's independent
+`rxmix` queue, mixes once and returns exactly `frame_count * 2` bytes (mono int16).
+An empty queue returns silence. Do not start `_rx_mix_loop` alongside callback
+output, and never call `stream.write()` on a callback stream. The old timer-loop
+method remains only for legacy tests; it is not the active playback path.
+
+The callback must not log, touch Qt, perform network I/O, or acquire the output
+stream lock. `stop_stream()` / `close()` wait for callbacks, so taking the same
+lock inside the callback would deadlock device changes or shutdown. It uses only
+the short receive-queue lock. Output stops before PyAudio is terminated.
+Pilot receive counters advance only for real audio, not idle silence.
+
+`rxmix` preserves long packet tails and joins short packets; network packets are
+not necessarily 20 ms. Its input is always decoded 48 kHz PCM. On fallback device
+rates the callback rescales its request and resamples to the exact device count.
+Do not reinstate packet-count queues or shortest-packet truncation.
+
+Validation: `controller/test_playback.py` covers variable callback sizes, silence
+and ten minutes of simulated two-speaker audio. `xpc/test_playback.py` covers the
+pilot callback, fallback rates, counters and actual output-open registration.
+Exercise the same pilot test source with each component directory first on
+`sys.path`, so flat imports actually load that component's `voice.py`.
+`controller/probe_playback.py` is an optional local silent output-device probe;
+it needs an actual sound device and is not a CI test. A HyperX MME device ran
+1501 callbacks over 30 seconds without PortAudio status flags. The operator
+confirmed the controller callback test package fixed their playback stutter.
+XPC/MSFS still require real simulator/network validation; this is not evidence
+of packet-loss concealment or a network jitter buffer.
+
+The experimental TLS/command-queue and transmit-buffer changes in `892a8ac` and
+`01fb7b9` were reverted by `fb5a6a3`. This playback fix is based on that rollback;
+do not silently restore those experiments while copying callback changes.
+
 **All four shipped clients use qfluentwidgets on PyQt6, and the palette lives in `theme.py`.** `controller/` and `atis/` were already Fluent; `xpc/` and `msfs/` were plain Qt widgets until they were converted. The colours used to sit at the top of each `gui.py`, which meant the same "green" had three different values across the repo (`#28a745` in controller/atis, `#2ecc71` in xpc/msfs) and — more practically — that `settings.py` could not reach them at all, because it cannot import `gui.py` without a cycle. `theme.py` is another byte-identical copy across all four components (like `voice.py` and `ptt.py`); **no `gui.py` may contain a literal `#rrggbb` any more.**
 
 Two things Fluent does *not* cover, both of which look like "the theme only got applied halfway":
