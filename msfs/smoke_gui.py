@@ -68,6 +68,7 @@ chime.Chime.play = _fake_chime
 import gui
 import i18n
 import simlink
+import theme
 from i18n import t
 
 SNAPSHOT = {
@@ -244,7 +245,14 @@ def main():
             window.fsd = None
     check("模拟器断开时保留网络", keeps_fsd_when_simulator_goes_away)
 
-    check("网络状态", lambda: window.on_fsd_status("online", "已上线"))
+    def keeps_fsd_status_when_simulator_goes_away():
+        window.on_fsd_status("online", "已上线")
+        window.on_sim_state(False, "模拟器断开")
+        assert window.fsd_label.text() == t("net.online"), window.fsd_label.text()
+        assert theme.ON_COLOR in window.fsd_label.styleSheet(), \
+            window.fsd_label.styleSheet()
+
+    check("模拟器断开不覆盖网络状态", keeps_fsd_status_when_simulator_goes_away)
     check("语音状态", lambda: window.on_voice_status("online", "语音已连接"))
     check("频道切换", lambda: window.on_channel(121.5, "FREQ_121500"))
 

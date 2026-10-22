@@ -864,7 +864,6 @@ class MsfsWindow(QMainWindow):
             # latest snapshot, and a dead worker can be replaced on recovery.
             self.snapshot = None
             self.ident_button.setEnabled(False)
-            self.fsd_label.setText(t("net.disconnected"))
             self.add_message(t("msg.sim_gone_fsd"), theme.ACTIVE_COLOR)
             self.connect_button.setText(
                 t("connect.disconnect") if self.voice or self.fsd else t("connect.connect"))

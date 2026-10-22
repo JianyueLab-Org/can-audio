@@ -14,7 +14,7 @@ PyQt6-Fluent-Widgets            # 四个客户端共用的 Fluent 深色外观�
 # ---- 语音 ----
 # 使用 pymumble_udp 的 Mumble 1.5+ protobuf UDP 音频格式；导入名仍是
 # pymumble_py3。不要改回 PyPI 的 pymumble，它只有 TCP audio tunnel。
-pymumble @ git+https://github.com/JianyueLab-Org/pymumble_udp.git@pymumble_py3
+pymumble-udp @ git+https://github.com/JianyueLab-Org/pymumble_udp.git@pymumble_py3
 pyaudio
 numpy
 

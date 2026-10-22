@@ -13,6 +13,7 @@ set_frequency() 就行，省掉一整套轮询和"频道对不对"的反复检�
 import logging
 import threading
 import time
+from collections import deque
 
 import denoise
 import micgain
@@ -252,6 +253,12 @@ class Voice:
         # 直接崩进程，Python 的 try/except 接不住。管制端一直有这把锁
         # （controller/voice.py 的 _stream_lock），这份原来没有。
         self._stream_lock = threading.Lock()
+        self._input_stream_lock = threading.Lock()
+        self._output_stream_lock = threading.Lock()
+        self._rx_mix_lock = threading.Lock()
+        self._rx_mix_wakeup = threading.Condition(self._rx_mix_lock)
+        self._rx_mix_frames = {}
+        self._rx_mix_thread = None
         self._channel_lock = threading.Lock()   # 频道切换不能并发
         self._channel_wanted = threading.Event()  # 有新频率要切
         self._channel_thread = None
@@ -410,20 +417,22 @@ class Voice:
         write()，不挡住它们就 close/terminate 是 C 层崩溃。
         """
         with self._stream_lock:
-            for stream in (self._input, self._output):
-                try:
-                    if stream:
-                        stream.stop_stream()
-                        stream.close()
-                except Exception:
-                    pass
-            self._input = self._output = None
-            try:
-                if self._audio:
-                    self._audio.terminate()
-            except Exception:
-                pass
-            self._open_audio()
+            with self._input_stream_lock:
+                with self._output_stream_lock:
+                    for stream in (self._input, self._output):
+                        try:
+                            if stream:
+                                stream.stop_stream()
+                                stream.close()
+                        except Exception:
+                            pass
+                    self._input = self._output = None
+                    try:
+                        if self._audio:
+                            self._audio.terminate()
+                    except Exception:
+                        pass
+                    self._open_audio()
 
     # ---------- 生命周期 ----------
     def start(self):
@@ -563,6 +572,8 @@ class Voice:
         self._status('online', t("voice.online", username=self.username))
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+        self._rx_mix_thread = threading.Thread(target=self._rx_mix_loop, daemon=True)
+        self._rx_mix_thread.start()
         self._channel_thread = threading.Thread(target=self._channel_loop,
                                                 daemon=True)
         self._channel_thread.start()
@@ -639,6 +650,47 @@ class Voice:
         self._stuck_reason = reason
         log.warning("still not in the frequency channel: %s", reason)
 
+    @staticmethod
+    def _mix_received_frames(frames):
+        if not frames:
+            return None
+        size = min(len(frame) for frame in frames)
+        mixed = np.zeros(size, dtype=np.int32)
+        for frame in frames:
+            mixed += frame[:size]
+        return np.clip(mixed, np.iinfo(np.int16).min,
+                       np.iinfo(np.int16).max).astype(np.int16)
+
+    def _rx_mix_loop(self):
+        """按固定帧长混合所有正在收到的发话者音频，再写入一次声卡。"""
+        frame_duration = self._chunk / self._rate
+        next_frame = time.monotonic()
+        while self.running:
+            next_frame += frame_duration
+            with self._rx_mix_wakeup:
+                while self.running and time.monotonic() < next_frame:
+                    self._rx_mix_wakeup.wait(timeout=next_frame - time.monotonic())
+                if not self.running:
+                    break
+                frames = tuple(queue.popleft() for queue in self._rx_mix_frames.values())
+                self._rx_mix_frames = {source: queue for source, queue in
+                                       self._rx_mix_frames.items() if queue}
+
+            if not frames:
+                continue
+            try:
+                mixed = self._mix_received_frames(frames)
+                with self._output_stream_lock:
+                    if self._output:
+                        self._output.write(mixed.tobytes())
+                        self._received_frames += 1
+                        self._received_total += 1
+            except Exception as e:
+                log.warning("failed to play the mixed received audio: %s", e)
+
+            if time.monotonic() > next_frame + frame_duration:
+                next_frame = time.monotonic()
+
     def _release(self):
         """把音频设备和 Mumble 连接放掉。start() 失败和 stop() 都必须走这里。
 
@@ -662,21 +714,33 @@ class Voice:
                 pass
             self.mumble = None
 
+        with self._rx_mix_wakeup:
+            self._rx_mix_frames.clear()
+            self._rx_mix_wakeup.notify_all()
+        mix_thread = self._rx_mix_thread
+        if (mix_thread and mix_thread.is_alive()
+                and mix_thread is not threading.current_thread()):
+            self.running = False
+            mix_thread.join(timeout=2)
+        self._rx_mix_thread = None
+
         with self._stream_lock:
-            for stream in (self._input, self._output):
-                try:
-                    if stream:
-                        stream.stop_stream()
-                        stream.close()
-                except Exception:
-                    pass
-            self._input = self._output = None
-            try:
-                if self._audio:
-                    self._audio.terminate()
-            except Exception:
-                pass
-            self._audio = None
+            with self._input_stream_lock:
+                with self._output_stream_lock:
+                    for stream in (self._input, self._output):
+                        try:
+                            if stream:
+                                stream.stop_stream()
+                                stream.close()
+                        except Exception:
+                            pass
+                    self._input = self._output = None
+                    try:
+                        if self._audio:
+                            self._audio.terminate()
+                    except Exception:
+                        pass
+                    self._audio = None
 
     def stop(self, state='stopped', message=None):
         """收掉整条连接。
@@ -696,11 +760,14 @@ class Voice:
         # 先收线程再动 PyAudio。反过来的话发送线程可能正卡在 stream.read()
         # 里，C 层被 terminate 掉是直接崩，Python 的 try/except 接不住。
         self._channel_wanted.set()      # 叫醒切换线程好让它看到 running=False
-        for thread in (self._thread, self._channel_thread):
+        with self._rx_mix_wakeup:
+            self._rx_mix_frames.clear()
+            self._rx_mix_wakeup.notify_all()
+        for thread in (self._thread, self._channel_thread, self._rx_mix_thread):
             if (thread and thread.is_alive()
                     and thread is not threading.current_thread()):
                 thread.join(timeout=2)
-        self._thread = self._channel_thread = None
+        self._thread = self._channel_thread = self._rx_mix_thread = None
 
         # _release() 里的 mumble.stop() 会把 reconnect 置空、exit 置真、socket
         # 关掉，主循环这才会返回——所以收这条线程必须排在 _release() 之后。
@@ -1186,16 +1253,13 @@ class Voice:
 
             volume = getattr(self.settings, "speaker_volume", 100) / 100.0
             samples = np.frombuffer(chunk.pcm, dtype=np.int16)
-            samples = (samples * volume).astype(np.int16)
-            with self._stream_lock:
-                if not self._output:
-                    # 收到了但扬声器没开——"听不到别人"和"根本没人说话"是两回事
-                    log.warning("audio received but the speaker is not open, "
-                                "nothing will be heard")
-                    return
-                self._output.write(samples.tobytes())
-            self._received_frames += 1
-            self._received_total += 1
+            samples = np.clip(samples.astype(np.float32) * volume,
+                              np.iinfo(np.int16).min,
+                              np.iinfo(np.int16).max).astype(np.int16)
+            with self._rx_mix_wakeup:
+                source = user.get("session", user.get("name", "?"))
+                self._rx_mix_frames.setdefault(source, deque(maxlen=3)).append(samples)
+                self._rx_mix_wakeup.notify()
         except Exception as e:
             log.warning("failed to play the received audio: %s", e)
 
@@ -1245,7 +1309,7 @@ class Voice:
                     continue
 
                 try:
-                    with self._stream_lock:
+                    with self._input_stream_lock:
                         if not self._input:
                             raise RuntimeError("stream closed")
                         data = self._input.read(self._chunk,
