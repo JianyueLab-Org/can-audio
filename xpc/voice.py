@@ -15,6 +15,7 @@ import threading
 import time
 from contextlib import nullcontext
 import rxmix
+import txbuffer
 
 import denoise
 import micgain
@@ -667,21 +668,23 @@ class Voice:
                 if not self.running:
                     break
                 mixed = rxmix.take(self._rx_mix_frames)
+            # 阻塞写入也参与计时，慢写之后不额外再等一帧。
+            next_frame = max(next_frame, time.monotonic())
 
+            # 声卡持续消费固定时间片，静音时也喂零，避免恢复话音时输出欠载。
+            has_audio = mixed is not None
             if mixed is None:
-                continue
+                mixed = np.zeros(960, dtype=np.int16)
             try:
                 mixed = rxmix.output_frame(mixed, self._chunk)
                 with self._output_stream_lock:
                     if self._output:
                         self._output.write(mixed.tobytes())
-                        self._received_frames += 1
-                        self._received_total += 1
+                        if has_audio:
+                            self._received_frames += 1
+                            self._received_total += 1
             except Exception as e:
                 log.warning("failed to play the mixed received audio: %s", e)
-
-            if time.monotonic() > next_frame + frame_duration:
-                next_frame = time.monotonic()
 
     def _release(self):
         """把音频设备和 Mumble 连接放掉。start() 失败和 stop() 都必须走这里。
@@ -1322,7 +1325,9 @@ class Voice:
                     self._mic_peak = max(self._mic_peak, peak)
                     self._non_silent_frames += peak > 0
                 with self._lock:
-                    self.mumble.sound_output.add_sound(samples.tobytes())
+                    dropped = txbuffer.enqueue(self.mumble.sound_output, samples.tobytes())
+                    if dropped:
+                        log.debug("trimmed %.3f s of stale outgoing audio", dropped)
                 self._sent_frames += 1
                 self._sent_total += 1
             except Exception as e:
