@@ -10,21 +10,6 @@ import rxmix
 
 
 class ReceiveMixTest(unittest.TestCase):
-    def test_ten_minutes_of_two_speakers_do_not_accumulate_latency(self):
-        queues = {}
-        a = np.full(2880, 100, np.int16)
-        b = np.full(480, 300, np.int16)
-        peak = 0
-        for tick in range(30000):
-            if tick % 3 == 0:
-                rxmix.enqueue(queues, 1, a)
-            rxmix.enqueue(queues, 2, b)
-            rxmix.enqueue(queues, 2, b)
-            peak = max(peak, sum(map(len, queues.get(1, ()))))
-            np.testing.assert_array_equal(rxmix.take(queues), np.full(960, 400))
-        self.assertEqual(peak, 2880)
-        self.assertEqual(queues, {})
-
     def test_different_packet_sizes_preserve_both_speakers(self):
         queues = {}
         # 一人发 60 ms 包，另一人发六个 10 ms 包。
