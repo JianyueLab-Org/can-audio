@@ -32,6 +32,11 @@ log = logging.getLogger("settings")
 # 新装的默认 PTT 键。老配置里的 ptt_key 会被升级成一条键盘绑定，见 ptt.load()。
 DEFAULT_PTT_KEY = "v"
 DEFAULT_MUMBLE_HOST = "audio.ceruleanavi.net"
+# 语音服务器的旧域名。mumble_host 是存进 radio_settings.json 的，所以光换
+# 上面那个默认值只对全新安装有效——老用户的 json 里还是旧域名，等旧域名
+# 停掉那天他们看到的是连不上语音，而设置界面上那一行看着完全正常。
+# 只认这几个旧值：用户自己填的别的地址是有意为之，不能动。
+OLD_MUMBLE_HOSTS = {"hjdczy.top", "audio.airwaysn.org"}
 
 
 class Settings:
@@ -87,6 +92,10 @@ class Settings:
                     self.output_device_index = data.get("output_device_index", None)
                     self.last_username = data.get("last_username", "")
                     self.mumble_host = data.get("mumble_host") or DEFAULT_MUMBLE_HOST
+                    if (self.mumble_host or "").strip().lower() in OLD_MUMBLE_HOSTS:
+                        log.info("the voice server was renamed, using %s instead of %s",
+                                 DEFAULT_MUMBLE_HOST, self.mumble_host)
+                        self.mumble_host = DEFAULT_MUMBLE_HOST
                     self.mumble_port = int(data.get("mumble_port", self.mumble_port))
                     self.always_on_top = bool(data.get("always_on_top", False))
                     self.compact = bool(data.get("compact", False))

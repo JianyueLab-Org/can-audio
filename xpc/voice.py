@@ -456,8 +456,10 @@ class Voice:
             self.mumble = bounded_mumble()(self.host, self.username,
                                            password=self.password,
                                            port=self.port,
-                                           udp=True,
                                            reconnect=True)
+            # 不传 udp=：pymumble-udp 默认就是 udp=True（加密 UDP，不通就退回
+            # TCP 隧道），而 PyPI 的 pymumble 不认这个参数——显式传的话，用旧
+            # 环境从源码跑的人语音会直接 TypeError，界面上只看到"连接失败"。
             self.mumble.reconnect_limit = self.reconnect_limit
             self.mumble.on_reconnect = self._on_reconnect_attempt
             self.mumble.set_receive_sound(True)
@@ -465,8 +467,8 @@ class Voice:
                                                self._on_sound)
             self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_PERMISSIONDENIED,
                                                self._on_permission_denied)
-            # 连接标记由这两条回调翻转，和老飞行员端一样
-                # （见 pymumble 的回调定义）。这一份原来两条都没接：DISCONNECTED 正是
+            # 连接标记由这两条回调翻转（见 pymumble 的回调定义）。
+            # 这一份原来两条都没接：DISCONNECTED 正是
             # pymumble 主循环结束时走的那条，没人听的话连接已经彻底死了而界面
             # 还是绿的，日志里一个字都没有。
             self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_CONNECTED,

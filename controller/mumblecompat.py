@@ -36,6 +36,15 @@ pymumble 自己的线程里，调用方只看到"线程没了"，界面上就显
 发。把校验放在 `connect()` 返回之前，就卡在这两者中间：验不过就抛，一个字节的
 凭据都不会出去。放在 `Mumble.connect()` 外面包一层是不行的——那时候
 `Authenticate` 早发完了。
+
+**客户端现在装的是 pymumble-udp（JianyueLab-Org/pymumble_udp），它不走
+`ssl.wrap_socket`。** 那个分支在 `mumble.py` 里有自己的模块级
+`_wrap_socket()`，3.12 上直接 `ssl.create_default_context().wrap_socket()`，
+只有拿不到 SSLContext 才退回 `ssl.wrap_socket`。所以光补 `ssl.wrap_socket`
+的话，指纹校验在那个分支上**一次都不会被调用**——而且它关掉了主机名和证书
+校验，等于什么都不验，表面上一切正常。`patch_tls()` 把那个 `_wrap_socket`
+也换成会验指纹的版本；`tls_pinned()` 说的是 pymumble 实际会走的那条路有没有
+钉住，而不是 `ssl.wrap_socket` 补没补。先包后连的顺序在那个分支上没变。
 """
 
 import hashlib
@@ -224,9 +233,11 @@ def send_stats():
 class _RetryingSocket:
     """给非阻塞 socket 的 `send()` 补上"等它可写再续发"。
 
-    **这是语音"一发话就掉线"的病根。** pymumble 没有 UDP 通道：话音被塞进
-    `UDPTUNNEL` 消息，和控制消息走**同一条 TCP**（soundoutput.py 的
-    `tcppacket = ... # encapsulate in tcp tunnel`）。而那条 socket 在
+    **这是语音"一发话就掉线"的病根。** PyPI 上的 pymumble 1.6.1 没有 UDP
+    通道：话音被塞进 `UDPTUNNEL` 消息，和控制消息走**同一条 TCP**
+    （soundoutput.py 的 `tcppacket = ... # encapsulate in tcp tunnel`）。
+    pymumble-udp 默认走加密 UDP，但 UDP 还没探通或者不通时照样退回这条 TCP
+    隧道，所以这一层在那个分支上也还要。而那条 socket 在
     `connect()` 里被设成了非阻塞，发送循环却是照 C 的写法兜错的：
 
         sent = self.mumble_object.control_socket.send(tcppacket)
@@ -358,21 +369,84 @@ class _PinnedSSLSocket(ssl.SSLSocket):
 
 
 def install():
-    """打上 pymumble 需要的两个补丁。返回值只说 ssl.wrap_socket 补没补。
+    """打上 pymumble 需要的补丁。返回值只说 ssl.wrap_socket 补没补。
 
     发送那个补丁在这里一并打上：所有客户端都在 import pymumble **之前**调
     install()，这是唯一一处四个组件都必经的地方。
     """
     patched_ssl = _install_wrap_socket()
-    if not patched_ssl and not getattr(ssl.wrap_socket, "_can_pinned", False):
-        # 只可能发生在 3.12 以前——那里 ssl.wrap_socket 还在，我们不去动它
-        # （动了会连累进程里别的东西），于是指纹校验也就挂不上。仓库要求
-        # Python 3.12、CI 也钉死 3.12，所以发出去的包都走上面那条路；这行是
-        # 给在旧解释器上跑源码的人看的，免得以为钉住了。
-        log.warning("this Python still has ssl.wrap_socket, so the voice server "
-                    "certificate is NOT pinned; use Python 3.12 or newer")
+    patch_tls()
+    if not tls_pinned():
+        # 两种情形会走到这里：3.12 以前的 PyPI pymumble——那里 ssl.wrap_socket
+        # 还在，我们不去动它（动了会连累进程里别的东西）；或者 pymumble 根本
+        # 导入不了。仓库要求 Python 3.12、CI 也钉死 3.12，所以发出去的包都钉
+        # 得上；这行是给在旧解释器上跑源码的人看的，免得以为钉住了。
+        log.warning("the voice server certificate is NOT pinned on this "
+                    "pymumble/Python combination; use Python 3.12 or newer")
     patch_send()
     return patched_ssl
+
+
+def _pinned_wrap_socket(sock, keyfile=None, certfile=None,
+                        cert_reqs=ssl.CERT_NONE, ca_certs=None, **kwargs):
+    """包出一条握手后验指纹的 TLS socket。`ssl.wrap_socket` 的签名。"""
+    # 忽略调用方传进来的 ssl_version：那些常量在新版里也已弃用，
+    # 交给 SSLContext 自己协商更稳妥
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    # 顺序不能反：check_hostname 还是 True 时设 CERT_NONE 会抛 ValueError
+    context.check_hostname = False
+    context.verify_mode = cert_reqs
+    if ca_certs:
+        context.load_verify_locations(ca_certs)
+    if certfile:
+        context.load_cert_chain(certfile, keyfile)
+    # CA 链认不了自签证书，认的是指纹——由这个子类在握手之后、发
+    # Authenticate 之前做
+    context.sslsocket_class = _PinnedSSLSocket
+    return context.wrap_socket(sock)
+
+
+def _pymumble_module():
+    try:
+        from pymumble_py3 import mumble
+    except Exception:
+        return None
+    return mumble
+
+
+def patch_tls(module=None):
+    """把 pymumble-udp 自己的 `_wrap_socket` 换成会验指纹的。返回是否打了补丁。
+
+    PyPI 上的 pymumble 没有这个函数，那边由 `ssl.wrap_socket` 那份负责，这里
+    什么都不做。`module` 只给测试用。
+    """
+    module = module or _pymumble_module()
+    original = getattr(module, "_wrap_socket", None)
+    if original is None or getattr(original, "_can_pinned", False):
+        return False
+
+    def _wrap_socket(sock, keyfile=None, certfile=None,
+                     verify_mode=ssl.CERT_NONE, server_hostname=None):
+        # server_hostname 只在开了 CA 校验时有用；钉的是指纹，主机名由
+        # _PinnedSSLSocket 从 connect() 的地址里拿
+        return _pinned_wrap_socket(sock, keyfile, certfile, cert_reqs=verify_mode)
+
+    _wrap_socket._can_pinned = True
+    module._wrap_socket = _wrap_socket
+    log.info("pymumble builds its own TLS context; the voice server "
+             "certificate is pinned there by SHA-256 fingerprint")
+    return True
+
+
+def tls_pinned(module=None):
+    """pymumble 建控制连接时实际走的那条路，是不是会验指纹。"""
+    module = module or _pymumble_module()
+    wrap = getattr(module, "_wrap_socket", None)
+    if wrap is not None:
+        # pymumble-udp：只有拿不到 SSLContext 才会退到 ssl.wrap_socket，所以
+        # 只看它自己的那个
+        return getattr(wrap, "_can_pinned", False)
+    return getattr(getattr(ssl, "wrap_socket", None), "_can_pinned", False)
 
 
 def _install_wrap_socket():
@@ -384,22 +458,8 @@ def _install_wrap_socket():
     if hasattr(ssl, "wrap_socket"):
         return False
 
-    def wrap_socket(sock, keyfile=None, certfile=None, cert_reqs=ssl.CERT_NONE,
-                    ca_certs=None, **kwargs):
-        # 忽略调用方传进来的 ssl_version：那些常量在新版里也已弃用，
-        # 交给 SSLContext 自己协商更稳妥
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        # 顺序不能反：check_hostname 还是 True 时设 CERT_NONE 会抛 ValueError
-        context.check_hostname = False
-        context.verify_mode = cert_reqs
-        if ca_certs:
-            context.load_verify_locations(ca_certs)
-        if certfile:
-            context.load_cert_chain(certfile, keyfile)
-        # CA 链认不了自签证书，认的是指纹——由这个子类在握手之后、发
-        # Authenticate 之前做
-        context.sslsocket_class = _PinnedSSLSocket
-        return context.wrap_socket(sock)
+    def wrap_socket(*args, **kwargs):
+        return _pinned_wrap_socket(*args, **kwargs)
 
     wrap_socket._can_pinned = True
     ssl.wrap_socket = wrap_socket
