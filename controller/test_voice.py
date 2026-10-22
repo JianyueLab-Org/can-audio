@@ -278,16 +278,16 @@ class RxIndicatorTest(unittest.TestCase):
     def test_mixer_writes_one_frame_for_two_sources(self):
         client = make_client()
         client.running = True
-        client.RATE = 1000
-        client.CHUNK = 20
+        client.RATE = 48000
+        client.CHUNK = 960
         client.output_stream = mock.MagicMock()
         client._rx_mix_thread = threading.Thread(target=client._rx_mix_loop, daemon=True)
         client._rx_mix_thread.start()
         with client._rx_mix_wakeup:
             client._rx_mix_frames[(118000, "1001")] = deque(
-                [np.array([100, 200], dtype=np.int16)], maxlen=3)
+                [np.full(960, 100, dtype=np.int16)])
             client._rx_mix_frames[(118000, "1002")] = deque(
-                [np.array([300, 400], dtype=np.int16)], maxlen=3)
+                [np.full(960, 300, dtype=np.int16)])
             client._rx_mix_wakeup.notify()
         deadline = time.monotonic() + 1
         while not client.output_stream.write.called and time.monotonic() < deadline:
@@ -299,7 +299,7 @@ class RxIndicatorTest(unittest.TestCase):
 
         self.assertEqual(client.output_stream.write.call_count, 1)
         self.assertEqual(client.output_stream.write.call_args.args[0],
-                         np.array([400, 600], dtype=np.int16).tobytes())
+                         np.full(960, 400, dtype=np.int16).tobytes())
 
     def test_two_callbacks_before_the_next_tick_are_mixed(self):
         client = make_client()
@@ -308,17 +308,16 @@ class RxIndicatorTest(unittest.TestCase):
         client.mumble.users = Users()
         client.mumble.channels = {7: {"name": "FREQ_118000"}}
         client._channel_to_khz = {7: 118000}
-        client.RATE = 1000
-        client.CHUNK = 50
+        client.RATE = 48000
+        client.CHUNK = 960
         client.output_stream = mock.MagicMock()
         client._rx_mix_thread = threading.Thread(target=client._rx_mix_loop, daemon=True)
         client._rx_mix_thread.start()
         try:
             client._on_sound({"name": "1001", "channel_id": 7},
-                             types.SimpleNamespace(pcm=np.array([100], dtype=np.int16).tobytes()))
-            time.sleep(0.01)
+                             types.SimpleNamespace(pcm=np.full(960, 100, dtype=np.int16).tobytes()))
             client._on_sound({"name": "1002", "channel_id": 7},
-                             types.SimpleNamespace(pcm=np.array([300], dtype=np.int16).tobytes()))
+                             types.SimpleNamespace(pcm=np.full(960, 300, dtype=np.int16).tobytes()))
             deadline = time.monotonic() + 1
             while not client.output_stream.write.called and time.monotonic() < deadline:
                 time.sleep(0.01)
@@ -329,7 +328,7 @@ class RxIndicatorTest(unittest.TestCase):
             client._rx_mix_thread.join(timeout=2)
         self.assertEqual(client.output_stream.write.call_count, 1)
         self.assertEqual(client.output_stream.write.call_args.args[0],
-                         np.array([400], dtype=np.int16).tobytes())
+                         np.full(960, 400, dtype=np.int16).tobytes())
 
     def test_atis_is_played_but_never_cross_coupled(self):
         client = make_client()

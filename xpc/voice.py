@@ -14,7 +14,7 @@ import logging
 import threading
 import time
 from contextlib import nullcontext
-from collections import deque
+import rxmix
 
 import denoise
 import micgain
@@ -653,14 +653,7 @@ class Voice:
 
     @staticmethod
     def _mix_received_frames(frames):
-        if not frames:
-            return None
-        size = min(len(frame) for frame in frames)
-        mixed = np.zeros(size, dtype=np.int32)
-        for frame in frames:
-            mixed += frame[:size]
-        return np.clip(mixed, np.iinfo(np.int16).min,
-                       np.iinfo(np.int16).max).astype(np.int16)
+        return rxmix.mix(frames)
 
     def _rx_mix_loop(self):
         """按固定帧长混合所有正在收到的发话者音频，再写入一次声卡。"""
@@ -673,14 +666,12 @@ class Voice:
                     self._rx_mix_wakeup.wait(timeout=next_frame - time.monotonic())
                 if not self.running:
                     break
-                frames = tuple(queue.popleft() for queue in self._rx_mix_frames.values())
-                self._rx_mix_frames = {source: queue for source, queue in
-                                       self._rx_mix_frames.items() if queue}
+                mixed = rxmix.take(self._rx_mix_frames)
 
-            if not frames:
+            if mixed is None:
                 continue
             try:
-                mixed = self._mix_received_frames(frames)
+                mixed = rxmix.output_frame(mixed, self._chunk)
                 with self._output_stream_lock:
                     if self._output:
                         self._output.write(mixed.tobytes())
@@ -1263,7 +1254,7 @@ class Voice:
                               np.iinfo(np.int16).max).astype(np.int16)
             with self._rx_mix_wakeup:
                 source = user.get("session", user.get("name", "?"))
-                self._rx_mix_frames.setdefault(source, deque(maxlen=3)).append(samples)
+                rxmix.enqueue(self._rx_mix_frames, source, samples)
                 self._rx_mix_wakeup.notify()
         except Exception as e:
             log.warning("failed to play the received audio: %s", e)

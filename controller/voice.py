@@ -17,7 +17,7 @@ import logging
 import re
 import threading
 import time
-from collections import deque
+import rxmix
 
 import numpy as np
 import pyaudio
@@ -783,14 +783,7 @@ class VoiceClient:
 
     @staticmethod
     def _mix_received_frames(frames):
-        if not frames:
-            return None
-        size = min(len(frame) for frame in frames)
-        mixed = np.zeros(size, dtype=np.int32)
-        for frame in frames:
-            mixed += frame[:size]
-        return np.clip(mixed, np.iinfo(np.int16).min,
-                       np.iinfo(np.int16).max).astype(np.int16)
+        return rxmix.mix(frames)
 
     def set_mic_volume(self, percent):
         self.mic_volume = max(0, min(200, int(percent)))
@@ -1269,7 +1262,7 @@ class VoiceClient:
                             np.iinfo(np.int16).max).astype(np.int16)
             with self._rx_mix_wakeup:
                 source = (khz, user.get("session", user.get("name", "?")))
-                self._rx_mix_frames.setdefault(source, deque(maxlen=3)).append(audio)
+                rxmix.enqueue(self._rx_mix_frames, source, audio)
                 self._rx_mix_wakeup.notify()
         except Exception as e:
             log.warning(f"queuing the received audio raised: {e}")
@@ -1289,14 +1282,12 @@ class VoiceClient:
                     self._rx_mix_wakeup.wait(timeout=next_frame - time.monotonic())
                 if not self.running:
                     break
-                frames = tuple(queue.popleft() for queue in self._rx_mix_frames.values())
-                self._rx_mix_frames = {source: queue for source, queue in
-                                       self._rx_mix_frames.items() if queue}
+                mixed = rxmix.take(self._rx_mix_frames)
 
-            if not frames:
+            if mixed is None:
                 continue
             try:
-                mixed = self._mix_received_frames(frames)
+                mixed = rxmix.output_frame(mixed, self.CHUNK)
                 with self._output_stream_lock:
                     if self.output_stream:
                         self.output_stream.write(mixed.tobytes())
