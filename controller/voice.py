@@ -17,6 +17,7 @@ import logging
 import re
 import threading
 import time
+import rxmix
 
 import numpy as np
 import pyaudio
@@ -310,6 +311,12 @@ class VoiceClient:
         self._input_device = None
         self._output_device = None
         self._stream_lock = threading.Lock()
+        self._input_stream_lock = threading.Lock()
+        self._output_stream_lock = threading.Lock()
+        self._rx_mix_lock = threading.Lock()
+        self._rx_mix_wakeup = threading.Condition(self._rx_mix_lock)
+        self._rx_mix_frames = {}
+        self._rx_mix_thread = None
 
         self.mic_volume = 100
         # 发送链路：降噪 → × 校准基准（dB）× 会话乘数（mic_volume）→ 限幅。
@@ -494,6 +501,7 @@ class VoiceClient:
 
         self._rx_monitor = threading.Thread(target=self._rx_monitor_loop, daemon=True)
         self._rx_monitor.start()
+        # 输出由 PortAudio 回调按设备时钟拉取，不再由 Python 定时线程推送。
         self._connection_thread = threading.Thread(target=self._connection_monitor, daemon=True)
         self._connection_thread.start()
 
@@ -686,11 +694,17 @@ class VoiceClient:
         self.transmitting = False
         self.connected = False
 
-        for thread in (self._tx_thread, self._rx_monitor, self._connection_thread):
+        with self._rx_mix_wakeup:
+            self._rx_mix_frames.clear()
+            self._rx_mix_wakeup.notify_all()
+
+        for thread in (self._tx_thread, self._rx_monitor, self._rx_mix_thread,
+                       self._connection_thread):
             if thread and thread.is_alive() and thread is not threading.current_thread():
                 thread.join(timeout=2)
         self._tx_thread = None
         self._rx_monitor = None
+        self._rx_mix_thread = None
         self._connection_thread = None
 
         self._close_streams()
@@ -745,22 +759,45 @@ class VoiceClient:
             self.output_stream = self.audio.open(
                 format=self.FORMAT, channels=self.CHANNELS, rate=self.RATE,
                 output=True, frames_per_buffer=self.CHUNK,
-                output_device_index=self._output_device)
+                output_device_index=self._output_device,
+                stream_callback=self._playback_callback)
+
+    def _playback_callback(self, in_data, frame_count, time_info, status):
+        """声卡需要多少采样就混多少；不在实时回调里等待、写声卡或记日志。"""
+        try:
+            size = max(1, int(round(frame_count * 48000 / self.RATE)))
+            with self._rx_mix_wakeup:
+                mixed = rxmix.take(self._rx_mix_frames, size)
+            if mixed is None:
+                return bytes(frame_count * 2), pyaudio.paContinue
+            return rxmix.output_frame(mixed, frame_count).tobytes(), pyaudio.paContinue
+        except Exception:
+            return bytes(frame_count * 2), pyaudio.paContinue
 
     def _close_streams(self):
         with self._stream_lock:
             self._close_streams_locked()
 
     def _close_streams_locked(self):
-        for name in ("input_stream", "output_stream"):
-            stream = getattr(self, name, None)
-            if stream:
-                try:
-                    stream.stop_stream()
-                    stream.close()
-                except Exception as e:
-                    log.warning(f"closing the {name} stream raised: {e}")
-                setattr(self, name, None)
+        with self._input_stream_lock:
+            self._close_stream_locked("input_stream")
+        with self._output_stream_lock:
+            self._close_stream_locked("output_stream")
+
+    def _close_stream_locked(self, name):
+        stream = getattr(self, name, None)
+        if not stream:
+            return
+        try:
+            stream.stop_stream()
+            stream.close()
+        except Exception as e:
+            log.warning(f"closing the {name} stream raised: {e}")
+        setattr(self, name, None)
+
+    @staticmethod
+    def _mix_received_frames(frames):
+        return rxmix.mix(frames)
 
     def set_mic_volume(self, percent):
         self.mic_volume = max(0, min(200, int(percent)))
@@ -1234,17 +1271,45 @@ class VoiceClient:
             if not len(audio):
                 return
             scale = (self.speaker_volume / 100.0) * (self._volumes.get(khz, 100) / 100.0)
-            audio = np.clip(audio * scale, np.iinfo(np.int16).min,
+            audio = np.clip(audio.astype(np.float32) * scale,
+                            np.iinfo(np.int16).min,
                             np.iinfo(np.int16).max).astype(np.int16)
-            with self._stream_lock:
-                if self.output_stream:
-                    self.output_stream.write(audio.tobytes())
+            with self._rx_mix_wakeup:
+                source = (khz, user.get("session", user.get("name", "?")))
+                rxmix.enqueue(self._rx_mix_frames, source, audio)
+                self._rx_mix_wakeup.notify()
         except Exception as e:
-            log.warning(f"playing the received audio raised: {e}")
+            log.warning(f"queuing the received audio raised: {e}")
 
         # ATIS whispers must not become unrestricted cross-coupled channel audio.
         if not re.fullmatch(r"[0-9]+_atis[0-9]{6}(?:_[A-Z0-9]{4}_(?:[DA]_)?ATIS)?", user.get("name", "")):
             self._forward_cross_couple(khz, soundchunk)
+
+    def _rx_mix_loop(self):
+        """按固定帧长混合所有正在收到的频率音频，再写入一次声卡。"""
+        frame_duration = self.CHUNK / self.RATE
+        next_frame = time.monotonic()
+        while self.running:
+            next_frame += frame_duration
+            with self._rx_mix_wakeup:
+                while self.running and time.monotonic() < next_frame:
+                    self._rx_mix_wakeup.wait(timeout=next_frame - time.monotonic())
+                if not self.running:
+                    break
+                mixed = rxmix.take(self._rx_mix_frames)
+
+            if mixed is None:
+                continue
+            try:
+                mixed = rxmix.output_frame(mixed, self.CHUNK)
+                with self._output_stream_lock:
+                    if self.output_stream:
+                        self.output_stream.write(mixed.tobytes())
+            except Exception as e:
+                log.warning(f"playing the mixed received audio raised: {e}")
+
+            if time.monotonic() > next_frame + frame_duration:
+                next_frame = time.monotonic()
 
     def _forward_cross_couple(self, khz, soundchunk):
         """交叉耦合：在一个 XC 频率上收到的话音，转发到其它 XC 频率。"""
@@ -1345,7 +1410,7 @@ class VoiceClient:
 
         while self.transmitting and self.running:
             try:
-                with self._stream_lock:
+                with self._input_stream_lock:
                     stream = self.input_stream
                     if not stream:
                         exit_reason = "input stream missing"

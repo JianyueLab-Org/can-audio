@@ -2225,6 +2225,14 @@ class XPlaneParsingTest(unittest.TestCase):
     def test_unknown_index_is_ignored(self):
         self.assertFalse(self.link._handle(self._rref([(999, 1.0)])))
 
+    def test_nonfinite_values_do_not_poison_the_snapshot(self):
+        self.link.values = {"elevation": 304.8}
+        for value in (float("nan"), float("inf"), float("-inf")):
+            self.assertFalse(self.link._handle(self._rref([
+                (xplane.NAME_TO_INDEX["elevation"], value)])))
+        self.assertEqual(self.link.snapshot()["altitude"], 1000)
+        self.assertEqual(self.link.last_update, 0)
+
     def test_indices_are_unique(self):
         self.assertEqual(len(xplane.NAME_TO_INDEX), len(xplane.DATAREFS))
         self.assertEqual(len(set(xplane.INDEX_TO_NAME)), len(xplane.DATAREFS))
@@ -2379,6 +2387,31 @@ class WaitingTest(unittest.TestCase):
 
     def test_rediscover_is_slower_than_stale(self):
         self.assertGreater(xplane.REDISCOVER_AFTER, xplane.STALE_AFTER)
+
+    def test_data_resuming_on_the_same_socket_restores_connected(self):
+        states = []
+        self.link.on_state = lambda connected, message: states.append(connected)
+        self.link.running = True
+        packet = b"RREF\x00" + struct.pack(
+            "=if", xplane.NAME_TO_INDEX["latitude"], 31.0)
+        calls = 0
+
+        def receive(size):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                self.link._still_waiting(time.time() - xplane.STALE_AFTER - 1)
+                raise xplane.socket.timeout()
+            if calls == 3:
+                self.link.running = False
+            return packet, self.link.address
+
+        sock = mock.MagicMock()
+        sock.recvfrom.side_effect = receive
+        with mock.patch.object(xplane.socket, "socket", return_value=sock):
+            self.link._run()
+        self.assertEqual(states, [True, False, True])
+        self.assertTrue(self.link.connected)
 
 
 class SnapshotTest(unittest.TestCase):

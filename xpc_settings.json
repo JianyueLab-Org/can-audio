@@ -1,0 +1,41 @@
+{
+  "cid": "",
+  "password": "",
+  "remember_password": false,
+  "real_name": "",
+  "callsign": "",
+  "aircraft": "",
+  "rating": 1,
+  "mumble_host": "audio.ceruleanavi.net",
+  "mumble_port": 64738,
+  "fsd_host": "fsd.ceruleanavi.net",
+  "fsd_port": 6809,
+  "ptt_bindings": [
+    {
+      "kind": "keyboard",
+      "key": "`"
+    }
+  ],
+  "language": "",
+  "debug": false,
+  "input_device_index": null,
+  "output_device_index": null,
+  "mic_calibration": {},
+  "mic_denoise": true,
+  "speaker_volume": 100,
+  "message_sound": true,
+  "message_sound_all": false,
+  "message_sound_volume": 100,
+  "connect_fsd": true,
+  "connect_voice": true,
+  "observer_mode": false,
+  "observer_frequency": "",
+  "flight_plan": {},
+  "render_traffic": true,
+  "csl_path": "",
+  "xplane_path": "",
+  "traffic_range_nm": 60,
+  "update_check": true,
+  "skipped_version": "2.2.35",
+  "update_url": ""
+}

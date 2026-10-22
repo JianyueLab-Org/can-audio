@@ -15,6 +15,7 @@ import threading
 import time
 import types
 import unittest
+from collections import deque
 from unittest import mock
 
 import numpy as np
@@ -266,6 +267,69 @@ class MicProcessingTest(unittest.TestCase):
 
 class RxIndicatorTest(unittest.TestCase):
 
+    def test_received_frames_are_mixed_and_limited(self):
+        frames = [
+            np.array([20000, -20000, 100], dtype=np.int16),
+            np.array([20000, -20000, 200], dtype=np.int16),
+        ]
+        mixed = VoiceClient._mix_received_frames(frames)
+        np.testing.assert_array_equal(mixed, [32767, -32768, 300])
+
+    def test_mixer_writes_one_frame_for_two_sources(self):
+        client = make_client()
+        client.running = True
+        client.RATE = 48000
+        client.CHUNK = 960
+        client.output_stream = mock.MagicMock()
+        client._rx_mix_thread = threading.Thread(target=client._rx_mix_loop, daemon=True)
+        client._rx_mix_thread.start()
+        with client._rx_mix_wakeup:
+            client._rx_mix_frames[(118000, "1001")] = deque(
+                [np.full(960, 100, dtype=np.int16)])
+            client._rx_mix_frames[(118000, "1002")] = deque(
+                [np.full(960, 300, dtype=np.int16)])
+            client._rx_mix_wakeup.notify()
+        deadline = time.monotonic() + 1
+        while not client.output_stream.write.called and time.monotonic() < deadline:
+            time.sleep(0.01)
+        client.running = False
+        with client._rx_mix_wakeup:
+            client._rx_mix_wakeup.notify_all()
+        client._rx_mix_thread.join(timeout=2)
+
+        self.assertEqual(client.output_stream.write.call_count, 1)
+        self.assertEqual(client.output_stream.write.call_args.args[0],
+                         np.full(960, 400, dtype=np.int16).tobytes())
+
+    def test_two_callbacks_before_the_next_tick_are_mixed(self):
+        client = make_client()
+        class Users(dict):
+            myself = {"name": "1000", "channel_id": 7}
+        client.mumble.users = Users()
+        client.mumble.channels = {7: {"name": "FREQ_118000"}}
+        client._channel_to_khz = {7: 118000}
+        client.RATE = 48000
+        client.CHUNK = 960
+        client.output_stream = mock.MagicMock()
+        client._rx_mix_thread = threading.Thread(target=client._rx_mix_loop, daemon=True)
+        client._rx_mix_thread.start()
+        try:
+            client._on_sound({"name": "1001", "channel_id": 7},
+                             types.SimpleNamespace(pcm=np.full(960, 100, dtype=np.int16).tobytes()))
+            client._on_sound({"name": "1002", "channel_id": 7},
+                             types.SimpleNamespace(pcm=np.full(960, 300, dtype=np.int16).tobytes()))
+            deadline = time.monotonic() + 1
+            while not client.output_stream.write.called and time.monotonic() < deadline:
+                time.sleep(0.01)
+        finally:
+            client.running = False
+            with client._rx_mix_wakeup:
+                client._rx_mix_wakeup.notify_all()
+            client._rx_mix_thread.join(timeout=2)
+        self.assertEqual(client.output_stream.write.call_count, 1)
+        self.assertEqual(client.output_stream.write.call_args.args[0],
+                         np.full(960, 400, dtype=np.int16).tobytes())
+
     def test_atis_is_played_but_never_cross_coupled(self):
         client = make_client()
         class Users(dict):
@@ -275,11 +339,10 @@ class RxIndicatorTest(unittest.TestCase):
         client._channel_to_khz = {7: 118000}
         client._channel_ids = {118000: 7}
         client._xc_targets = {7: 3}
-        client.output_stream = mock.MagicMock()
         pcm = np.array([10, 20], dtype=np.int16).tobytes()
         for name in ("900_atis118000", "900_atis118000_RJTT_ATIS"):
             client._on_sound({"name": name, "channel_id": 7}, types.SimpleNamespace(pcm=pcm))
-        self.assertEqual(client.output_stream.write.call_count, 2)
+        self.assertEqual(len(client._rx_mix_frames), 2)
         self.assertEqual(client.mumble.sound_output.sent, [])
         client._on_sound({"name": "1001", "channel_id": 7}, types.SimpleNamespace(pcm=pcm))
         self.assertEqual(len(client.mumble.sound_output.sent), 1)
