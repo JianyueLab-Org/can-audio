@@ -13,6 +13,7 @@
 """
 
 import logging
+import math
 import socket
 import struct
 import threading
@@ -323,7 +324,6 @@ class XPlaneLink:
             log.info("subscribed to %d datarefs at %s:%s", len(DATAREFS), address[0],
                      address[1])
 
-            got_data = False
             silent_since = time.time()
             while self.running:
                 try:
@@ -345,11 +345,9 @@ class XPlaneLink:
 
                 if self._handle(data):
                     silent_since = time.time()
-                    if not got_data:
-                        got_data = True
-                        # 这个地址真的有数据回来，记住它——以后信标收不到时
-                        # 优先用它，不要退回本机瞎试
-                        self._known_good = address
+                    # 短暂超时后仍在同一个订阅里收数，也必须恢复连接状态。
+                    self._known_good = address
+                    if not self._connected:
                         self._state(True, t("sim.link_up", address=address[0]))
 
             self._close()
@@ -378,7 +376,7 @@ class XPlaneLink:
         for i in range(body // 8):
             index, value = struct.unpack_from("=if", data, 5 + i * 8)
             name = INDEX_TO_NAME.get(index)
-            if name:
+            if name and math.isfinite(value):
                 updates[name] = value
         if not updates:
             return False
