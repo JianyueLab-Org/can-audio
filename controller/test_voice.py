@@ -67,6 +67,88 @@ def make_client():
 
 
 class VoiceTargetTest(unittest.TestCase):
+
+    def test_nonblocking_move_never_waits_on_ready_lock(self):
+        from pymumble_py3.commands import Commands
+        mumble = voice.RejectAwareMumble.__new__(voice.RejectAwareMumble)
+        mumble.connected = voice.PYMUMBLE_CONN_STATE_CONNECTED
+        mumble.is_alive = lambda: True
+        mumble.commands = Commands()
+        mumble.is_ready = mock.Mock(side_effect=AssertionError('must not wait'))
+        cmd = voice.messages.MoveCmd(42, 7)
+        mumble.execute_command(cmd, blocking=False)
+        self.assertIs(mumble.commands.pop_cmd(), cmd)
+        mumble.commands.answer(cmd)
+        mumble.is_ready.assert_not_called()
+
+    def test_disconnect_race_neither_waits_nor_writes_from_switch_thread(self):
+        mumble = voice.RejectAwareMumble.__new__(voice.RejectAwareMumble)
+        mumble.mumble_thread = object()
+        mumble.connected = voice.PYMUMBLE_CONN_STATE_FAILED
+        mumble.is_alive = lambda: True
+        mumble.commands = mock.Mock()
+        mumble.execute_command = mock.Mock()
+        state = voice.mumble_pb2.UserState()
+        with self.assertRaises(ConnectionError):
+            mumble.send_message(voice.PYMUMBLE_MSG_TYPES_USERSTATE, state)
+        mumble.commands.new_cmd.assert_not_called()
+        mumble.execute_command.assert_not_called()
+
+    def test_real_command_queue_keeps_rapid_switches_on_one_sender_thread(self):
+        from pymumble_py3.commands import Commands
+        import struct
+        import logging
+        mumble = voice.RejectAwareMumble.__new__(voice.RejectAwareMumble)
+        threading.Thread.__init__(mumble)
+        mumble._control_send_lock = threading.RLock()
+        mumble.connected = voice.PYMUMBLE_CONN_STATE_CONNECTED
+        mumble.commands = Commands()
+        mumble.Log = logging.getLogger('test-wire')
+        mumble.is_alive = lambda: True
+        wire = bytearray()
+        writers = set()
+
+        def send(data):
+            writers.add(threading.get_ident())
+            wire.extend(data[:3])  # 强制部分写，验证整条消息重试。
+            return min(3, len(data))
+
+        mumble.control_socket = types.SimpleNamespace(send=send)
+        ready = threading.Event()
+        queued = threading.Event()
+
+        def worker():
+            mumble.mumble_thread = threading.current_thread()
+            ready.set()
+            queued.wait(2)
+            while mumble.commands.is_cmd():
+                mumble.treat_command(mumble.commands.pop_cmd())
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        self.assertTrue(ready.wait(1))
+        for channel in range(1, 201):
+            move = voice.messages.MoveCmd(42, channel)
+            mumble.commands.new_cmd(move)
+            state = voice.mumble_pb2.UserState()
+            state.session = 42
+            state.listening_channel_add.append(channel + 1)
+            mumble.send_message(voice.PYMUMBLE_MSG_TYPES_USERSTATE, state)
+        self.assertFalse(wire)
+        queued.set()
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(writers, {thread.ident})
+        count = 0
+        while wire:
+            kind, size = struct.unpack('!HL', wire[:6])
+            self.assertEqual(kind, voice.PYMUMBLE_MSG_TYPES_USERSTATE)
+            state = voice.mumble_pb2.UserState()
+            state.ParseFromString(bytes(wire[6:6 + size]))
+            self.assertEqual(state.session, 42)
+            del wire[:6 + size]
+            count += 1
+        self.assertEqual(count, 400)
     """PTT 和交叉耦合必须用不同的 VoiceTarget 编号。"""
 
     def test_ptt_and_cross_couple_use_different_targets(self):
@@ -111,6 +193,8 @@ class VoiceTargetTest(unittest.TestCase):
     def test_frequency_control_is_queued_for_the_mumble_thread(self):
         mumble = voice.RejectAwareMumble.__new__(voice.RejectAwareMumble)
         mumble.is_alive = lambda: True
+        mumble.mumble_thread = object()
+        mumble.connected = voice.PYMUMBLE_CONN_STATE_CONNECTED
         mumble.execute_command = mock.Mock()
         mumble._control_send_lock = threading.RLock()
         mumble.commands = mock.Mock()
@@ -120,8 +204,8 @@ class VoiceTargetTest(unittest.TestCase):
         with mock.patch.object(voice.pymumble.Mumble, 'send_message') as send:
             mumble.send_message(voice.PYMUMBLE_MSG_TYPES_USERSTATE, message)
             send.assert_not_called()
-            cmd = mumble.execute_command.call_args.args[0]
-            self.assertFalse(mumble.execute_command.call_args.kwargs['blocking'])
+            mumble.execute_command.assert_not_called()
+            cmd = mumble.commands.new_cmd.call_args.args[0]
             expected = message.SerializeToString()
             message.Clear()
             mumble.treat_command(cmd)

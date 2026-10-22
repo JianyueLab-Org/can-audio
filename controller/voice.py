@@ -107,11 +107,16 @@ class RejectAwareMumble(pymumble.Mumble):
     def send_message(self, type, message):
         # SSLSocket 的读和写也不能由两条线程同时操作。仅给 send 加锁
         # 仍会撞上库线程的 recv；把外部线程的整条控制消息交回库线程处理。
-        if threading.current_thread() is not self and self.is_alive():
+        owner = getattr(self, "mumble_thread", None)
+        if owner is not None and threading.current_thread() is not owner:
+            if not self.is_alive() or self.connected != PYMUMBLE_CONN_STATE_CONNECTED:
+                raise ConnectionError("cannot queue control messages outside an established session")
             cmd = messages.Cmd()
             cmd.cmd = "can_raw_control"
             cmd.parameters = (type, message.SerializeToString())
-            self.execute_command(cmd, blocking=False)
+            # execute_command 即便 blocking=False 也会先 is_ready() 等锁；
+            # 断线竞态中它可能永久挂住同步线程。这里直接入当前会话队列。
+            self.commands.new_cmd(cmd)
             return
         with self._control_send_lock:
             return super().send_message(type, message)
@@ -134,6 +139,13 @@ class RejectAwareMumble(pymumble.Mumble):
             return
         return super().treat_command(cmd)
 
+    def execute_command(self, cmd, blocking=True):
+        if not blocking:
+            if self.connected != PYMUMBLE_CONN_STATE_CONNECTED or not self.is_alive():
+                raise ConnectionError("cannot queue commands outside an established session")
+            return self.commands.new_cmd(cmd)
+        return super().execute_command(cmd, blocking=blocking)
+
     def send_audio_packet(self, packet):
         with self._control_send_lock:
             return super().send_audio_packet(packet)
@@ -151,6 +163,15 @@ class RejectAwareMumble(pymumble.Mumble):
             except Exception as e:
                 log.warning("could not parse the Reject message: %s", e)
         return super().dispatch_control_message(type, message)
+
+    def loop(self):
+        try:
+            return super().loop()
+        except OSError as e:
+            # pymumble.run 会吞掉 socket.error，只留下无理由的重连回调。
+            log.warning("Mumble I/O failed: %s (errno=%s, winerror=%s)",
+                        e, getattr(e, 'errno', None), getattr(e, 'winerror', None))
+            raise
 
     def run(self):
         """接住"服务器拒绝"，别让它变成一条 CRITICAL。
