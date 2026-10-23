@@ -13,7 +13,7 @@ import unittest
 
 import version
 
-COMPONENTS = ("controller", "atis", "xpc", "msfs")
+COMPONENTS = ("controller", "atis")
 
 
 def repo_root():

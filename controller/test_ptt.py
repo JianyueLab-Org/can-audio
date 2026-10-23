@@ -1,6 +1,6 @@
 """ptt.py 的单元测试。
 
-    python -m unittest test_ptt -v      （在 controller / xpc / msfs 任一目录下）
+    python -m unittest test_ptt -v      （在 controller 目录下）
 
 不碰真的键盘、鼠标和摇杆：pynput 和 pygame 都是从 ptt.py 里的两个惰性导入函数
 拿的，测试把那两个函数换成假的，于是可以在没有输入设备、没有图形界面、也没装
@@ -544,13 +544,13 @@ class JoystickCaptureTest(unittest.TestCase):
 
 
 class SharedCopyTest(unittest.TestCase):
-    """三个客户端里的 ptt.py 必须逐字节相同。
+    """各客户端里的 ptt.py 必须逐字节相同。
 
-    这个仓库靠复制共享代码，不靠 import。改了一份不同步另外两份的话，
-    另外两个客户端的 PTT 行为会悄悄和测试说的不一样。
+    这个仓库靠复制共享代码，不靠 import。现在只有 controller 带 ptt.py，
+    以后再有客户端加副本时把它加进 COMPONENTS。
     """
 
-    COMPONENTS = ("controller", "xpc", "msfs")
+    COMPONENTS = ("controller",)
 
     def test_every_copy_is_byte_identical(self):
         here = os.path.dirname(os.path.abspath(__file__))

@@ -1,7 +1,0 @@
-﻿build/
-dist/
-__pycache__/
-*.pyc
-msfs_settings.json
-msfs-for-can.log*
-buildinfo.json

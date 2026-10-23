@@ -1,6 +1,6 @@
 # CI 打包和跑测试用的依赖清单。
 #
-# 只覆盖四个出包的 Windows 客户端（controller / atis / xpc / msfs）以及跑得动
+# 只覆盖出包的 Windows 客户端（controller / atis）以及跑得动
 # 它们测试所需的东西。服务端（server/）的 zeroc-ice 和生成的 MumbleServer slice
 # 不在这里——那些要在 Mumble 主机上生成，装不进 CI，server 的测试也不依赖它们。
 #
@@ -9,7 +9,7 @@
 
 # ---- 界面 ----
 PyQt6
-PyQt6-Fluent-Widgets            # 四个客户端共用的 Fluent 深色外观（theme.py）
+PyQt6-Fluent-Widgets            # 客户端共用的 Fluent 深色外观（theme.py）
 
 # ---- 语音 ----
 # 使用 pymumble_udp 的 Mumble 1.5+ protobuf UDP 音频格式；导入名仍是
@@ -23,20 +23,16 @@ pymumble-udp @ git+https://github.com/JianyueLab-Org/pymumble_udp.git@168f2c846d
 pyaudio
 numpy
 
-# opuslib 用 ctypes 在运行时加载原生 opus。四个组件目录里各自带了一份
+# opuslib 用 ctypes 在运行时加载原生 opus。组件目录里各自带了一份
 # opus.dll（已提交），gui.spec 的 find_opus() 会找到它并打进包里，所以 CI 上
 # 不需要额外装 opus。留着 pyogg 是给本地开发用的后备来源。
 pyogg
 
 # ---- 输入设备 ----
-# PTT 的三个来源都在 ptt.py 里（controller / xpc / msfs 各一份逐字节相同的副本）：
+# PTT 的三个来源都在 controller/ptt.py 里：
 # 键盘和鼠标侧键走 pynput 的全局监听，摇杆走 pygame 轮询。
 pynput                          # 键盘 + 鼠标侧键 PTT
 pygame                          # 摇杆 PTT（SDL 的视频/音频驱动会被置成 dummy）
-# ---- 模拟器 ----
-# SimConnect.dll 就在这个 wheel 里，msfs/gui.spec 从包目录把它捞出来打进
-# _internal/SimConnect/。少了它程序照常启动，只是永远读不到模拟器。
-SimConnect
 
 # ---- 语音合成（通播） ----
 pyttsx3

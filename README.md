@@ -18,25 +18,17 @@ COM1 频率决定他坐在哪个 Mumble 频道，管制员用一个电台栈同�
 |---|---|---|
 | `controller/` | `gui.py` | 管制客户端，一个电台栈，每个频率有 RX/TX/XC |
 | `atis/` | `gui.py` | 情报通播客户端，仿 vATIS：席位、预设、模板 |
-| `xpc/` | `gui.py` | **XPC for CAN** — X-Plane 客户端，语音 **+** FSD，能看到他机 |
-| `msfs/` | `gui.py` | **MSFS for CAN** — 同上，用于微软模拟器 |
 | `server/` | `login.py`、`ATIS/mumble.py` | 跑在 Mumble 主机上：Ice 认证器 + 服务端通播机队 |
 
-`xpc/` 和 `msfs/` 是功能最全的两个：除了语音还会登录 FSD，所以飞机会出现在
-网络上、也能看到别人。
+飞行员客户端（X-Plane / MSFS）已经移出这个分支，由 C# 统一客户端
+can-pilot-client 维护；这里只留管制、通播两个 Python 语音客户端和服务端。
 
 每个组件都是**从自己的目录独立运行**的——图标路径和配置文件都按当前目录解析。
-组件之间靠**复制**共享代码，不是 import（`mumblecompat.py`、`applog.py`、
-`voice.py` 等都有多份副本）。改公共逻辑要逐个核对副本，`xpc` 和 `msfs` 的
-`voice.py`、`traffic.py`、`chime.py`、`observer.py` 必须逐字节一致，有测试盯着。
+组件之间靠**复制**共享代码，不是 import（`mumblecompat.py`、`applog.py`
+等都有多份副本，`server/ATIS/` 里也有一份）。改公共逻辑要逐个核对副本，
+有测试盯着。
 
-`xpc/` 和 `msfs/` 还有一个**观察员模式**（连接栏上的勾），给双人机组的右座用：
-只连语音、不连 FSD，所以网络上不会多出一架飞机，也不会有重复呼号被踢。频率跟着
-自己的 COM1 走，没开模拟器就在无线电栏里手输一个。代价是收不到管制的文字消息
-——那是发给机长呼号的。两个人要用各自的账号。
-
-`controller/`、`atis/`、`xpc/` 和 `msfs/` 的设置中可选择服务器并刷新列表。
-`xpc/` 和 `msfs/` 的入口在「网络」页。语音和 FSD 分别选择，地址和端口会保存。
+`controller/` 和 `atis/` 的设置中可选择服务器并刷新列表，地址和端口会保存。
 选择「自定义」可手动填写地址和端口；列表获取失败时仍可使用已保存的地址。
 切换前需断开所有连接，ATIS 需停止所有播出。
 
@@ -62,8 +54,6 @@ library`。仓库里各组件目录下有 `opus.dll`，把那个目录加进 `PA
 ```powershell
 cd controller;    python gui.py
 cd atis;          python gui.py
-cd xpc;           python gui.py
-cd msfs;          python gui.py
 ```
 
 ---
@@ -71,15 +61,13 @@ cd msfs;          python gui.py
 ## 测试
 
 除 `server/login.py` 外每个组件都有测试，都在各自目录下运行，**不需要服务器、
-不需要音频设备、不需要网络**。跑之前把 `xpc` 加进 `PATH`（opus）。
+不需要音频设备、不需要网络**。跑之前把 `controller` 加进 `PATH`（opus）。
 
 ```powershell
 cd controller;    python -m unittest test_radiostack test_applog test_mumblecompat test_voice -v
                   python smoke_gui.py
 cd atis;          python -m unittest test_atis test_applog test_mumblecompat -v
                   python smoke_gui.py
-cd xpc;           python -m unittest test_xpc -v;  python smoke_gui.py
-cd msfs;          python -m unittest test_msfs -v; python smoke_gui.py
 cd server;        python -m unittest test_login test_serverconf -v
 cd server\ATIS;   python -m unittest test_mumble -v
 ```
@@ -107,11 +95,8 @@ pyinstaller gui.spec
 
 打包前先关掉正在运行的同名程序，否则 `dist/` 被占用会产出残缺的包。
 
-两个必须随包带上、漏了会静默失效的原生库：**每个 spec 都要带 `opus.dll`**
-（ctypes 运行时加载，静态分析看不见）；**`msfs/gui.spec` 还要带
-`SimConnect.dll`**，而且必须落在 `_internal/SimConnect/` —— Python-SimConnect
-按模块自身位置推路径。漏了 SimConnect.dll 的话程序照样启动、涂装照样扫描，
-就是永远读不到模拟器，界面一直说"连不上 MSFS"。
+必须随包带上、漏了会静默失效的原生库：**每个 spec 都要带 `opus.dll`**
+（ctypes 运行时加载，静态分析看不见）。
 
 ---
 
@@ -134,8 +119,7 @@ unless-stopped` 让外面重新拉起）。两个方向都会出事：`login.py`
 
 ### Docker
 
-镜像由 CI 构建并推到 GHCR（`.github/workflows/server-image.yml`，只在改
-`server/` 或 `Dockerfile` 时触发），服务器上用 compose 部署：
+这个分支暂时没有 GitHub CI，镜像需要手动构建并推到 GHCR，服务器上用 compose 部署：
 
 ```bash
 cp .env.example .env      # 改里面的密码；全都可以留空
@@ -161,9 +145,9 @@ docker run -d --name can-server --restart unless-stopped \
   can-audio-server
 ```
 
-**CI 里那步冒烟不是走过场**：这个镜像的失败模式全是"构建成功、运行时才发现"
+**构建完一定要冒烟**：这个镜像的失败模式全是"构建成功、运行时才发现"
 （漏了 `serverconf.py`、`start.sh` 没有执行位、ini 或 slice 路径探错），在
-`docker build` 的输出里一律是绿色的。所以构建完会真的把容器跑起来，等它自己的
+`docker build` 的输出里一律是绿色的。所以构建完要真的把容器跑起来，等它自己的
 HEALTHCHECK 变 healthy，再确认日志里出现了「认证器已设置」和「服务器回调已注册」。
 
 四条别绕过去的：
@@ -246,7 +230,7 @@ python3 server/fix_acl.py --apply    # 真的写进去
   `lock.acquire()` 没有任何超时（pymumble 源码里就写着 TODO）。命令没被处理就
   永久卡死，症状是日志的*缺失*——停在"建一个临时的"之后既没成功也没报错。
   **任何组件都不许调这两个包装**，自己发 `CreateChannel` / `MoveCmd`，再轮询确认
-  结果。`xpc/voice.py` 是参考实现。
+  结果。`controller/voice.py` 是参考实现。
 - **进没进频道是服务器说了算的，不能靠本地记账。** 连接都是 `reconnect=True`，
   重连之后服务器会把人放回根频道，而本地记的频率还是旧的。只比对本地值的话会
   以为"已经到位"而再也不切。另外根频道的 `channel_id` 就是 `0`，判断"有没有进

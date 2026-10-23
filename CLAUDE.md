@@ -14,15 +14,13 @@ There is no dependency manifest, test suite, or build script in the repo. Everyt
 |---|---|---|
 | `controller/` | `gui.py` | ATC client — a **stack of frequencies** modelled on [TrackAudio](https://github.com/pierr3/TrackAudio), each with RX/TX/XC |
 | `atis/` | `gui.py` | ATIS client modelled on [vATIS](https://github.com/vatis-project/vatis) — stations, presets, templates; broadcasts over Mumble |
-| `xpc/` | `gui.py` | **XPC for CAN** — X-Plane pilot client modelled on [xPilot](https://github.com/xpilot-project/xpilot): Mumble voice **and** an FSD connection |
-| `msfs/` | `gui.py` | **MSFS for CAN** — the same client for Microsoft Flight Simulator, over SimConnect |
 | `server/` | `login.py`, `ATIS/mumble.py` | Runs on the Mumble/Murmur host: Ice authenticator + server-side ATIS bot fleet |
 
-`controller/`, `atis/`, `xpc/` and `msfs/` are the shipped clients. Each component remains an independent directory so its PyInstaller spec and runtime configuration can be used from that directory.
+`controller/` and `atis/` are the shipped clients. **On this branch (`new-client-sys`) the `xpc/` and `msfs/` pilot clients and the GitHub workflows have been removed** — pilot clients now live in the C# can-pilot-client. Sections below that still mention `xpc/` / `msfs/` describe those removed directories; treat them as history, not as files to edit. Each component remains an independent directory so its PyInstaller spec and runtime configuration can be used from that directory.
 
 There is no shared package — each component is imported flat from its own directory, which is why `mumblecompat.py` and `applog.py` exist as per-component copies rather than one import. Keep that pattern when adding cross-cutting helpers; a shared parent module would need path juggling in every PyInstaller spec.
 
-All four GUI components carry `applog.py` and log rather than `print` — which matters because the packaged builds are `console=False` and a bare `print` goes nowhere.
+Both GUI components carry `applog.py` and log rather than `print` — which matters because the packaged builds are `console=False` and a bare `print` goes nowhere.
 
 ## Commands
 
