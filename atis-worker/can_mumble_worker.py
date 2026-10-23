@@ -1,7 +1,7 @@
 """Small CAN ATIS Mumble sender used by the desktop client.
 
 The protocol and channel lifecycle intentionally follow atis/broadcast.py
-(the old Python desktop ATIS client, still on main):
+(the old Python desktop ATIS client, still on can-audio's main branch):
 connect with pymumble, create FREQ_xxxxxx as a temporary root channel when
 needed, wait for the server echo, move in, then enqueue 20 ms PCM frames.
 """
@@ -24,6 +24,28 @@ mumblecompat.install()
 import pymumble_py3 as pymumble
 from pymumble_py3 import messages
 from pymumble_py3.constants import PYMUMBLE_CLBK_CONNECTED
+
+
+def frequency_khz(value):
+    """--frequency -> kHz. Accepts Hz (127800000, what can-atis sends) or MHz (127.8)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"not a frequency: {value!r}")
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError(f"not a frequency: {value!r}")
+    if number >= 1_000_000:
+        khz = number / 1000
+    elif number < 1000:
+        khz = number * 1000
+    else:
+        # 1000-999999 could be kHz or a typo; refuse rather than guess a channel
+        raise argparse.ArgumentTypeError(
+            f"frequency must be in Hz or MHz: {value!r}")
+    khz = int(round(khz))
+    if not 1 <= khz <= 999_999:
+        raise argparse.ArgumentTypeError(f"frequency out of range: {value!r}")
+    return khz
 
 
 def transport_status(mumble):
@@ -61,10 +83,11 @@ def main():
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--cid", required=True)
     parser.add_argument("--callsign", required=True)
-    parser.add_argument("--frequency", required=True)
+    parser.add_argument("--frequency", required=True, type=frequency_khz,
+                        help="Hz (127800000) or MHz (127.8)")
     args = parser.parse_args()
 
-    khz = int(round(float(args.frequency) * 1000))
+    khz = args.frequency
     channel_name = f"FREQ_{khz:06d}"
     user = f"{args.cid}_atis{khz:06d}_{args.callsign}"
     pcm = sys.stdin.buffer.read()

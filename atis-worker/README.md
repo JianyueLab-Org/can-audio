@@ -29,7 +29,8 @@ can_mumble_worker.py --host audio.ceruleanavi.net --port 64738 \
 ```
 
 - 网络密码走环境变量 `CAN_VOICE_PASSWORD`，不放在命令行上；进程读完就从环境里删掉。
-- `--frequency` 按 MHz 解析（`127.8` → 频道 `FREQ_127800`）。
+- `--frequency` 接受 Hz 或 MHz：`127800000` 和 `127.8` 都进频道 `FREQ_127800`。can-atis 传的是 Hz
+  （`AtisStation.Frequency`）。1000–999999 之间的值分不清是 kHz 还是写错了，直接拒绝。
 - Mumble 用户名是 `<cid>_atis<千赫六位>_<呼号>`，如 `1234_atis127800_ZBAA_ATIS`。
 - stdin：整段播报音频，48 kHz、单声道、16 位小端 PCM。C# 写完就关掉 stdin；读到空内容时以退出码 2 结束。
 
@@ -50,7 +51,7 @@ stderr 不属于协议，C# 原样记进自己的日志（密码替换成 `[reda
 | 退出码 | 含义 |
 | --- | --- |
 | 0 | `--self-test` 通过 |
-| 2 | stdin 为空 |
+| 2 | 参数不对（包括频率无法识别），或 stdin 为空 |
 | 3 | 15 秒内没连上 |
 | 4 | 5 秒内建不出频道 |
 | 5 | 5 秒内进不了频道 |
