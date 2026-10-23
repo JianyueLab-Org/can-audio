@@ -317,6 +317,8 @@ class VoiceClient:
         self._rx_mix_wakeup = threading.Condition(self._rx_mix_lock)
         self._rx_mix_frames = {}
         self._rx_mix_thread = None
+        self._range_audio_lock = threading.Lock()
+        self._range_audio_policy = {}
 
         self.mic_volume = 100
         # 发送链路：降噪 → × 校准基准（dB）× 会话乘数（mic_volume）→ 限幅。
@@ -361,6 +363,38 @@ class VoiceClient:
         self._last_connected = False
         self._stack = None               # 最近一次 sync 用的电台栈，重连后重推
         self._last_ping_rcv = time.time()
+
+    def set_range_audio_policy(self, policy):
+        """Replace the CID -> allow snapshot used for received audio.
+
+        CIDs absent from the snapshot are intentionally allowed.  The bridge
+        receives complete snapshots from the client, so replacing the dict in
+        one operation prevents an audio callback from observing a half-update.
+        """
+        if not isinstance(policy, dict):
+            raise ValueError("range_audio data must be an object mapping CID to allow")
+
+        normalized = {}
+        for cid, allow in policy.items():
+            cid = str(cid).strip()
+            if not cid:
+                raise ValueError("range_audio CID must not be empty")
+            if not isinstance(allow, bool):
+                raise ValueError(f"range_audio allow for CID {cid} must be boolean")
+            normalized[cid] = allow
+
+        with self._range_audio_lock:
+            self._range_audio_policy = normalized
+        return len(normalized)
+
+    def _range_audio_allowed(self, user):
+        """Return whether this Mumble user's audio may reach local outputs."""
+        try:
+            cid = str(user.get("name", "")).strip()
+        except AttributeError:
+            return True
+        with self._range_audio_lock:
+            return self._range_audio_policy.get(cid, True)
 
     # ---------- 状态回报 ----------
     def _state(self, state, message):
@@ -697,6 +731,8 @@ class VoiceClient:
         with self._rx_mix_wakeup:
             self._rx_mix_frames.clear()
             self._rx_mix_wakeup.notify_all()
+        with self._range_audio_lock:
+            self._range_audio_policy = {}
 
         for thread in (self._tx_thread, self._rx_monitor, self._rx_mix_thread,
                        self._connection_thread):
@@ -1256,6 +1292,9 @@ class VoiceClient:
 
         if channel_id != self.mumble.users.myself.get("channel_id"):
             self.listeners_confirmed = True   # 收到了监听频道的话音，服务端确实支持
+
+        if not self._range_audio_allowed(user):
+            return
 
         now = time.time()
         first = khz not in self._last_rx or now - self._last_rx[khz] > RX_TIMEOUT

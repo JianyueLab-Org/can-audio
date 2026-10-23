@@ -15,12 +15,12 @@ COM1 频率决定他坐在哪个 Mumble 频道，管制员用一个电台栈同�
 
 ## 组件
 
-| 目录 | 入口 | 是什么 |
-|---|---|---|
-| `controller/` | `bridge.py` | 无界面语音引擎：Mumble 连接、音频收发、混音、降噪、增益。由 C# 管制客户端启动，经 stdin/stdout 的 JSON Lines 通信 |
-| `atis-worker/` | `can_mumble_worker.py` | 通播语音发送进程：由 C# 通播客户端 can-atis 启动，从 stdin 收 PCM，进频率频道循环播报，stdout 上报连接状态 |
-| `server/` | `login.py`、`ATIS/mumble.py` | 跑在 Mumble 主机上：Ice 认证器 + 服务端通播机队 |
-| `native/rnnoise/` | `build.ps1` | 可选的 RNNoise 降噪原生库构建 |
+| 目录                | 入口                             | 是什么                                                                                                            |
+| ------------------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `controller/`     | `bridge.py`                    | 无界面语音引擎：Mumble 连接、音频收发、混音、降噪、增益。由 C# 管制客户端启动，经 stdin/stdout 的 JSON Lines 通信 |
+| `atis-worker/`    | `can_mumble_worker.py`         | 通播语音发送进程：由 C# 通播客户端 can-atis 启动，从 stdin 收 PCM，进频率频道循环播报，stdout 上报连接状态        |
+| `server/`         | `login.py`、`ATIS/mumble.py` | 跑在 Mumble 主机上：Ice 认证器 + 服务端通播机队                                                                   |
+| `native/rnnoise/` | `build.ps1`                    | 可选的 RNNoise 降噪原生库构建                                                                                     |
 
 这是 `new-client-sys` 分支：只放**客户端与 Python 开发共同维护的语音部分**和服务端。
 管制端的界面、设置、PTT 输入、电台栈规则都在 C# 客户端
@@ -103,8 +103,7 @@ cd server
 cd ATIS && python3 mumble.py          # 通播机队，需要 PATH 里有 ffmpeg
 ```
 
-`start.sh` 里**任何一个进程退出，整个退出**（容器上配 `--restart
-unless-stopped` 让外面重新拉起）。两个方向都会出事：`login.py` 不在，Murmur
+`start.sh` 里**任何一个进程退出，整个退出**（容器上配 `--restart unless-stopped` 让外面重新拉起）。两个方向都会出事：`login.py` 不在，Murmur
 回落到自己的空账号库，所有人登录被拒而客户端显示"密码错误"；`mumble-server`
 重启之后认证器不会被自动重新注册，`login.py` 的 `watch_connection()` 察觉链路
 断了会主动退出——"退出比假装还活着好"。
@@ -193,10 +192,10 @@ slice2py /usr/share/mumble-server/MumbleServer.ice
 
 Mumble 默认的根 ACL 不一定够。两个看起来毫不相干的故障其实是同一个缺口：
 
-| 症状 | 缺的权限 |
-|---|---|
-| 管制端「没有权限（频道监听需要 Listen 权限）」 | `Listen` `0x800` |
-| 情报台「Channel FREQ_127800 does not exists」 | `MakeTempChannel` `0x400` |
+| 症状                                           | 缺的权限                      |
+| ---------------------------------------------- | ----------------------------- |
+| 管制端「没有权限（频道监听需要 Listen 权限）」 | `Listen` `0x800`          |
+| 情报台「Channel FREQ_127800 does not exists」  | `MakeTempChannel` `0x400` |
 
 `Listen` 是 Mumble 1.4 才加的，**从 1.2/1.3 升级上来的服务器会留着一份没有它的
 旧 ACL**。频率频道都是根的临时子频道、继承根的 ACL，所以在根上授一次就够：
@@ -229,5 +228,3 @@ python3 server/fix_acl.py --apply    # 真的写进去
   频道"必须用 `is None`。
 - **`favicon.ico` 其实是 PNG**，扩展名不对。Qt 认内容所以窗口图标没问题，但
   PyInstaller 6 会拒绝它当 exe 图标，除非装了 `pillow` 帮它转换。
-
-更多背景和逐条出处见 `CLAUDE.md`。
