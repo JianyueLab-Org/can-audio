@@ -24,6 +24,8 @@ import pyaudio
 import pymumble_py3 as pymumble
 from pymumble_py3 import messages, mumble_pb2
 from pymumble_py3.constants import (
+    PYMUMBLE_CLBK_CHANNELCREATED,
+    PYMUMBLE_CLBK_CHANNELREMOVED,
     PYMUMBLE_CLBK_CONNECTED,
     PYMUMBLE_CLBK_DISCONNECTED,
     PYMUMBLE_CLBK_PERMISSIONDENIED,
@@ -333,6 +335,12 @@ class VoiceClient:
         self._channel_ids = {}           # frequency_khz -> channel_id
         self._channel_to_khz = {}        # channel_id -> frequency_khz
         self._listening = set()
+        # 频道监听集合会被两条线程改：sync 线程按电台栈推，pymumble 的网络线程在
+        # 频道被销毁时把死号拆掉（见 _on_channel_removed）
+        self._listen_lock = threading.Lock()
+        # 自己正在建的频道名。服务器回 ChannelState 时也会触发 CHANNELCREATED，
+        # 那是自己建的，不该再补一轮 sync
+        self._creating = set()
         self._tx_channels = []
         self._xc_channels = []
         self._sent_target = None         # 上次发出去的发话目标，避免重复发
@@ -458,6 +466,10 @@ class VoiceClient:
             self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_SOUNDRECEIVED, self._on_sound)
             self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_PERMISSIONDENIED,
                                                self._on_permission_denied)
+            self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_CHANNELCREATED,
+                                               self._on_channel_created)
+            self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_CHANNELREMOVED,
+                                               self._on_channel_removed)
             self.mumble.start()
         except Exception as e:
             self._abort_connect()
@@ -875,12 +887,15 @@ class VoiceClient:
             time.sleep(0.1)
         return self._find_channel(name)
 
-    def _resolve_channel(self, khz):
-        """拿到频率对应的频道 id，没有就建一个临时频道。解析不出来时返回 None。"""
-        channel_id, _ = self._resolve_channel_ex(khz)
+    def _resolve_channel(self, khz, create=True):
+        """拿到频率对应的频道 id，没有就建一个临时频道。解析不出来时返回 None。
+
+        ``create=False`` 时频道不存在就直接返回 None，不建。
+        """
+        channel_id, _ = self._resolve_channel_ex(khz, create=create)
         return channel_id
 
-    def _resolve_channel_ex(self, khz):
+    def _resolve_channel_ex(self, khz, create=True):
         """同 `_resolve_channel`，另外回报**这一次是不是新建过频道**。
 
         `_join_frequency` 要靠这个信息决定重不重试。真 Murmur 分配的是**最小空闲
@@ -901,14 +916,24 @@ class VoiceClient:
         "收得到、发不动、不报错"。
 
         查一次频道表只是本地字典查找，不走网络，没有省下来的必要。
+
+        **只有要进去的频率才能建频道（create=True）。** Murmur 会把建临时频道的
+        人当场挪进去；只监听的频率要是也建，紧接着进主频道时就得离开它，它一空
+        就被销毁，监听落了空，下一轮再建——实测日志里 FREQ_122800 每 15 秒一次
+        "Added channel" + "Moved … to FREQ_125900"，整晚没监听上。
         """
         name = syncplan.channel_name(khz)
         channel = self._find_channel(name)
         recreated = False
 
         if channel is None:
-            recreated = True
             self._forget_channel(khz, name)
+            if not create:
+                log.debug("channel %s does not exist yet, waiting for someone "
+                          "to open it", name)
+                return None, recreated
+            recreated = True
+            self._creating.add(name)
             try:
                 log.info("channel %s does not exist, creating a temporary one", name)
                 # 清掉上一次的拒绝说明，否则 _wait_for_channel 会拿旧的当这一次的
@@ -918,6 +943,8 @@ class VoiceClient:
             except Exception as e:
                 log.warning(f"could not create channel {name}: {e}")
                 return None, recreated
+            finally:
+                self._creating.discard(name)
         if channel is None:
             log.warning("channel %s did not appear within %.0f s of being "
                         "created, skipping this round", name, CHANNEL_TIMEOUT)
@@ -952,9 +979,50 @@ class VoiceClient:
             return
         if self._channel_to_khz.get(stale) == khz:
             self._channel_to_khz.pop(stale, None)
-        self._listening.discard(stale)
+        with self._listen_lock:
+            self._listening.discard(stale)
         log.info("channel %s is gone (a temporary channel dies as soon as it "
                  "empties), discarding the stale id %s", name, stale)
+
+    def _on_channel_created(self, channel):
+        """别人开了电台栈里的某个频率，立刻补一轮 sync 把监听挂上。
+
+        只监听的频率不再自己建频道，频道要等别人（机组、另一位管制员）开出来；
+        光靠界面 15 秒一次的 sync，对方开口的头几句就听不到了。
+
+        这是 pymumble 网络线程里、持着频道表锁调的，sync 要等好几秒，必须另起
+        线程。
+        """
+        try:
+            name = channel["name"]
+        except (KeyError, TypeError):
+            return
+        stack = self._stack
+        if not self.connected or stack is None or name in self._creating:
+            return
+        wanted = (set(stack.rx_frequencies()) | set(stack.tx_frequencies())
+                  | set(stack.xc_frequencies()))
+        if name not in {syncplan.channel_name(khz) for khz in wanted}:
+            return
+        log.info("channel %s was opened, syncing the radio stack", name)
+        threading.Thread(target=self.sync, args=(stack,), daemon=True).start()
+
+    def _on_channel_removed(self, channel):
+        """临时频道空了被服务器销毁，它上面的监听也跟着没了。
+
+        不拆的话 `_listening` 里留着这个号；Murmur 发的是最小空闲号，频道下次被
+        建回来多半还是同一个号，`_set_listening` 的 diff 就会以为早监听上了，
+        一条监听都不发。
+        """
+        try:
+            channel_id = channel["channel_id"]
+        except (KeyError, TypeError):
+            return
+        with self._listen_lock:
+            self._listening.discard(channel_id)
+        khz = self._channel_to_khz.pop(channel_id, None)
+        if khz is not None and self._channel_ids.get(khz) == channel_id:
+            self._channel_ids.pop(khz, None)
 
     def sync(self, stack):
         """把电台栈的状态推到服务器：进主频道、监听其余 RX、设好 TX 目标。
@@ -1005,18 +1073,22 @@ class VoiceClient:
         # 内没回来（远程服务器上很常见），后面几遍就会看到"频道还是不存在"，
         # 于是**再各发一次 CreateChannel**——服务器随后用 ChannelName（重名）
         # 回拒，日志里同一秒里连着好几行"建一个临时的"就是这么来的。
+        #
+        # 这一遍**只查不建**：频道不存在说明这个频率上眼下没有人，监听它、往它
+        # 发话都没有对象。建了反而坏事——Murmur 把建频道的人挪进去，一回主频道
+        # 它就空了被销毁，每一轮建一次、删一次（见 _resolve_channel_ex）。等
+        # 别人开出来，_on_channel_created 会补一轮 sync。
         wanted_khz = list(dict.fromkeys(
             list(stack.rx_frequencies())
             + list(stack.tx_frequencies())
             + list(stack.xc_frequencies())))
         resolved = {}
         for khz in wanted_khz:
-            channel_id = self._resolve_channel(khz)
+            channel_id = self._resolve_channel(khz, create=False)
             if channel_id is not None:
                 resolved[khz] = channel_id
 
-        rx_channels = {khz: resolved[khz] for khz in stack.rx_frequencies()
-                       if khz in resolved}
+        rx_khz = list(stack.rx_frequencies())
 
         # 主频率：真正进入的那个频道。服务端不支持监听时，至少这个频率能听到。
         #
@@ -1039,25 +1111,40 @@ class VoiceClient:
             locked = {raw_locked}
         else:
             locked = set(raw_locked or ())
+        #
+        # 主频道是唯一允许新建频道的地方：要进去的频道，人在里面它就不会被销毁。
         if locked:
-            if stack.selected_khz in locked and stack.selected_khz in rx_channels:
+            if stack.selected_khz in locked and stack.selected_khz in rx_khz:
                 candidates.append(stack.selected_khz)
             candidates.extend(
                 khz for khz in sorted(locked)
-                if khz in rx_channels and khz not in candidates)
+                if khz in rx_khz and khz not in candidates)
         else:
-            if stack.selected_khz in rx_channels:
+            if stack.selected_khz in rx_khz:
                 candidates.append(stack.selected_khz)
-            if not candidates and rx_channels:
-                candidates.append(next(iter(rx_channels)))
+            if not candidates and rx_khz:
+                # 优先挑已经有人在的频率，免得为了当主频道凭空建一个
+                candidates.append(next((khz for khz in rx_khz if khz in resolved),
+                                       rx_khz[0]))
 
         joined_khz = None
         for khz in candidates:
-            if self._join_frequency(khz, rx_channels[khz]):
+            channel_id = resolved.get(khz)
+            if channel_id is None:
+                channel_id = self._resolve_channel(khz)
+            if channel_id is not None and self._join_frequency(khz, channel_id):
                 joined_khz = khz
+                # _join_frequency 可能按名字重解析过，以表里最新的号为准
+                resolved[khz] = self._channel_ids.get(khz, channel_id)
                 break
+            if khz in self._channel_ids:
+                resolved[khz] = self._channel_ids[khz]
+            else:
+                resolved.pop(khz, None)
             log.warning("could not join the primary channel %s",
                         syncplan.format_frequency(khz))
+
+        rx_channels = {khz: resolved[khz] for khz in rx_khz if khz in resolved}
 
         # 没进去的频率一律挂频道监听——**试过没进去的那些也算在内**，别让管制员
         # 唯一在用的那个频率成了唯一听不到的
@@ -1163,25 +1250,40 @@ class VoiceClient:
                      or self._channel_name(channel_id) == expected_name))
 
     def _set_listening(self, channel_ids):
-        """频道监听。pymumble 没封装，直接发 UserState。"""
-        add = channel_ids - self._listening
-        remove = self._listening - channel_ids
-        if not add and not remove:
-            return
+        """频道监听。pymumble 没封装，直接发 UserState。
 
+        持着 `_listen_lock` 做，并且只记还在频道表里的号：pymumble 先把频道从表
+        里删掉再回调 _on_channel_removed，这样无论两边谁先拿到锁，死号都不会
+        留在 `_listening` 里。
+        """
+        with self._listen_lock:
+            channel_ids = {c for c in channel_ids if self._channel_exists(c)}
+            add = channel_ids - self._listening
+            remove = self._listening - channel_ids
+            if not add and not remove:
+                return
+
+            try:
+                state = mumble_pb2.UserState()
+                state.session = self.mumble.users.myself_session
+                for channel_id in add:
+                    state.listening_channel_add.append(channel_id)
+                for channel_id in remove:
+                    state.listening_channel_remove.append(channel_id)
+                self.mumble.send_message(PYMUMBLE_MSG_TYPES_USERSTATE, state)
+                log.debug("channel listeners +%s -%s, now listening to %s",
+                          sorted(add), sorted(remove), sorted(channel_ids))
+                self._listening = set(channel_ids)
+            except Exception as e:
+                log.warning(f"setting the channel listeners failed: {e}")
+
+    def _channel_exists(self, channel_id):
         try:
-            state = mumble_pb2.UserState()
-            state.session = self.mumble.users.myself_session
-            for channel_id in add:
-                state.listening_channel_add.append(channel_id)
-            for channel_id in remove:
-                state.listening_channel_remove.append(channel_id)
-            self.mumble.send_message(PYMUMBLE_MSG_TYPES_USERSTATE, state)
-            log.debug("channel listeners +%s -%s, now listening to %s",
-                      sorted(add), sorted(remove), sorted(channel_ids))
-            self._listening = set(channel_ids)
-        except Exception as e:
-            log.warning(f"setting the channel listeners failed: {e}")
+            self.mumble.channels[channel_id]
+            return True
+        except (KeyError, TypeError, AttributeError, IndexError,
+                pymumble.errors.UnknownChannelError):
+            return False
 
     def _program_target(self, target_id, channel_ids):
         """把一组频道编成某个编号的 VoiceTarget。"""
