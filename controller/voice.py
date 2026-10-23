@@ -156,6 +156,12 @@ SUPPORTED_SAMPLE_RATES = [48000, 44100, 32000, 24000, 16000]
 PTT_TARGET_ID = 1
 XC_TARGET_BASE = 10            # 每个 XC 频率一个编号，从这里往后排
 RX_TIMEOUT = 0.5               # 多久没收到话音就认为对方松开了
+# 服务器写在音频包里的送达方式（Mumble 1.5 Audio.context，pymumble 放在
+# soundchunk.target），见 _rx_channel
+AUDIO_CONTEXT_NORMAL = 0       # 当前频道里的正常说话
+AUDIO_CONTEXT_SHOUT = 1        # 发到我们当前频道的 VoiceTarget
+AUDIO_CONTEXT_WHISPER = 2      # 直接发给本人
+AUDIO_CONTEXT_LISTEN = 3       # 经由监听的频道
 CONNECT_TIMEOUT = 15.0
 # 建完临时频道到它出现在频道表里、以及进频道到服务器确认，都要等一次网络往返。
 # 固定 sleep 赌不起——远程服务器上 0.2 秒经常不够，表现出来就是频道"建不出来"。
@@ -1341,7 +1347,7 @@ class VoiceClient:
         if not soundchunk or getattr(soundchunk, "pcm", None) is None:
             return
 
-        channel_id = user.get("channel_id")
+        channel_id = self._rx_channel(user, soundchunk)
         khz = self._channel_to_khz.get(channel_id)
         if khz is None:
             return                      # 不是我们关心的频率
@@ -1386,6 +1392,41 @@ class VoiceClient:
         # ATIS whispers must not become unrestricted cross-coupled channel audio.
         if not re.fullmatch(r"[0-9]+_atis[0-9]{6}(?:_[A-Z0-9]{4}_(?:[DA]_)?ATIS)?", user.get("name", "")):
             self._forward_cross_couple(khz, soundchunk)
+
+    def _rx_channel(self, user, soundchunk):
+        """这段话音是从**我们的哪个频道**收到的。
+
+        不能直接用说话人自己所在的频道。管制员的话是靠 VoiceTarget 发出去的，
+        人待在自己的主频道，话却可以发到别的频率：实测塔台 10006 待在
+        FREQ_118500，按 PTT 发 125.900，1005 在 125.900 里听得见，界面却亮
+        118.500。
+
+        服务器在每个音频包里写明这段话是怎么送到**我们**这儿的（Mumble 1.5
+        的 Audio.context，pymumble 放在 soundchunk.target）：
+
+        - NORMAL / SHOUT：我们是作为当前频道的成员收到的，频率就是主频道；
+        - LISTEN：经由某个监听频道收到。说话人所在频道正好在监听里就是它
+          （正常说话、或者 TX 带上了自己的频道）；只监听着一个频道也只能是它；
+        - WHISPER（直接发给本人，ATIS 的地理分发就是这样）和认不出的值：
+          只剩说话人所在频道这一条线索，照旧用它。
+        """
+        sender_channel = user.get("channel_id")
+        context = getattr(soundchunk, "target", None)
+        if context in (AUDIO_CONTEXT_NORMAL, AUDIO_CONTEXT_SHOUT):
+            myself = self.mumble.users.myself
+            mine = myself.get("channel_id") if myself is not None else None
+            return mine if mine is not None else sender_channel
+        if context == AUDIO_CONTEXT_LISTEN:
+            with self._listen_lock:
+                listening = set(self._listening)
+            if sender_channel in listening or not listening:
+                return sender_channel
+            if len(listening) == 1:
+                return next(iter(listening))
+            log.debug("audio from %s reached us through one of the listened "
+                      "channels %s, cannot tell which", user.get("name"),
+                      sorted(listening))
+        return sender_channel
 
     def _rx_mix_loop(self):
         """按固定帧长混合所有正在收到的频率音频，再写入一次声卡。"""

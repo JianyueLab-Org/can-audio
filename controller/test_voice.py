@@ -347,6 +347,56 @@ class RxIndicatorTest(unittest.TestCase):
         client._on_sound({"name": "1001", "channel_id": 7}, types.SimpleNamespace(pcm=pcm))
         self.assertEqual(len(client.mumble.sound_output.sent), 1)
 
+    def heard_on(self, context, sender_channel, my_channel=1, listening=()):
+        """1005 在 my_channel 里、监听着 listening，收到一段 context 送来的话音。
+
+        频道 1 = 125.900，2 = 118.500，3 = 122.800。
+        """
+        client = make_client()
+
+        class Users(dict):
+            myself = {"name": "1005", "channel_id": my_channel}
+        client.mumble.users = Users()
+        client.mumble.channels = {1: {"name": "FREQ_125900"},
+                                  2: {"name": "FREQ_118500"},
+                                  3: {"name": "FREQ_122800"}}
+        client._channel_to_khz = {1: 125900, 2: 118500, 3: 122800}
+        client._channel_ids = {125900: 1, 118500: 2, 122800: 3}
+        client._listening = set(listening)
+        events = []
+        client.on_rx = lambda khz, active, name: events.append(khz)
+        pcm = np.array([10, 20], dtype=np.int16).tobytes()
+        client._on_sound({"name": "10006", "channel_id": sender_channel},
+                         types.SimpleNamespace(pcm=pcm, target=context))
+        return events
+
+    def test_a_voice_target_into_our_channel_is_shown_on_our_frequency(self):
+        """实测：塔台 10006 待在 FREQ_118500，PTT 发 125.900；1005 在 125.900。
+
+        听得见，界面却亮 118.500——原来按说话人所在的频道算频率。
+        """
+        events = self.heard_on(voice.AUDIO_CONTEXT_SHOUT, sender_channel=2,
+                               listening={2})
+        self.assertEqual(events, [125900])
+
+    def test_normal_speech_is_on_our_channel(self):
+        self.assertEqual(self.heard_on(voice.AUDIO_CONTEXT_NORMAL, 1), [125900])
+
+    def test_listened_audio_uses_the_sender_channel_when_we_listen_to_it(self):
+        events = self.heard_on(voice.AUDIO_CONTEXT_LISTEN, sender_channel=3,
+                               listening={2, 3})
+        self.assertEqual(events, [122800])
+
+    def test_listened_audio_from_elsewhere_goes_to_the_only_listened_channel(self):
+        events = self.heard_on(voice.AUDIO_CONTEXT_LISTEN, sender_channel=2,
+                               listening={3})
+        self.assertEqual(events, [122800])
+
+    def test_a_direct_whisper_keeps_the_sender_channel(self):
+        """ATIS 地理分发是直接发给本人的 whisper，频率只能看说话人所在频道。"""
+        events = self.heard_on(voice.AUDIO_CONTEXT_WHISPER, sender_channel=2)
+        self.assertEqual(events, [118500])
+
     def test_continuous_audio_never_reports_rx_end(self):
         """有人一直在讲话时，监控线程不该报 RX 结束——那会让指示灯闪。"""
         client = make_client()
