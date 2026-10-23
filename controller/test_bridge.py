@@ -57,6 +57,69 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual({r.frequency_khz: r.effective_volume() for r in plan},
                          {118000: 80, 121700: 100})
 
+    def test_range_audio_command_requires_connection(self):
+        process = subprocess.Popen([sys.executable, '-u', str(Path(__file__).with_name('bridge.py'))],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding='utf-8')
+        try:
+            output, error = process.communicate('\n'.join(json.dumps(item) for item in [
+                {'id': 1, 'command': 'range_audio', 'data': {'1003': False}},
+                {'id': 2, 'command': 'quit'},
+            ]) + '\n', timeout=10)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+        self.assertEqual(process.returncode, 0, error)
+        replies = {message['id']: message for message in map(json.loads, output.splitlines())
+                   if 'id' in message}
+        self.assertIn('error', replies[1])
+        self.assertIn('尚未连接', replies[1]['error'])
+        self.assertNotIn(2, replies)
+
+    def test_invalid_range_audio_payloads_preserve_previous_policy(self):
+        # 在独立进程运行真正的命令循环，只替换联网和声卡初始化。
+        script = '''
+from unittest.mock import patch
+import bridge
+from voice import VoiceClient
+client = VoiceClient("host", "1000", "pw")
+original = client.set_range_audio_policy
+def apply(policy):
+    if policy == {}:
+        bridge.emit(id=998, result=client._range_audio_policy)
+    return original(policy)
+client.set_range_audio_policy = apply
+with patch("voice.VoiceClient", return_value=client), \\
+     patch.object(client, "connect", return_value=True), \\
+     patch.object(client, "disconnect"):
+    bridge.main()
+bridge.emit(id=999, result=client._range_audio_policy)
+'''
+        invalid = [[], False, 0, "", None, ["1001", False], {"1001": 1}, {"": False}]
+        for payload in invalid + ['missing']:
+            with self.subTest(payload=payload):
+                request = {'id': 3, 'command': 'range_audio'}
+                if payload != 'missing':
+                    request['data'] = payload
+                requests = [
+                    {'id': 1, 'command': 'connect', 'data': {
+                        'host': 'host', 'cid': '1000', 'password': 'pw', 'port': 64738}},
+                    {'id': 2, 'command': 'range_audio', 'data': {'1001': False}},
+                    request,
+                    {'id': 4, 'command': 'range_audio', 'data': {}},
+                    {'id': 5, 'command': 'quit'},
+                ]
+                process = subprocess.run([sys.executable, '-c', script],
+                    cwd=Path(__file__).parent, input='\n'.join(map(json.dumps, requests)) + '\n',
+                    capture_output=True, text=True, encoding='utf-8', timeout=10)
+                self.assertEqual(process.returncode, 0, process.stderr)
+                replies = {msg['id']: msg for msg in map(json.loads, process.stdout.splitlines()) if 'id' in msg}
+                self.assertIn('error', replies[3])
+                self.assertEqual(replies[998]['result'], {'1001': False})
+                self.assertEqual(replies[4]['result'], {'entries': 0})
+                self.assertEqual(replies[999]['result'], {})
+
 
 if __name__ == '__main__':
     unittest.main()

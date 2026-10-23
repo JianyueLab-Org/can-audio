@@ -33,6 +33,7 @@ C# 对每条命令等 90 秒。
 | `connect` | `host`, `port`, `cid`, `password`, `input`, `output`（设备 index 或 null） | `true` / `false` | 阻塞到连上或失败；失败原因走 `state` 事件 |
 | `audio` | `mic`, `speaker`（0–200 %），`denoise`（bool），`input`, `output` | `null` | 未连接时报错 |
 | `sync` | 见下 | `null` | 立即返回，频道同步在后台线程做 |
+| `range_audio` | `{ "CID": true/false }` | `{"entries": n}` | 替换范围通话策略；未出现的 CID 默认允许 |
 | `ptt` | `active`（bool） | `null` | 开始 / 停止发话；未连接时忽略。C# 已经过滤掉"未上席位"和"设置窗口打开"的情况 |
 | `disconnect` | 无 | `null` | |
 | `quit` | 无 | `null` | 收尾后退出进程；stdin 关闭也会退出 |
@@ -48,6 +49,12 @@ C# 对每条命令等 90 秒。
 - `selected` 是主频率（真正进入的频道），可为 `null`；`locked` 是本人在数据源上值守的频率，进不去主频率时按它回退。
 - `volumes` 的键是频率字符串，值 0–100（静音已折算为 0）。
 - `tx` 为空时必须立刻停止发话（未上席位或全部关了 TX）。
+
+`range_audio` 的完整约定见仓库根目录的
+[`range_audio_protocol.md`](../range_audio_protocol.md)。C# 客户端应定时发送完整的
+CID 策略快照，例如 `{"1003": true, "10013": false}`；Python 只在收到声音时按
+Mumble 用户名（当前即 CID）查询该快照，明确为 `false` 的来源不会进入本地混音或
+交叉耦合，未列出的来源放行。
 
 ### 事件（Python → C#）
 
