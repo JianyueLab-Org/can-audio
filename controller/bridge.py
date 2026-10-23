@@ -79,7 +79,7 @@ def main():
                     # 频道同步会等待网络往返，不能挡住 PTT 松开指令。
                     threading.Thread(target=client.sync, args=(plan,), daemon=True).start()
                 elif command == 'range_audio' and client:
-                    result = {'entries': client.set_range_audio_policy(data)}
+                    result = {'entries': client.set_range_audio_policy(request.get('data'))}
                 elif command == 'audio' and client:
                     client.set_mic_volume(data['mic'])
                     client.set_speaker_volume(data['speaker'])
