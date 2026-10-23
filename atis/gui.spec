@@ -64,6 +64,7 @@ a = Analysis(
     # pyttsx3 的驱动是运行时按名字加载的，静态分析找不到
     hiddenimports=[
         'pymumble_py3',
+        'pymumble_py3.MumbleUDP_pb2',
         'google.protobuf',
         'pyttsx3.drivers',
         'pyttsx3.drivers.sapi5',

@@ -181,8 +181,23 @@ class Wire:
         assert size == len(body)
         self.messages.append((kind, body, threading.get_ident()))
         if kind == 1:
-            self.audio.append(body[0] & 31)
+            self.audio.append(audio_target(body))
         return len(packet)
+
+
+def audio_target(body):
+    """UDPTUNNEL payload -> voice target, in either pymumble's audio format.
+
+    PyPI pymumble writes the legacy header byte (codec << 5 | target);
+    pymumble-udp writes Mumble 1.5's protobuf format, a 0 type byte and then a
+    MumbleUDP.Audio message carrying the target.
+    """
+    if body[0] >> 5:
+        return body[0] & 31
+    from pymumble_py3 import MumbleUDP_pb2
+    audio = MumbleUDP_pb2.Audio()
+    audio.ParseFromString(body[1:])
+    return audio.target
 
 
 class Encoder:
@@ -227,6 +242,11 @@ class FakeMumble:
         body = message.SerializeToString()
         self.control_socket.send(struct.pack("!HL", kind, len(body)) + body)
 
+    def send_audio_packet(self, packet):
+        # pymumble-udp's SoundOutput hands audio here; with UDP off it goes
+        # down the TCP tunnel exactly like PyPI pymumble's.
+        self.control_socket.send(struct.pack("!HL", 1, len(packet)) + packet)
+
 
 class GateFixture(RoutingTestCase):
     def setUp(self):
@@ -257,6 +277,10 @@ class GateFixture(RoutingTestCase):
 
 
 class GateTest(GateFixture):
+    def test_attach_keeps_atis_audio_on_the_tcp_tunnel(self):
+        """VoiceTarget changes go over TCP; UDP audio could overtake them."""
+        self.assertIs(self.mumble.udp_enabled, False)
+
     def test_new_listener_preserves_current_cycle_and_buffer(self):
         generation = self.router.begin_cycle()
         self.assertTrue(self.router.enqueue(b"\x01\x00" * 960, generation))
@@ -444,6 +468,9 @@ class RealStartupTest(RoutingTestCase):
 
         mumble = library.Mumble("synthetic.invalid", "900_atis128800_RJTT_ATIS",
                                 reconnect=reconnect)
+        # As broadcast.py and mumble.py do. pymumble-udp builds sound_output
+        # only when receive_sound is on; PyPI pymumble always builds it.
+        mumble.set_receive_sound(True)
         self.assertFalse(any(hasattr(mumble, name) for name in ("users", "channels", "sound_output")))
         router = self.routing.ATISRouter("RJTT_ATIS", 128800, feed=FakeFeed(self.routing))
         self.addCleanup(router.close)
@@ -480,7 +507,7 @@ class RealStartupTest(RoutingTestCase):
         with mock.patch.object(self.routing.time, "time", return_value=NOW), \
                 mock.patch.object(library.socket, "getaddrinfo", return_value=[(2, 1, 6, "", ("127.0.0.1", 0))]), \
                 mock.patch.object(library.socket, "socket", side_effect=transports), \
-                mock.patch.object(library.ssl, "wrap_socket", side_effect=lambda socket, **kwargs: socket, create=True), \
+                mock.patch.object(library.ssl, "wrap_socket", side_effect=lambda socket, **kwargs: socket, create=True),                 mock.patch.object(library, "_wrap_socket", side_effect=lambda socket, *args, **kwargs: socket, create=True), \
                 mock.patch.object(library.select, "select", side_effect=select), \
                 mock.patch.object(library, "PYMUMBLE_CONNECTION_RETRY_INTERVAL", 0), \
                 mock.patch.object(soundoutput.opuslib, "Encoder", side_effect=RecordingEncoder):

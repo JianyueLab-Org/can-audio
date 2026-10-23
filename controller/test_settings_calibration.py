@@ -90,6 +90,19 @@ class MicCalibrationSettingsTest(unittest.TestCase):
         self.assertEqual(settings.mumble_host, "audio.ceruleanavi.net")
         self.assertEqual(settings.last_username, "1000")
 
+    def test_migrates_the_old_voice_host(self):
+        for host in ("hjdczy.top", "audio.airwaysn.org"):
+            with self.subTest(host=host):
+                with open("radio_settings.json", "w", encoding="utf-8") as config:
+                    json.dump({"mumble_host": host}, config)
+                self.assertEqual(settings_module.Settings().mumble_host,
+                                 "audio.ceruleanavi.net")
+
+    def test_keeps_a_deliberate_voice_host(self):
+        with open("radio_settings.json", "w", encoding="utf-8") as config:
+            json.dump({"mumble_host": "127.0.0.1"}, config)
+        self.assertEqual(settings_module.Settings().mumble_host, "127.0.0.1")
+
 
 if __name__ == "__main__":
     unittest.main()

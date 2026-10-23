@@ -272,6 +272,12 @@ class ATISRouter:
             self._owned_feed = True
         self.mumble = mumble
         self._disabled = False
+        # pymumble-udp sends audio over UDP when it can, while the VoiceTarget
+        # update stays on TCP, so a frame could reach the server before the
+        # receiver set it was meant for. Keep ATIS on the TCP tunnel: the
+        # registration-before-audio ordering depends on one stream. Read on
+        # every connect(); PyPI pymumble has no UDP and ignores the attribute.
+        mumble.udp_enabled = False
         init = mumble.init_connection
         dispatch = mumble.dispatch_control_message
 
