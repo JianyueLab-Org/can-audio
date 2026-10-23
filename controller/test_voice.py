@@ -164,6 +164,72 @@ class CrossCoupleDuringPttTest(unittest.TestCase):
                         f"出现了意料之外的 target: {targets - allowed}")
 
 
+class RangeAudioTest(unittest.TestCase):
+    def test_missing_cid_is_allowed_and_explicit_false_is_blocked(self):
+        client = make_client()
+        client.set_range_audio_policy({'1001': True, '1002': False})
+
+        self.assertTrue(client._range_audio_allowed({'name': '1001'}))
+        self.assertFalse(client._range_audio_allowed({'name': '1002'}))
+        self.assertTrue(client._range_audio_allowed({'name': '1003'}))
+
+    def test_blocked_source_is_not_mixed_or_cross_coupled(self):
+        client = make_client()
+        class Users(dict):
+            myself = {'name': '1000', 'channel_id': 7}
+        client.mumble.users = Users()
+        client.mumble.channels = {7: {'name': 'FREQ_118000'}}
+        client._channel_to_khz = {7: 118000}
+        client._channel_ids = {118000: 7}
+        client._xc_channels = [7, 8]
+        client._program_cross_couple_targets()
+        client.set_range_audio_policy({'1002': False})
+        pcm = b'\x01\x00' * 960
+
+        client._on_sound({'name': '1002', 'session': 2, 'channel_id': 7},
+                         types.SimpleNamespace(pcm=pcm))
+
+        self.assertEqual(client._rx_mix_frames, {})
+        self.assertEqual(client.mumble.sound_output.sent, [])
+
+    def test_allowed_sources_on_same_frequency_are_still_mixed(self):
+        client = make_client()
+        class Users(dict):
+            myself = {'name': '1000', 'channel_id': 7}
+        client.mumble.users = Users()
+        client.mumble.channels = {7: {'name': 'FREQ_118000'}}
+        client._channel_to_khz = {7: 118000}
+        client.set_range_audio_policy({'1002': False})
+
+        client._on_sound({'name': '1001', 'session': 1, 'channel_id': 7},
+                         types.SimpleNamespace(pcm=b'\x01\x00' * 960))
+        client._on_sound({'name': '1002', 'session': 2, 'channel_id': 7},
+                         types.SimpleNamespace(pcm=b'\x02\x00' * 960))
+
+        self.assertEqual(list(client._rx_mix_frames), [(118000, 1)])
+
+    def test_policy_replaces_previous_snapshot_atomically(self):
+        client = make_client()
+        self.assertEqual(client.set_range_audio_policy({'1001': False}), 1)
+        self.assertFalse(client._range_audio_allowed({'name': '1001'}))
+
+        self.assertEqual(client.set_range_audio_policy({'1002': False}), 1)
+        self.assertTrue(client._range_audio_allowed({'name': '1001'}))
+        self.assertFalse(client._range_audio_allowed({'name': '1002'}))
+
+    def test_policy_requires_boolean_values(self):
+        client = make_client()
+        with self.assertRaises(ValueError):
+            client.set_range_audio_policy({'1001': 1})
+
+    def test_disconnect_clears_the_session_policy(self):
+        client = make_client()
+        client.set_range_audio_policy({'1001': False})
+        client.disconnect()
+
+        self.assertTrue(client._range_audio_allowed({'name': '1001'}))
+
+
 class TransmitThreadTest(unittest.TestCase):
 
     def test_ptt_summary_reports_microphone_and_queue_progress(self):
