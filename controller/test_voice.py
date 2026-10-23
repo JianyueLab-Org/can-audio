@@ -24,7 +24,7 @@ for _name in ("opuslib", "opuslib.api", "opuslib.api.decoder",
               "opuslib.api.encoder", "opuslib.api.info", "opuslib.exceptions"):
     sys.modules.setdefault(_name, mock.MagicMock())
 
-import radiostack
+from syncplan import SyncPlan
 import voice
 from voice import VoiceClient
 
@@ -688,21 +688,13 @@ class ChannelSwitchTest(unittest.TestCase):
         """sync() 是整条链的入口，卡在这里等于电台栈永远同步不上去。"""
         voice.CHANNEL_TIMEOUT = 0.3
         self.server.answers = False
-        stack = radiostack.RadioStack()
-        for freq in ("118.000", "121.700"):
-            stack.add(freq)
-            stack.get(radiostack.parse_frequency(freq)).rx = True
-        stack.selected_khz = 118000
+        stack = SyncPlan(rx=[118000, 121700], selected=118000)
         _, elapsed = self.call(lambda: self.client.sync(stack), budget=6.0)
         self.assertLess(elapsed, 5.0, "两个频率各等一个超时，也该结束了")
         self.assertEqual(self.server.blocking_calls, [])
 
     def test_sync_joins_the_selected_frequency(self):
-        stack = radiostack.RadioStack()
-        for freq in ("118.000", "121.700"):
-            stack.add(freq)
-            stack.get(radiostack.parse_frequency(freq)).rx = True
-        stack.selected_khz = 121700
+        stack = SyncPlan(rx=[118000, 121700], selected=121700)
         self.call(lambda: self.client.sync(stack), budget=8.0)
         joined = self.client._channel_ids[121700]
         self.assertEqual(self.server.my_channel, joined,
@@ -738,13 +730,8 @@ class TemporaryChannelRemovedTest(unittest.TestCase):
         self.client.connected = True
         self.client.running = True
 
-        self.stack = radiostack.RadioStack()
-        for khz in (118000, 121700):
-            self.stack.add(khz)
-            radio = self.stack.get(khz)
-            radio.rx = True
-            radio.tx = True
-        self.stack.select(118000)
+        self.stack = SyncPlan(rx=[118000, 121700], tx=[118000, 121700],
+                              selected=118000)
 
     def tearDown(self):
         voice.CHANNEL_TIMEOUT = self._timeout
@@ -762,7 +749,7 @@ class TemporaryChannelRemovedTest(unittest.TestCase):
         old = self.client._channel_ids[118000]
         self.assertEqual(self.server.my_channel, old, "前提：先进了 118.000")
 
-        self.stack.select(121700)
+        self.stack.selected_khz = 121700
         self.sync_and_wait()
         self.assertNotEqual(self.server.my_channel, old, "前提：已经换到 121.700")
 
@@ -772,7 +759,7 @@ class TemporaryChannelRemovedTest(unittest.TestCase):
     def test_a_removed_channel_is_not_joined_by_its_old_id(self):
         self.switch_away_and_let_the_old_channel_die()
 
-        self.stack.select(118000)
+        self.stack.selected_khz = 118000
         self.sync_and_wait()
 
         rebuilt = self.server.by_name.get("FREQ_118000")
@@ -790,7 +777,7 @@ class TemporaryChannelRemovedTest(unittest.TestCase):
     def test_a_removed_channel_never_ends_up_in_the_voice_target(self):
         self.switch_away_and_let_the_old_channel_die()
 
-        self.stack.select(118000)
+        self.stack.selected_khz = 118000
         self.sync_and_wait()
 
         programmed = None
@@ -821,13 +808,8 @@ class ReconnectTest(unittest.TestCase):
         self.client.connected = True
         self.client.running = True
 
-        self.stack = radiostack.RadioStack()
-        self.stack.add(118000)
-        self.stack.add(121700)
-        for radio in self.stack:
-            radio.rx = True
-            radio.tx = True
-        self.stack.select(118000)
+        self.stack = SyncPlan(rx=[118000, 121700], tx=[118000, 121700],
+                              selected=118000)
 
     def sync_and_wait(self):
         thread = threading.Thread(target=self.client.sync, args=(self.stack,),
@@ -917,15 +899,11 @@ class SyncStormTest(unittest.TestCase):
         voice.CHANNEL_TIMEOUT = self._timeout
 
     def stack_with(self, *frequencies, tx=(), xc=()):
-        stack = radiostack.RadioStack()
-        for khz in frequencies:
-            stack.add(khz)
-        for radio in stack:
-            radio.rx = True
-            radio.tx = radio.frequency_khz in tx or radio.frequency_khz in xc
-            radio.xc = radio.frequency_khz in xc
-        stack.select(frequencies[0])
-        return stack
+        frequencies = sorted(frequencies)
+        return SyncPlan(rx=frequencies,
+                        tx=[khz for khz in frequencies if khz in tx or khz in xc],
+                        xc=[khz for khz in frequencies if khz in xc],
+                        selected=frequencies[0])
 
     def fire(self, calls):
         """同时打进来一批 sync，等它们全部返回。"""
@@ -1244,14 +1222,10 @@ class PrimaryChannelSelectionTest(unittest.TestCase):
         self.client.connected = True
         self.client.running = True
 
-        self.stack = radiostack.RadioStack()
-        for khz in (118000, 121700, 126750):
-            self.stack.add(khz)
-            radio = self.stack.get(khz)
-            radio.rx = True
-            radio.tx = True
-        self.stack.select(126750)       # 手动选中的不是本人席位
-        self.stack.set_locked({118000, 121700})
+        # 手动选中的 126.750 不是本人席位；本人值守 118.000 / 121.700
+        self.stack = SyncPlan(rx=[118000, 121700, 126750],
+                              tx=[118000, 121700, 126750],
+                              selected=126750, locked={118000, 121700})
 
     def tearDown(self):
         voice.CHANNEL_TIMEOUT = self._timeout
@@ -1290,14 +1264,9 @@ class PrimaryChannelFallbackTest(unittest.TestCase):
         self.client.connected = True
         self.client.running = True
 
-        self.stack = radiostack.RadioStack()
-        for khz in (118000, 118350):
-            self.stack.add(khz)
-            radio = self.stack.get(khz)
-            radio.rx = True
-            radio.tx = True
-        self.stack.select(118000)          # 手动加的那个当上了主频率
-        self.stack.set_locked({118350})  # 数据源上正在值守的是 118.350
+        # 手动加的 118.000 当上了主频率，数据源上正在值守的是 118.350
+        self.stack = SyncPlan(rx=[118000, 118350], tx=[118000, 118350],
+                              selected=118000, locked={118350})
 
     def tearDown(self):
         voice.CHANNEL_TIMEOUT = self._timeout

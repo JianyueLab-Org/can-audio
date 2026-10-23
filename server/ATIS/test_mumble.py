@@ -411,16 +411,15 @@ class CompatPatchTest(unittest.TestCase):
         from pymumble_py3.mumble import Mumble
         self.assertTrue(getattr(Mumble.connect, "_can_guarded", False))
 
-    # 所有带 mumblecompat.py 的组件。这里列全而不是只比 xpc 一份：原来只钉了
-    # server/ATIS ↔ xpc，于是两个 legacy 飞行员端悄悄停在了老版本上——只有
-    # ssl.wrap_socket 那一半，没有 patch_send()，也就是说"一发话就掉线"那个病
-    # 在它们身上一直还在，而没有任何测试会发现。
-    COMPONENTS = ("controller", "atis", "xpc", "msfs")
+    # 所有带 mumblecompat.py 的组件，列全而不是只比一份：只钉一份的话其余
+    # 组件会悄悄停在老版本上——只有 ssl.wrap_socket 那一半，没有
+    # patch_send()，"一发话就掉线"那个病一直还在，而没有任何测试会发现。
+    COMPONENTS = ("controller", "atis-worker")
 
     def test_the_copy_matches_the_clients(self):
         """mumblecompat.py 必须和**每一个**客户端那份逐字节相同。
 
-        这个仓库靠复制共享（msfs 对 xpc 也是这么钉的），漂移了就意味着某个
+        这个仓库靠复制共享，漂移了就意味着某个
         补丁只修了一边——而这个文件里的两个补丁，缺哪一个都是"连不上"或者
         "一发话就掉线"，排查方向还都会被带到密码和网络上去。
         """

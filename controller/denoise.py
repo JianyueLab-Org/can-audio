@@ -1,8 +1,8 @@
 """RNNoise 麦克风降噪。
 
-ctypes 直接调 xiph RNNoise v0.2 的原生库（模型编在库里）。库由 CI 从
-native/rnnoise/ 构建，随包放在 _internal/；PyInstaller 看不见 ctypes 的
-依赖，所以 gui.spec 显式打包、发布流程显式验证。
+ctypes 直接调 xiph RNNoise v0.2 的原生库（模型编在库里）。库可通过
+native/rnnoise/build.ps1 本地构建，随包放在 _internal/；PyInstaller
+看不见 ctypes 的依赖，所以 gui.spec 显式打包。
 
 库不在、或者设备不是 48 kHz（模型只训练了 48 kHz）时直通不处理，
 写一条 WARNING——降噪没了可以接受，发不出话不行。

@@ -2,7 +2,6 @@ temp.wav
 radio_settings.json
 tools
 .vscode
-xplane_radio_settings.json
 .venv*
 atis_profile.json
 atis_settings.json
@@ -21,6 +20,3 @@ rnnoise.dll
 librnnoise.dylib
 native/rnnoise/work/
 native/rnnoise/out/
-
-# 原生 X-Plane 插件的 cmake 输出
-xpc/native_plugin/build/
