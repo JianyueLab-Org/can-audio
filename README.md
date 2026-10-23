@@ -1,10 +1,11 @@
-# airwaysn_audio
+# can-audio
 
-Cerulean Aviation Network（原 Cerulean Aviation Network）的**语音层**。基于 Mumble：飞行员的模拟器
+Cerulean Aviation Network（原 AirwaySN）的**语音层**。基于 Mumble：飞行员的模拟器
 COM1 频率决定他坐在哪个 Mumble 频道，管制员用一个电台栈同时守听/发话多个频率，
 情报通播由服务端的机器人把合成语音播到各自的频率上。
 
-管制客户端的使用说明在 [can-audio-client](https://github.com/JianyueLab-Org/can-audio-client)；给 AI 助手看的工程约定在
+管制客户端的使用说明在 [can-audio-client](https://github.com/JianyueLab-Org/can-audio-client)，
+通播客户端在 [can-atis](https://github.com/JianyueLab-Org/can-atis)；给 AI 助手看的工程约定在
 [`CLAUDE.md`](CLAUDE.md)。这份 README 是给要维护语音引擎、部署服务端的人看的。
 
 网络的另外两块在隔壁仓库：**can-fsd**（Go 写的 FSD 服务端 + 数据源）和
@@ -17,19 +18,22 @@ COM1 频率决定他坐在哪个 Mumble 频道，管制员用一个电台栈同�
 | 目录 | 入口 | 是什么 |
 |---|---|---|
 | `controller/` | `bridge.py` | 无界面语音引擎：Mumble 连接、音频收发、混音、降噪、增益。由 C# 管制客户端启动，经 stdin/stdout 的 JSON Lines 通信 |
+| `atis-worker/` | `can_mumble_worker.py` | 通播语音发送进程：由 C# 通播客户端 can-atis 启动，从 stdin 收 PCM，进频率频道循环播报，stdout 上报连接状态 |
 | `server/` | `login.py`、`ATIS/mumble.py` | 跑在 Mumble 主机上：Ice 认证器 + 服务端通播机队 |
 | `native/rnnoise/` | `build.ps1` | 可选的 RNNoise 降噪原生库构建 |
 
 这是 `new-client-sys` 分支：只放**客户端与 Python 开发共同维护的语音部分**和服务端。
-界面、设置、PTT 输入、电台栈规则都在 C# 客户端
+管制端的界面、设置、PTT 输入、电台栈规则都在 C# 客户端
 [can-audio-client](https://github.com/JianyueLab-Org/can-audio-client) 里；
-飞行员客户端由 C# 的 can-pilot-client 维护。旧的 Python 管制 GUI、桌面通播客户端
+通播的界面、模板、METAR、FSD 和语音合成在 C# 客户端
+[can-atis](https://github.com/JianyueLab-Org/can-atis) 里；
+飞行员客户端由 C# 的 can-pilot-client 维护。旧的 Python 管制 GUI、Python 桌面通播客户端
 （`atis/`）和飞行员客户端仍在 `main` 分支的历史里。
 
-C# ↔ 语音引擎的协议、文件分工、测试和打包见 [`controller/README.md`](controller/README.md)。
-改协议要两个仓库一起改。
+两边的协议、文件分工、测试和打包：管制端见 [`controller/README.md`](controller/README.md)，
+通播见 [`atis-worker/README.md`](atis-worker/README.md)。改协议要两个仓库一起改。
 
-`mumblecompat.py` 在 `controller/` 和 `server/ATIS/` 各有一份，必须逐字节相同，
+`mumblecompat.py` 在 `controller/`、`atis-worker/` 和 `server/ATIS/` 各有一份，必须逐字节相同，
 `server/ATIS/test_mumble.py` 会核对。
 
 ---
@@ -51,12 +55,12 @@ $env:PYTHONUTF8 = 1
 `pymumble_py3` 目录，以前装过 PyPI 版的先 `pip uninstall pymumble`。
 
 pymumble 通过 ctypes 加载原生的 **opus** 库；`controller/opus.dll` 已提交，
-`bridge.py` 启动时会把自己的目录加进 `PATH`。
+`atis-worker/opus.dll` 是同一个文件；两个入口启动时都会把自己的目录加进 `PATH`。
 
 语音引擎本身没有界面，平时由 C# 客户端启动。手动调试可以直接跑，往 stdin 里一行一条命令：
 
 ```powershell
-.\.venv\Scripts\python.exe -u controllerridge.py
+.\.venv\Scripts\python.exe -u controller\bridge.py
 {"id": 1, "command": "devices"}
 ```
 
@@ -68,6 +72,7 @@ pymumble 通过 ctypes 加载原生的 **opus** 库；`controller/opus.dll` 已�
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s controller -v
+.\.venv\Scripts\python.exe -m unittest discover -s atis-worker -v
 cd server;        python -m unittest test_login test_serverconf test_fix_acl -v
 cd server\ATIS;   python -m unittest test_mumble test_atisrouting -v
 ```
@@ -80,8 +85,10 @@ cd server\ATIS;   python -m unittest test_mumble test_atisrouting -v
 
 ## 打包
 
-语音引擎打成单文件 `can-voice.exe`，命令见 [`controller/README.md`](controller/README.md#开发与测试)。
-C# 客户端的发行脚本会把它放进发行包的 `controller/` 目录。
+- 管制端语音引擎打成单文件 `can-voice.exe`，命令见 [`controller/README.md`](controller/README.md#开发与测试)。
+  C# 管制客户端的发行脚本会把它放进发行包的 `controller/` 目录。
+- 通播语音发送进程打成单文件 `can-voice-worker.exe`，命令见 [`atis-worker/README.md`](atis-worker/README.md#开发与测试)。
+  can-atis 的 `build-single-file.ps1` 会把它嵌进 `atis-for-can.exe`。
 
 ---
 
