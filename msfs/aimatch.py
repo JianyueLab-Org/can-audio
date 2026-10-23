@@ -87,6 +87,50 @@ GENERIC_BY_PREFIX = (
 
 DEFAULT_TYPE = "B738"
 
+# MSFS 2024 的被动 AI 机（PassiveAircraft）。2024 的默认机是流式下载的，包目录里
+# 扫不到它们的 aircraft.cfg，可 AICreateNonATCAircraft 拿这些 title 一定建得出来。
+# 只装着默认机的 2024 用户扫出来的模型是零或者只有附加件，不补上这张表的话天上
+# 一架他机都没有。表照 can-pilot-client 的 BuiltInRules.Msfs2024（vPilot 也是这么
+# 写死的），改一边要记得改另一边。
+MSFS2024_PASSIVE = (
+    ("BCS1", "Asobo PassiveAircraft A220-100"),
+    ("BCS3", "Asobo PassiveAircraft A220-300"),
+    ("A318", "Asobo PassiveAircraft A318"),
+    ("A319", "Asobo PassiveAircraft A319 CEO"),
+    ("A320", "Asobo PassiveAircraft A320 NEO"),
+    ("A321", "Asobo PassiveAircraft A321 CEO"),
+    ("A321", "Asobo PassiveAircraft A321 NEO"),
+    ("AT43", "Asobo PassiveAircraft ATR42-320"),
+    ("AT45", "Asobo PassiveAircraft ATR42-500"),
+    ("AT76", "Asobo PassiveAircraft ATR72-600"),
+    ("B712", "Asobo PassiveAircraft B717-200"),
+    ("B733", "Asobo PassiveAircraft B737-300"),
+    ("B734", "Asobo PassiveAircraft B737-400"),
+    ("B739", "Asobo PassiveAircraft B737-900"),
+    ("B752", "Asobo PassiveAircraft B757-200"),
+    ("B763", "Asobo PassiveAircraft B767-300BCF"),
+    ("B772", "Asobo PassiveAircraft B777-200LR"),
+    ("BE23", "Asobo PassiveAircraft Beechcraft 23 Musketeer"),
+    ("C152", "Asobo PassiveAircraft C152 Aerobat"),
+    ("C402", "Asobo PassiveAircraft C402"),
+    ("C25A", "Asobo PassiveAircraft Citation CJ2"),
+    ("C25A", "Asobo PassiveAircraft Citation CJ2 Plus"),
+    ("C25C", "Asobo PassiveAircraft Citation CJ4"),
+    ("C700", "Asobo PassiveAircraft Citation Longitude"),
+    ("C680", "Asobo PassiveAircraft Citation Sovereign Plus"),
+    ("C650", "Asobo PassiveAircraft Citation VII"),
+    ("DH8D", "Asobo PassiveAircraft DHC-8 400"),
+    ("E145", "Asobo PassiveAircraft E145"),
+    ("E170", "Asobo PassiveAircraft E170"),
+    ("E190", "Asobo PassiveAircraft E190"),
+    ("E195", "Asobo PassiveAircraft E195"),
+    ("E195", "Asobo PassiveAircraft E195-E2"),
+    ("SF34", "Microsoft PassiveAircraft S340B Passenger"),
+)
+
+# 2024 上什么都对不上时的兜底，和 can-pilot-client 的 DefaultModel 一致
+MSFS2024_DEFAULT = "Asobo PassiveAircraft E190"
+
 
 class Model:
     """一个可用的涂装。"""
@@ -105,6 +149,18 @@ class Model:
 
     def __repr__(self):
         return f"<Model {self.title!r} {self.icao}/{self.airline or '-'}>"
+
+
+# 兜底要先试 MSFS2024_DEFAULT，所以把它排到最前
+_PASSIVE_MODELS = tuple(sorted(
+    (Model(title, icao=icao, package="MSFS 2024 PassiveAircraft")
+     for icao, title in MSFS2024_PASSIVE),
+    key=lambda model: model.title != MSFS2024_DEFAULT))
+
+_PASSIVE_BY_ICAO = {}
+for _model in _PASSIVE_MODELS:
+    _PASSIVE_BY_ICAO.setdefault(_model.icao, []).append(_model)
+del _model
 
 
 def _clean(value):
@@ -288,25 +344,42 @@ class ModelSet:
                 return model
         return None
 
-    def match(self, equipment="", airline="", csl="", exclude=None):
+    def match(self, equipment="", airline="", csl="", exclude=None,
+              msfs2024=False):
         """挑一个涂装。返回 (Model, 匹配层级说明) 或 (None, 原因)。
 
         层级说明会写进日志，用户报"这飞机长得不对"时能直接看出来退化了几级。
         csl 参数是对方在 #SB 里直接指定的模型名——MSFS 上通常对不上（那是
         X-Plane 的 CSL 名），但如果刚好是个装着的 title 就直接用。
+
+        msfs2024：连着的是 MSFS 2024。每一级在扫到的涂装之后再试 2024 的被动
+        AI 机（MSFS2024_PASSIVE），兜底先用 MSFS2024_DEFAULT。2024 的默认机
+        扫不到，不这样的话只装默认机的 2024 用户一架他机都看不见。
         """
-        if not self.models:
+        passive = _PASSIVE_MODELS if msfs2024 else ()
+        if not self.models and not passive:
             return None, "没有找到任何可用的飞机"
 
         model = self.by_title(csl)
         if model:
             return model, "对方指定的模型正好装着"
+        wanted = (csl or "").strip().lower()
+        for model in passive:
+            if wanted and model.title.lower() == wanted:
+                return model, "对方指定的模型是 MSFS 2024 的被动 AI 机"
 
         equipment = (equipment or "").upper()
         airline = (airline or "").upper()
         # 模拟器拒绝生成过的模型要跳过，否则会一直挑中同一个建不出来的，飞机
         # 永远出不来。调用方把 TrafficInjector 的黑名单传进来。
         excluded = {t.strip().lower() for t in (exclude or ())}
+
+        def of_type(icao):
+            # 扫到的在前：用户自己装的涂装比被动 AI 机好看
+            found = self._by_icao.get(icao) or []
+            if passive:
+                found = found + _PASSIVE_BY_ICAO.get(icao, [])
+            return found
 
         def pick(models):
             for model in models or ():
@@ -320,7 +393,7 @@ class ModelSet:
                 return model, "机型和航司都匹配"
 
         if equipment:
-            model = pick(self._by_icao.get(equipment))
+            model = pick(of_type(equipment))
             if model:
                 return model, "机型匹配，涂装不对"
 
@@ -331,7 +404,7 @@ class ModelSet:
                 model = pick(self._by_icao_airline.get((relative, airline)))
                 if model:
                     return model, f"用同族 {relative} 顶替，航司正确"
-            model = pick(self._by_icao.get(relative))
+            model = pick(of_type(relative))
             if model:
                 return model, f"用同族 {relative} 顶替"
 
@@ -345,7 +418,7 @@ class ModelSet:
         category = category_of(equipment)
         if category:
             for candidate in CATEGORIES[category]:
-                model = pick(self._by_icao.get(candidate))
+                model = pick(of_type(candidate))
                 if model:
                     return model, f"同为{category}，用 {candidate} 顶替"
 
@@ -354,11 +427,16 @@ class ModelSet:
         # A20N），所以这一级同样要走一遍同族，否则会白白掉到兜底。
         generic = generic_for(equipment)
         for candidate in (generic,) + tuple(family_of(generic)):
-            model = pick(self._by_icao.get(candidate))
+            model = pick(of_type(candidate))
             if model:
                 return model, f"退到通用机型 {candidate}"
 
         # 兜底。看不见的飞机比涂装错的飞机危险得多。
+        # 2024 上先用被动 AI 机：扫到的涂装可能来自 2020 的包目录，2024 不一定
+        # 建得出来，而被动 AI 机一定建得出来。
+        model = pick(passive)
+        if model:
+            return model, "没有近似机型，用了 MSFS 2024 的默认 AI 机"
         # 优先挑有机型码的：没有机型码的多半是装得不规范的附加件，拿它当所有
         # 飞机的替身最难看。
         model = pick([m for m in self.models if m.icao])

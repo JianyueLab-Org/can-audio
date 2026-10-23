@@ -17,6 +17,7 @@ SimConnect 只能连本机的模拟器，没有发现过程；模拟器没开时
 dataref 讨论。
 """
 
+import ctypes
 import logging
 import math
 import threading
@@ -42,6 +43,68 @@ XPDR_ONLINE = 2
 XPDR_STANDBY = 1
 # 判"停着"的地速门槛（节）。和 fsdpilot 降低位置包频率用的是同一条线。
 PARKED_SPEED_KT = 1
+
+# 连着的是哪个模拟器。SIMCONNECT_RECV_OPEN 的程序主版本号 11 是 2020、12 是
+# 2024（can-pilot-client 的 SimulatorTypeExtensions.FromApplicationVersion）；
+# 认不出的版本按程序名猜，2024 的内部名是 SunRise。
+MSFS_2020 = "msfs2020"
+MSFS_2024 = "msfs2024"
+
+
+def simulator_from_open(application_name, version_major):
+    if version_major == 12:
+        return MSFS_2024
+    if version_major == 11:
+        return MSFS_2020
+    if isinstance(application_name, bytes):
+        application_name = application_name.decode("utf-8", "replace")
+    if "sunrise" in (application_name or "").lower():
+        return MSFS_2024
+    return MSFS_2020
+
+
+_simconnect_class = None
+
+
+def simconnect_class():
+    """Python-SimConnect 的 SimConnect，多记一样：连着的是 2020 还是 2024。
+
+    包自带的 dispatch 收到 SIMCONNECT_RECV_OPEN 只打一行 "SIM OPEN"，程序名和
+    版本号都扔了。OPEN 在构造函数里就到了（它在 __init__ 里等 self.ok），而
+    __init__ 把 self.my_dispatch_proc 包成 ctypes 跳板——所以只能在子类里覆盖
+    这个方法，构造完再换就晚了。
+    """
+    global _simconnect_class
+    if _simconnect_class is not None:
+        return _simconnect_class
+    from SimConnect import SimConnect
+    from SimConnect.Enum import SIMCONNECT_RECV_OPEN
+
+    class _SimConnect(SimConnect):
+        simulator = MSFS_2020
+
+        def my_dispatch_proc(self, pData, cbData, pContext):
+            try:
+                if int(pData.contents.dwID) == 2:     # SIMCONNECT_RECV_ID_OPEN
+                    opened = ctypes.cast(
+                        pData, ctypes.POINTER(SIMCONNECT_RECV_OPEN)).contents
+                    self.simulator = simulator_from_open(
+                        opened.szApplicationName,
+                        int(opened.dwApplicationVersionMajor))
+                    log.info("simulator is %s (application %s, version %d.%d)",
+                             self.simulator,
+                             opened.szApplicationName.decode("utf-8", "replace"),
+                             opened.dwApplicationVersionMajor,
+                             opened.dwApplicationVersionMinor)
+            except Exception as e:
+                log.warning("could not read the SimConnect open message: %s", e)
+            # simulator 要在原处理把 self.ok 置上之前定下来：构造函数一返回，
+            # 别的线程就会来问
+            return SimConnect.my_dispatch_proc(self, pData, cbData, pContext)
+
+    _simconnect_class = _SimConnect
+    return _simconnect_class
+
 
 # SimVar 名字 -> 我们内部的键。值都通过 AircraftRequests.get() 取。
 # 名字必须和 SimConnect 的 SimVar 完全一致，写错了 get() 返回 None。
@@ -251,11 +314,16 @@ class SimLink:
         """底层 SimConnect 句柄，他机注入那边要用。"""
         return self._sim
 
+    @property
+    def msfs2024(self):
+        """连着的是 MSFS 2024。没连上时是 False。"""
+        return getattr(self._sim, "simulator", MSFS_2020) == MSFS_2024
+
     def _open(self):
         """连模拟器。没开的话构造函数直接抛，这是正常情况不是错误。"""
-        from SimConnect import AircraftRequests, SimConnect
+        from SimConnect import AircraftRequests
 
-        self._sim = SimConnect()
+        self._sim = simconnect_class()()
         # _time 是这个包的缓存窗口（毫秒）。位置一秒要读 5 次，缓存久了会发出
         # 过期的位置；设小一点让它每次都真的去问。
         self._requests = AircraftRequests(self._sim, _time=100)
