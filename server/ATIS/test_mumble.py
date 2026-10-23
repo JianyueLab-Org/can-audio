@@ -414,7 +414,7 @@ class CompatPatchTest(unittest.TestCase):
     # 所有带 mumblecompat.py 的组件，列全而不是只比一份：只钉一份的话其余
     # 组件会悄悄停在老版本上——只有 ssl.wrap_socket 那一半，没有
     # patch_send()，"一发话就掉线"那个病一直还在，而没有任何测试会发现。
-    COMPONENTS = ("controller", "atis")
+    COMPONENTS = ("controller",)
 
     def test_the_copy_matches_the_clients(self):
         """mumblecompat.py 必须和**每一个**客户端那份逐字节相同。

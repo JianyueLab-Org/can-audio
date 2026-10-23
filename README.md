@@ -4,8 +4,8 @@ Cerulean Aviation Network（原 Cerulean Aviation Network）的**语音层**。�
 COM1 频率决定他坐在哪个 Mumble 频道，管制员用一个电台栈同时守听/发话多个频率，
 情报通播由服务端的机器人把合成语音播到各自的频率上。
 
-只找使用说明的话看 [`发布说明.md`](发布说明.md)；给 AI 助手看的工程约定在
-[`CLAUDE.md`](CLAUDE.md)。这份 README 是给要跑源码、打包或部署服务端的人看的。
+管制客户端的使用说明在 [can-audio-client](https://github.com/JianyueLab-Org/can-audio-client)；给 AI 助手看的工程约定在
+[`CLAUDE.md`](CLAUDE.md)。这份 README 是给要维护语音引擎、部署服务端的人看的。
 
 网络的另外两块在隔壁仓库：**can-fsd**（Go 写的 FSD 服务端 + 数据源）和
 **can-web**（网站、账号、雷达）。这个仓库只做语音，不参与飞行数据。
@@ -16,63 +16,61 @@ COM1 频率决定他坐在哪个 Mumble 频道，管制员用一个电台栈同�
 
 | 目录 | 入口 | 是什么 |
 |---|---|---|
-| `controller/` | `gui.py` | 管制客户端，一个电台栈，每个频率有 RX/TX/XC |
-| `atis/` | `gui.py` | 情报通播客户端，仿 vATIS：席位、预设、模板 |
+| `controller/` | `bridge.py` | 无界面语音引擎：Mumble 连接、音频收发、混音、降噪、增益。由 C# 管制客户端启动，经 stdin/stdout 的 JSON Lines 通信 |
 | `server/` | `login.py`、`ATIS/mumble.py` | 跑在 Mumble 主机上：Ice 认证器 + 服务端通播机队 |
+| `native/rnnoise/` | `build.ps1` | 可选的 RNNoise 降噪原生库构建 |
 
-飞行员客户端（X-Plane / MSFS）已经移出这个分支，由 C# 统一客户端
-can-pilot-client 维护；这里只留管制、通播两个 Python 语音客户端和服务端。
+这是 `new-client-sys` 分支：只放**客户端与 Python 开发共同维护的语音部分**和服务端。
+界面、设置、PTT 输入、电台栈规则都在 C# 客户端
+[can-audio-client](https://github.com/JianyueLab-Org/can-audio-client) 里；
+飞行员客户端由 C# 的 can-pilot-client 维护。旧的 Python 管制 GUI、桌面通播客户端
+（`atis/`）和飞行员客户端仍在 `main` 分支的历史里。
 
-每个组件都是**从自己的目录独立运行**的——图标路径和配置文件都按当前目录解析。
-组件之间靠**复制**共享代码，不是 import（`mumblecompat.py`、`applog.py`
-等都有多份副本，`server/ATIS/` 里也有一份）。改公共逻辑要逐个核对副本，
-有测试盯着。
+C# ↔ 语音引擎的协议、文件分工、测试和打包见 [`controller/README.md`](controller/README.md)。
+改协议要两个仓库一起改。
 
-`controller/` 和 `atis/` 的设置中可选择服务器并刷新列表，地址和端口会保存。
-选择「自定义」可手动填写地址和端口；列表获取失败时仍可使用已保存的地址。
-切换前需断开所有连接，ATIS 需停止所有播出。
+`mumblecompat.py` 在 `controller/` 和 `server/ATIS/` 各有一份，必须逐字节相同，
+`server/ATIS/test_mumble.py` 会核对。
 
 ---
 
 ## 跑起来
 
-需要 **Python 3.12**（3.13+ 没有 PyAudio 的 wheel）。
+需要 **Python 3.12**（3.13+ 没有 PyAudio 的 wheel）。Windows 上 requirements 文件里有中文注释，
+pip 默认按 GBK 读会失败，先设 `PYTHONUTF8=1`：
 
 ```powershell
-pip install -r requirements-build.txt
+py -3.12 -m venv .venv
+$env:PYTHONUTF8 = 1
+.\.venv\Scripts\python.exe -m pip install -r requirements-voice.txt
 ```
 
-按需再装：`edge-tts requests pyttsx3 scipy`（服务端通播）、`zeroc-ice`（服务端认证器）。
 客户端使用仓库的 `pymumble_udp` 分支，而不是 PyPI 上只有 TCP tunnel 的旧版
 `pymumble`。它对外仍导入为 `pymumble_py3`，并会在 Mumble 1.5+ 服务端上使用
 加密 UDP 音频；UDP 不可用时自动回退到 TCP tunnel。两个包装进同一个
 `pymumble_py3` 目录，以前装过 PyPI 版的先 `pip uninstall pymumble`。
 
-pymumble 通过 ctypes 加载原生的 **opus** 库，找不到就 `Could not find Opus
-library`。仓库里各组件目录下有 `opus.dll`，把那个目录加进 `PATH` 即可。
+pymumble 通过 ctypes 加载原生的 **opus** 库；`controller/opus.dll` 已提交，
+`bridge.py` 启动时会把自己的目录加进 `PATH`。
+
+语音引擎本身没有界面，平时由 C# 客户端启动。手动调试可以直接跑，往 stdin 里一行一条命令：
 
 ```powershell
-cd controller;    python gui.py
-cd atis;          python gui.py
+.\.venv\Scripts\python.exe -u controllerridge.py
+{"id": 1, "command": "devices"}
 ```
 
 ---
 
 ## 测试
 
-除 `server/login.py` 外每个组件都有测试，都在各自目录下运行，**不需要服务器、
-不需要音频设备、不需要网络**。跑之前把 `controller` 加进 `PATH`（opus）。
+都**不需要服务器、不需要音频设备、不需要网络**：
 
 ```powershell
-cd controller;    python -m unittest test_radiostack test_applog test_mumblecompat test_voice -v
-                  python smoke_gui.py
-cd atis;          python -m unittest test_atis test_applog test_mumblecompat -v
-                  python smoke_gui.py
-cd server;        python -m unittest test_login test_serverconf -v
-cd server\ATIS;   python -m unittest test_mumble -v
+.\.venv\Scripts\python.exe -m unittest discover -s controller -v
+cd server;        python -m unittest test_login test_serverconf test_fix_acl -v
+cd server\ATIS;   python -m unittest test_mumble test_atisrouting -v
 ```
-
-`smoke_gui.py` 用离屏平台把所有窗口和对话框都建一遍，是唯一会碰 `gui.py` 的东西。
 
 **写测试请断言真实行为**——耗时、状态、真的收发了什么——而不是"有没有调用某个
 函数"。这条不是洁癖：仓库里已经有好几个 bug 是因为测试只对源码做字符串匹配而
@@ -82,21 +80,8 @@ cd server\ATIS;   python -m unittest test_mumble -v
 
 ## 打包
 
-在组件目录下：
-
-```powershell
-pyinstaller gui.spec
-```
-
-**能跑的是 `dist/` 里那份，不是 `build/` 里的。** PyInstaller 会在工作目录留一个
-同名 exe，但那只是引导程序，`python312.dll`、`opus.dll` 和 Qt 库都在
-`dist/<名字>/_internal/` 里；点 `build/` 那个会报「Failed to load Python DLL」，
-看着像构建坏了，其实只是点错了。
-
-打包前先关掉正在运行的同名程序，否则 `dist/` 被占用会产出残缺的包。
-
-必须随包带上、漏了会静默失效的原生库：**每个 spec 都要带 `opus.dll`**
-（ctypes 运行时加载，静态分析看不见）。
+语音引擎打成单文件 `can-voice.exe`，命令见 [`controller/README.md`](controller/README.md#开发与测试)。
+C# 客户端的发行脚本会把它放进发行包的 `controller/` 目录。
 
 ---
 

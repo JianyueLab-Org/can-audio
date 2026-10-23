@@ -12,15 +12,12 @@ There is no dependency manifest, test suite, or build script in the repo. Everyt
 
 | Directory | Entry point | Role |
 |---|---|---|
-| `controller/` | `gui.py` | ATC client — a **stack of frequencies** modelled on [TrackAudio](https://github.com/pierr3/TrackAudio), each with RX/TX/XC |
-| `atis/` | `gui.py` | ATIS client modelled on [vATIS](https://github.com/vatis-project/vatis) — stations, presets, templates; broadcasts over Mumble |
+| `controller/` | `bridge.py` | **Headless voice engine** for the C# controller client ([can-audio-client](https://github.com/JianyueLab-Org/can-audio-client)): Mumble connection, audio I/O, RX mixing, RNNoise, mic gain. Speaks JSON Lines over stdin/stdout — protocol in `controller/README.md` |
 | `server/` | `login.py`, `ATIS/mumble.py` | Runs on the Mumble/Murmur host: Ice authenticator + server-side ATIS bot fleet |
 
-`controller/` and `atis/` are the shipped clients. **On this branch (`new-client-sys`) the `xpc/` and `msfs/` pilot clients and the GitHub workflows have been removed** — pilot clients now live in the C# can-pilot-client. Sections below that still mention `xpc/` / `msfs/` describe those removed directories; treat them as history, not as files to edit. Each component remains an independent directory so its PyInstaller spec and runtime configuration can be used from that directory.
+**This branch (`new-client-sys`) only holds the Python voice part shared with the C# client, plus the server.** The Python controller GUI (`gui.py`, settings, PTT via pynput/pygame, the radio stack model, i18n UI strings), the desktop ATIS client (`atis/`), the `xpc/` / `msfs/` pilot clients and the GitHub workflows have all been removed. UI, settings, PTT input and the radio-stack rules (RX/TX/XC coupling, the on-duty transmit gate, primary-frequency choice) now live in C#; the engine receives a finished `sync` plan (`controller/syncplan.py`) and just carries it out. Sections below that mention `gui.py`, `ptt.py`, `radiostack.py`, `atis/`, `xpc/` or `msfs/` describe removed code — treat them as history and design rationale, not as files to edit. The voice-engine behaviour they describe (`voice.py`, `mumblecompat.py`, reconnect limits, kick handling, channel resolution) still applies.
 
-There is no shared package — each component is imported flat from its own directory, which is why `mumblecompat.py` and `applog.py` exist as per-component copies rather than one import. Keep that pattern when adding cross-cutting helpers; a shared parent module would need path juggling in every PyInstaller spec.
-
-Both GUI components carry `applog.py` and log rather than `print` — which matters because the packaged builds are `console=False` and a bare `print` goes nowhere.
+`mumblecompat.py` exists in `controller/` and `server/ATIS/` and must stay byte-identical (`server/ATIS/test_mumble.py` checks). Changing a command or event in `controller/bridge.py` is a protocol change: update `controller/README.md` and the C# side (`Services/VoiceBridge.cs`, `ViewModels/MainWindowViewModel.Backend.cs`) together.
 
 ## Commands
 

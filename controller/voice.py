@@ -39,7 +39,7 @@ from pymumble_py3.constants import (
 import denoise
 import micgain
 import mumblecompat
-import radiostack
+import syncplan
 from i18n import t
 
 # pymumble 用的 ssl.wrap_socket 在 Python 3.12 里已被删除，导入时先补上，
@@ -902,7 +902,7 @@ class VoiceClient:
 
         查一次频道表只是本地字典查找，不走网络，没有省下来的必要。
         """
-        name = radiostack.channel_name(khz)
+        name = syncplan.channel_name(khz)
         channel = self._find_channel(name)
         recreated = False
 
@@ -938,9 +938,9 @@ class VoiceClient:
             if self._channel_ids.get(previous_khz) == channel_id:
                 self._channel_ids.pop(previous_khz, None)
             log.warning("channel id %s was reused: %s -> %s",
-                        channel_id, radiostack.channel_name(previous_khz), name)
+                        channel_id, syncplan.channel_name(previous_khz), name)
         log.debug("frequency %s maps to channel %s (id %s)",
-                  radiostack.format_frequency(khz), name, channel_id)
+                  syncplan.format_frequency(khz), name, channel_id)
         self._channel_ids[khz] = channel_id
         self._channel_to_khz[channel_id] = khz
         return channel_id, recreated
@@ -1057,7 +1057,7 @@ class VoiceClient:
                 joined_khz = khz
                 break
             log.warning("could not join the primary channel %s",
-                        radiostack.format_frequency(khz))
+                        syncplan.format_frequency(khz))
 
         # 没进去的频率一律挂频道监听——**试过没进去的那些也算在内**，别让管制员
         # 唯一在用的那个频率成了唯一听不到的
@@ -1079,10 +1079,10 @@ class VoiceClient:
         self._set_voice_target(self._tx_channels, force=force_target)
         self._program_cross_couple_targets()
         log.debug("syncing the radio stack: primary %s, RX %s, TX %s, XC %s",
-                  radiostack.format_frequency(joined_khz) if joined_khz else "none",
-                  [radiostack.format_frequency(k) for k in stack.rx_frequencies()],
-                  [radiostack.format_frequency(k) for k in stack.tx_frequencies()],
-                  [radiostack.format_frequency(k) for k in stack.xc_frequencies()])
+                  syncplan.format_frequency(joined_khz) if joined_khz else "none",
+                  [syncplan.format_frequency(k) for k in stack.rx_frequencies()],
+                  [syncplan.format_frequency(k) for k in stack.tx_frequencies()],
+                  [syncplan.format_frequency(k) for k in stack.xc_frequencies()])
 
     def _join_frequency(self, khz, channel_id):
         """进这个频率的频道，一次不成就按名字重新解析再试一次。
@@ -1103,7 +1103,7 @@ class VoiceClient:
         恰好在它唯一该生效的场景里把重试挡掉了——实测日志里 8 次进频道失败，
         "joining again" 一次都没出现过。
         """
-        name = radiostack.channel_name(khz)
+        name = syncplan.channel_name(khz)
         if self._join(channel_id, expected_name=name):
             return True
 
@@ -1116,7 +1116,7 @@ class VoiceClient:
             # 里面的，会把后面排队的 sync 一起拖住
             return False
         log.info("channel for %s resolved to id %s (recreated=%s), joining again",
-                 radiostack.format_frequency(khz), again, recreated)
+                 syncplan.format_frequency(khz), again, recreated)
         return self._join(again, expected_name=name)
 
     def _join(self, channel_id, expected_name=None):
@@ -1248,8 +1248,8 @@ class VoiceClient:
         # 的话音会点亮 A 的灯、按 A 的音量播、还转发到 A 的交叉耦合上。
         try:
             channel = self.mumble.channels[channel_id]
-            if channel.get("name") != radiostack.channel_name(khz):
-                self._forget_channel(khz, radiostack.channel_name(khz))
+            if channel.get("name") != syncplan.channel_name(khz):
+                self._forget_channel(khz, syncplan.channel_name(khz))
                 return
         except Exception:
             return

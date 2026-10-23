@@ -3,7 +3,6 @@
 import copy
 import importlib.util
 import logging
-import pathlib
 import struct
 import sys
 import threading
@@ -410,12 +409,6 @@ class GateTest(GateFixture):
         self.assertTrue(self.router.enqueue(b"\x00" * 1920, generation))
         self.send()
         self.assertEqual(self.mumble.control_socket.audio, [2])
-
-    def test_helper_copies_are_identical(self):
-        path = pathlib.Path(__file__).resolve()
-        root = path.parents[2] if path.parent.name == "ATIS" else path.parents[1]
-        self.assertEqual((root / "atis/atisrouting.py").read_bytes(),
-                         (root / "server/ATIS/atisrouting.py").read_bytes())
 
 
 class RealStartupTest(RoutingTestCase):

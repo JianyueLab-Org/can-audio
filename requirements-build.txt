@@ -1,47 +1,12 @@
-# CI 打包和跑测试用的依赖清单。
+# 打包语音引擎（controller/ → can-voice.exe）和跑它的测试用的依赖。
 #
-# 只覆盖出包的 Windows 客户端（controller / atis）以及跑得动
-# 它们测试所需的东西。服务端（server/）的 zeroc-ice 和生成的 MumbleServer slice
-# 不在这里——那些要在 Mumble 主机上生成，装不进 CI，server 的测试也不依赖它们。
+# 服务端（server/）的 zeroc-ice 和生成的 MumbleServer slice 不在这里——那些要在
+# Mumble 主机上生成，server 的测试也不依赖它们。
 #
-# **Python 必须是 3.12。** PyAudio 没有 3.13+ 的 wheel，从源码编要 PortAudio
-# 头文件加 MSVC；3.11 及以下没试过。
+# **Python 必须是 3.12。** PyAudio 没有 3.13+ 的 wheel。Windows 上 pip 会按 GBK
+# 读这个文件，安装前先设 PYTHONUTF8=1。
 
-# ---- 界面 ----
-PyQt6
-PyQt6-Fluent-Widgets            # 客户端共用的 Fluent 深色外观（theme.py）
-
-# ---- 语音 ----
-# 使用 pymumble_udp 的 Mumble 1.5+ protobuf UDP 音频格式；导入名仍是
-# pymumble_py3。不要改回 PyPI 的 pymumble，它只有 TCP audio tunnel。
-# 发行名是 pymumble-udp（它 setup.py 里的 name）——写成 `pymumble @ …` 的话
-# pip 会因为名字对不上直接拒装。钉在提交上而不是分支上：分支一动，下一次发版
-# 就悄悄换了一份语音库。升级时改这个哈希，并重新跑 mumblecompat 的测试——
-# 证书指纹校验挂在它的 _wrap_socket 上。和 PyPI 的 pymumble 装的是同一个
-# pymumble_py3 目录，旧环境先 `pip uninstall pymumble` 再装。
-pymumble-udp @ git+https://github.com/JianyueLab-Org/pymumble_udp.git@168f2c846d37088902bbfe48f8ea76cb95bf7dd7
-pyaudio
-numpy
-
-# opuslib 用 ctypes 在运行时加载原生 opus。组件目录里各自带了一份
-# opus.dll（已提交），gui.spec 的 find_opus() 会找到它并打进包里，所以 CI 上
-# 不需要额外装 opus。留着 pyogg 是给本地开发用的后备来源。
-pyogg
-
-# ---- 输入设备 ----
-# PTT 的三个来源都在 controller/ptt.py 里：
-# 键盘和鼠标侧键走 pynput 的全局监听，摇杆走 pygame 轮询。
-pynput                          # 键盘 + 鼠标侧键 PTT
-pygame                          # 摇杆 PTT（SDL 的视频/音频驱动会被置成 dummy）
-
-# ---- 语音合成（通播） ----
-pyttsx3
-comtypes                        # pyttsx3 在 Windows 上走 SAPI5，需要它
-requests                        # 取天气和数据源
-certifi                         # 给打包版提供稳定、随程序分发的 HTTPS 根证书
+-r requirements-voice.txt
 
 # ---- 打包 ----
 pyinstaller
-# favicon.ico 其实是个 PNG，只是扩展名写成了 .ico。Qt 会嗅探内容所以窗口图标
-# 没事，但 PyInstaller 6 拒绝拿它当 exe 图标，除非装了 pillow 来转换。
-pillow
