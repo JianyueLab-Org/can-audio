@@ -740,9 +740,10 @@ class MsfsWindow(QMainWindow):
             if not models.types:
                 log.warning(
                     "no aircraft type was recognised in %s; other aircraft "
-                    "cannot be model-matched. If that path is wrong, set the "
-                    "package directory in the traffic settings to the folder "
-                    "that contains Official and Community",
+                    "cannot be model-matched (on MSFS 2024 the built-in "
+                    "PassiveAircraft are still used). If that path is wrong, "
+                    "set the package directory in the traffic settings to the "
+                    "folder that contains Official and Community",
                     ", ".join(roots))
 
         threading.Thread(target=scan, daemon=True).start()
@@ -825,11 +826,14 @@ class MsfsWindow(QMainWindow):
                 and cached not in rejected):
             return cached
 
+        # 2024 的默认机是流式的，扫不到；连着 2024 时匹配器补上被动 AI 机。
+        # 换模拟器要重连 SimConnect，那时注入器重建、缓存清空，不会串。
         model, why = self.models.match(
             equipment=entry.get("equipment", ""),
             airline=entry.get("airline", ""),
             csl=entry.get("csl", ""),
-            exclude=rejected)
+            exclude=rejected,
+            msfs2024=self.sim.msfs2024)
         title = model.title if model else ""
         self._model_cache[callsign] = title
         # 带上这次匹配用的机型/航司：#SB 的回复如果恰好落在快照之后、这里

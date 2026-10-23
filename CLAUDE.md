@@ -636,6 +636,8 @@ The same client as `xpc/`, for Microsoft Flight Simulator. `voice.py`, `traffic.
 
 **Model matching reads the sim's installed aircraft, not CSL packages.** `aimatch.py` walks each package tree for `aircraft.cfg`, taking `icao_type_designator` from `[GENERAL]` and one `title` + `icao_airline` per `[FLTSIM.n]` section. The title string is what `AICreateNonATCAircraft` takes, so it must be reproduced exactly. The fallback chain is the same as `cslmatch.py`'s and the two `FAMILIES` tables are meant to stay in sync.
 
+**MSFS 2024 gets the built-in PassiveAircraft.** 2024's default aircraft are streamed, so no `aircraft.cfg` exists on disk for them; a 2024 install with only default aircraft scans zero types. `simlink` reads `SIMCONNECT_RECV_OPEN` in a `SimConnect` subclass (`simconnect_class()`): application major 12 is 2024, 11 is 2020, otherwise `SunRise` in the name means 2024. `SimLink.msfs2024` feeds `ModelSet.match(msfs2024=True)`. Each tier then tries scanned models first and `MSFS2024_PASSIVE` second; the last resort is `MSFS2024_DEFAULT` before any scanned model. The table copies can-pilot-client's `BuiltInRules.Msfs2024`. Pinned by `Msfs2024PassiveTest` and `SimulatorDetectionTest`.
+
 Three things only a real install revealed — the synthetic `aircraft.cfg` tests all passed while a live scan found 10 liveries instead of 375:
 
 - **The package directory must come from `UserCfg.opt`.** `InstalledPackagesPath` can point anywhere; on the dev machine it is `D:\MSFS2022` (257 aircraft) while the guessed `%APPDATA%\Microsoft Flight Simulator\Packages` holds none. Guessing paths silently misses the whole install.

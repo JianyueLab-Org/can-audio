@@ -933,6 +933,148 @@ class ModelMatchingTest(unittest.TestCase):
         self.assertIn("没有带机型码", why)
 
 
+class Msfs2024PassiveTest(unittest.TestCase):
+    """MSFS 2024 的默认机是流式的，包目录里扫不到（can-issues#20）。
+
+    只装默认机的 2024 用户扫出来零个机型，原来的匹配链每一级都落空，天上
+    一架他机都没有。2024 上要补 PassiveAircraft，照 can-pilot-client 的
+    BuiltInRules.Msfs2024。
+    """
+
+    PASSIVE = {title for _, title in aimatch.MSFS2024_PASSIVE}
+
+    def test_nothing_scanned_still_gives_a_model_on_2024(self):
+        model, why = aimatch.ModelSet().match(equipment="B738", msfs2024=True)
+        self.assertIsNotNone(model, why)
+        self.assertIn(model.title, self.PASSIVE)
+
+    def test_exact_type_uses_the_matching_passive_aircraft(self):
+        model, why = aimatch.ModelSet().match(equipment="A320", msfs2024=True)
+        self.assertEqual(model.title, "Asobo PassiveAircraft A320 NEO", why)
+
+    def test_widebody_gets_a_passive_widebody(self):
+        model, why = aimatch.ModelSet().match(equipment="B77W", msfs2024=True)
+        self.assertEqual(model.icao, "B772", why)
+
+    def test_only_attachments_scanned_still_spawns_a_passive_aircraft(self):
+        # 2024 的包目录里常常只剩附加件这类没机型码的配置，拿它当替身建不出来
+        models = aimatch.ModelSet([aimatch.Model("某个部件配置")])
+        model, why = models.match(equipment="ZZZZ", msfs2024=True)
+        self.assertIn(model.title, self.PASSIVE, why)
+
+    def test_scanned_livery_of_the_same_type_wins(self):
+        models = aimatch.ModelSet([aimatch.Model("A320neo Air China",
+                                                 icao="A320", airline="CCA")])
+        model, _ = models.match(equipment="A320", msfs2024=True)
+        self.assertEqual(model.title, "A320neo Air China")
+
+    def test_exact_passive_type_beats_a_scanned_relative(self):
+        # can-pilot-client 的第 3 轮：机型完全一致的内置规则排在同族之前
+        models = aimatch.ModelSet([aimatch.Model("A20N Asobo", icao="A20N")])
+        model, why = models.match(equipment="A319", msfs2024=True)
+        self.assertEqual(model.title, "Asobo PassiveAircraft A319 CEO", why)
+
+    def test_rejected_passive_aircraft_are_skipped(self):
+        model, why = aimatch.ModelSet().match(
+            equipment="A320", msfs2024=True,
+            exclude={"Asobo PassiveAircraft A320 NEO"})
+        self.assertIsNotNone(model, why)
+        self.assertNotEqual(model.title, "Asobo PassiveAircraft A320 NEO")
+
+    def test_explicit_passive_title_is_used(self):
+        model, _ = aimatch.ModelSet().match(
+            equipment="B738", csl="asobo passiveaircraft e170", msfs2024=True)
+        self.assertEqual(model.title, "Asobo PassiveAircraft E170")
+
+    def test_not_used_on_2020(self):
+        # 2020 没有这些 title，建了也是 CREATE_OBJECT_FAILED
+        self.assertIsNone(aimatch.ModelSet().match(equipment="A320")[0])
+        models = aimatch.ModelSet([aimatch.Model("怪飞机")])
+        self.assertEqual(models.match(equipment="A320")[0].title, "怪飞机")
+
+    def test_the_last_resort_is_the_default_passive_aircraft(self):
+        # 通用机型那级也落空时用 MSFS2024_DEFAULT（can-pilot-client 的 DefaultModel），
+        # 不用扫到的附加件
+        generic = ("B738",) + tuple(aimatch.family_of("B738"))
+        exclude = {title for icao, title in aimatch.MSFS2024_PASSIVE
+                   if icao in generic}
+        models = aimatch.ModelSet([aimatch.Model("某个部件配置")])
+        model, why = models.match(equipment="ZZZZ", msfs2024=True,
+                                  exclude=exclude)
+        self.assertEqual(model.title, aimatch.MSFS2024_DEFAULT, why)
+
+
+class SimulatorDetectionTest(unittest.TestCase):
+    """2020 还是 2024，从 SIMCONNECT_RECV_OPEN 里读。"""
+
+    def test_version_major(self):
+        self.assertEqual(simlink.simulator_from_open(b"KittyHawk", 11),
+                         simlink.MSFS_2020)
+        self.assertEqual(simlink.simulator_from_open(b"SunRise", 12),
+                         simlink.MSFS_2024)
+
+    def test_unknown_version_falls_back_to_the_name(self):
+        self.assertEqual(simlink.simulator_from_open(b"SunRise", 13),
+                         simlink.MSFS_2024)
+        self.assertEqual(simlink.simulator_from_open("KittyHawk", 0),
+                         simlink.MSFS_2020)
+
+    def _fake_package(self, calls):
+        import ctypes
+        import types
+
+        class Recv(ctypes.Structure):
+            _fields_ = [("dwSize", ctypes.c_uint32),
+                        ("dwVersion", ctypes.c_uint32),
+                        ("dwID", ctypes.c_uint32)]
+
+        class RecvOpen(Recv):
+            _fields_ = [("szApplicationName", ctypes.c_char * 256)] + [
+                (name, ctypes.c_uint32) for name in (
+                    "dwApplicationVersionMajor", "dwApplicationVersionMinor",
+                    "dwApplicationBuildMajor", "dwApplicationBuildMinor",
+                    "dwSimConnectVersionMajor", "dwSimConnectVersionMinor",
+                    "dwSimConnectBuildMajor", "dwSimConnectBuildMinor",
+                    "dwReserved1", "dwReserved2")]
+
+        class SimConnect:
+            def __init__(self):
+                # 和真包一样：构造时把当时的 my_dispatch_proc 包起来
+                self.dispatch = self.my_dispatch_proc
+
+            def my_dispatch_proc(self, pData, cbData, pContext):
+                calls.append(pData.contents.dwID)
+
+        package = types.ModuleType("SimConnect")
+        package.SimConnect = SimConnect
+        enum = types.ModuleType("SimConnect.Enum")
+        enum.SIMCONNECT_RECV_OPEN = RecvOpen
+        package.Enum = enum
+        return package, enum, Recv, RecvOpen
+
+    def test_the_open_message_sets_the_simulator(self):
+        import ctypes
+        calls = []
+        package, enum, recv, recv_open = self._fake_package(calls)
+        with mock.patch.dict(sys.modules, {"SimConnect": package,
+                                           "SimConnect.Enum": enum}), \
+                mock.patch.object(simlink, "_simconnect_class", None):
+            sim = simlink.simconnect_class()()
+            self.assertEqual(sim.simulator, simlink.MSFS_2020)
+            opened = recv_open(dwID=2, szApplicationName=b"SunRise",
+                               dwApplicationVersionMajor=12)
+            sim.dispatch(ctypes.cast(ctypes.pointer(opened),
+                                     ctypes.POINTER(recv)), 0, None)
+            self.assertEqual(sim.simulator, simlink.MSFS_2024)
+            # 原来的处理照样要跑，否则 SimConnect() 永远等不到 self.ok
+            self.assertEqual(calls, [2])
+
+            link = simlink.SimLink()
+            self.assertFalse(link.msfs2024)
+            link._sim = sim
+            self.assertTrue(link.msfs2024)
+
+
 class FlightPlanTest(unittest.TestCase):
     """$FP 的字段布局。协议层和 xpc 共用同一份 fsdpilot.py。"""
 
