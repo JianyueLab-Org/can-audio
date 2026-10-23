@@ -1,0 +1,8 @@
+# C# 客户端的无界面语音引擎（controller/），Python 3.12 x64
+#
+# pymumble_udp 使用 Mumble 1.5+ protobuf UDP 音频格式，导入名仍是 pymumble_py3。
+# 不要改回 PyPI 的 pymumble（只有 TCP audio tunnel）；钉在提交上，升级时改哈希
+# 并重跑 mumblecompat 的测试——证书指纹校验挂在它的 _wrap_socket 上。
+pymumble-udp @ git+https://github.com/JianyueLab-Org/pymumble_udp.git@168f2c846d37088902bbfe48f8ea76cb95bf7dd7
+PyAudio
+numpy

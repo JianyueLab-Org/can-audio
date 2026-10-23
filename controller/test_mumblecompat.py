@@ -338,6 +338,74 @@ class CertificatePinTest(unittest.TestCase):
                          "connect() 没有验证书就返回了")
 
 
+class PymumbleUdpPinTest(unittest.TestCase):
+    """pymumble-udp 不走 `ssl.wrap_socket`，指纹校验得挂到它自己的函数上。
+
+    那个分支的 `mumble.py` 有模块级 `_wrap_socket()`，3.12 上直接
+    `ssl.create_default_context().wrap_socket()`，`CERT_NONE`、不验主机名。
+    只补 `ssl.wrap_socket` 的话，`_PinnedSSLSocket` 一次都不会被用上，而
+    `install()` 还照样说"钉住了"——就是这么漏过去的。
+    """
+
+    def fork_module(self):
+        """长得和 pymumble-udp 的 mumble 模块一样的替身。"""
+        import types
+
+        def _wrap_socket(sock, keyfile=None, certfile=None,
+                         verify_mode=ssl.CERT_NONE, server_hostname=None):
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = verify_mode
+            return context.wrap_socket(sock, server_hostname=server_hostname)
+
+        return types.SimpleNamespace(_wrap_socket=_wrap_socket)
+
+    def test_the_fork_is_not_pinned_until_patched(self):
+        module = self.fork_module()
+        self.assertFalse(mumblecompat.tls_pinned(module))
+
+    def test_the_forks_wrap_socket_becomes_the_pinning_class(self):
+        module = self.fork_module()
+        self.assertTrue(mumblecompat.patch_tls(module))
+        self.assertTrue(mumblecompat.tls_pinned(module))
+        wrapped = module._wrap_socket(socket.socket(), None, None)
+        self.addCleanup(wrapped.close)
+        self.assertIsInstance(wrapped, mumblecompat._PinnedSSLSocket)
+        self.assertEqual(wrapped.context.verify_mode, ssl.CERT_NONE)
+        self.assertFalse(wrapped.context.check_hostname)
+
+    def test_patching_twice_does_not_stack(self):
+        module = self.fork_module()
+        mumblecompat.patch_tls(module)
+        first = module._wrap_socket
+        self.assertFalse(mumblecompat.patch_tls(module))
+        self.assertIs(module._wrap_socket, first)
+
+    def test_pypi_pymumble_is_left_to_ssl_wrap_socket(self):
+        """PyPI 的 pymumble 没有 `_wrap_socket`，那边看 `ssl.wrap_socket`。"""
+        import types
+        module = types.SimpleNamespace()
+        self.assertFalse(mumblecompat.patch_tls(module))
+        self.assertFalse(hasattr(module, "_wrap_socket"))
+        self.assertEqual(
+            mumblecompat.tls_pinned(module),
+            getattr(getattr(ssl, "wrap_socket", None), "_can_pinned", False))
+
+    def test_the_installed_pymumble_is_pinned_after_install(self):
+        """装的是哪一个就验哪一个：install() 之后实际要走的那条路必须钉住。"""
+        import sys
+        from unittest import mock
+        if sys.version_info < (3, 12):
+            self.skipTest("3.12 以前的 ssl.wrap_socket 不去动它")
+        for name in ("opuslib", "opuslib.api", "opuslib.api.decoder",
+                     "opuslib.api.encoder", "opuslib.api.info", "opuslib.exceptions"):
+            sys.modules.setdefault(name, mock.MagicMock())
+        mumblecompat.install()
+        if mumblecompat._pymumble_module() is None:
+            self.skipTest("pymumble 导入不了")
+        self.assertTrue(mumblecompat.tls_pinned())
+
+
 class PymumbleIntegrationTest(unittest.TestCase):
     """确认补丁之后 pymumble 真的能建起连接对象。"""
 

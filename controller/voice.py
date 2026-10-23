@@ -18,7 +18,6 @@ import re
 import threading
 import time
 import rxmix
-import txbuffer
 
 import numpy as np
 import pyaudio
@@ -40,7 +39,7 @@ from pymumble_py3.constants import (
 import denoise
 import micgain
 import mumblecompat
-import radiostack
+import syncplan
 from i18n import t
 
 # pymumble 用的 ssl.wrap_socket 在 Python 3.12 里已被删除，导入时先补上，
@@ -97,61 +96,11 @@ class RejectAwareMumble(pymumble.Mumble):
     """
 
     def __init__(self, *args, **kwargs):
-        # 切频线程与库线程共用 TLS；整条消息（含部分写重试）必须串行。
-        self._control_send_lock = threading.RLock()
         super().__init__(*args, **kwargs)
-        self.parent_thread = threading.main_thread()
         self.reject_type = None
         self.reject_reason = None
 
-    def send_message(self, type, message):
-        # SSLSocket 的读和写也不能由两条线程同时操作。仅给 send 加锁
-        # 仍会撞上库线程的 recv；把外部线程的整条控制消息交回库线程处理。
-        owner = getattr(self, "mumble_thread", None)
-        if owner is not None and threading.current_thread() is not owner:
-            if not self.is_alive() or self.connected != PYMUMBLE_CONN_STATE_CONNECTED:
-                raise ConnectionError("cannot queue control messages outside an established session")
-            cmd = messages.Cmd()
-            cmd.cmd = "can_raw_control"
-            cmd.parameters = (type, message.SerializeToString())
-            # execute_command 即便 blocking=False 也会先 is_ready() 等锁；
-            # 断线竞态中它可能永久挂住同步线程。这里直接入当前会话队列。
-            self.commands.new_cmd(cmd)
-            return
-        with self._control_send_lock:
-            return super().send_message(type, message)
-
-    def treat_command(self, cmd):
-        if cmd.cmd == "can_raw_control":
-            type, payload = cmd.parameters
-
-            class SerializedMessage:
-                def ByteSize(self):
-                    return len(payload)
-
-                def SerializeToString(self):
-                    return payload
-
-            with self._control_send_lock:
-                super().send_message(type, SerializedMessage())
-            cmd.response = True
-            self.commands.answer(cmd)
-            return
-        return super().treat_command(cmd)
-
-    def execute_command(self, cmd, blocking=True):
-        if not blocking:
-            if self.connected != PYMUMBLE_CONN_STATE_CONNECTED or not self.is_alive():
-                raise ConnectionError("cannot queue commands outside an established session")
-            return self.commands.new_cmd(cmd)
-        return super().execute_command(cmd, blocking=blocking)
-
-    def send_audio_packet(self, packet):
-        with self._control_send_lock:
-            return super().send_audio_packet(packet)
-
     def dispatch_control_message(self, type, message):
-        self._last_control_received = time.monotonic()
         if type == PYMUMBLE_MSG_TYPES_REJECT:
             try:
                 reject = mumble_pb2.Reject()
@@ -163,15 +112,6 @@ class RejectAwareMumble(pymumble.Mumble):
             except Exception as e:
                 log.warning("could not parse the Reject message: %s", e)
         return super().dispatch_control_message(type, message)
-
-    def loop(self):
-        try:
-            return super().loop()
-        except OSError as e:
-            # pymumble.run 会吞掉 socket.error，只留下无理由的重连回调。
-            log.warning("Mumble I/O failed: %s (errno=%s, winerror=%s)",
-                        e, getattr(e, 'errno', None), getattr(e, 'winerror', None))
-            raise
 
     def run(self):
         """接住"服务器拒绝"，别让它变成一条 CRITICAL。
@@ -502,8 +442,10 @@ class VoiceClient:
             self.mumble = bounded_mumble()(self.server, self.cid,
                                            password=self.password,
                                            port=self.port,
-                                           udp=True,
                                            reconnect=True)
+            # 不传 udp=：pymumble-udp 默认就是 udp=True（加密 UDP，不通就退回
+            # TCP 隧道），而 PyPI 的 pymumble 不认这个参数——显式传的话，用旧
+            # 环境从源码跑的人语音会直接 TypeError，界面上只看到"连接失败"。
             self.mumble.reconnect_limit = self.reconnect_limit
             self.mumble.on_reconnect = self._on_reconnect_attempt
             self.mumble.set_receive_sound(True)
@@ -559,8 +501,7 @@ class VoiceClient:
 
         self._rx_monitor = threading.Thread(target=self._rx_monitor_loop, daemon=True)
         self._rx_monitor.start()
-        self._rx_mix_thread = threading.Thread(target=self._rx_mix_loop, daemon=True)
-        self._rx_mix_thread.start()
+        # 输出由 PortAudio 回调按设备时钟拉取，不再由 Python 定时线程推送。
         self._connection_thread = threading.Thread(target=self._connection_monitor, daemon=True)
         self._connection_thread.start()
 
@@ -649,10 +590,9 @@ class VoiceClient:
                 alive = bool(self.mumble) and (
                     self.mumble.connected == PYMUMBLE_CONN_STATE_CONNECTED)
                 if alive and time.time() - self._last_ping_rcv > PING_TIMEOUT:
-                    # 切频回包、音频仍在到达就不是断线；Ping 不是唯一心跳。
-                    recent_control = getattr(self.mumble, "_last_control_received", 0)
-                    if time.monotonic() - recent_control > PING_TIMEOUT:
-                        alive = False
+                    alive = False
+                    log.info(f"no ping reply for {time.time() - self._last_ping_rcv:.1f}s, "
+                             f"treating the connection as dropped")
 
                 if alive != self._last_connected:
                     reconnected = alive and not self._last_connected
@@ -819,7 +759,20 @@ class VoiceClient:
             self.output_stream = self.audio.open(
                 format=self.FORMAT, channels=self.CHANNELS, rate=self.RATE,
                 output=True, frames_per_buffer=self.CHUNK,
-                output_device_index=self._output_device)
+                output_device_index=self._output_device,
+                stream_callback=self._playback_callback)
+
+    def _playback_callback(self, in_data, frame_count, time_info, status):
+        """声卡需要多少采样就混多少；不在实时回调里等待、写声卡或记日志。"""
+        try:
+            size = max(1, int(round(frame_count * 48000 / self.RATE)))
+            with self._rx_mix_wakeup:
+                mixed = rxmix.take(self._rx_mix_frames, size)
+            if mixed is None:
+                return bytes(frame_count * 2), pyaudio.paContinue
+            return rxmix.output_frame(mixed, frame_count).tobytes(), pyaudio.paContinue
+        except Exception:
+            return bytes(frame_count * 2), pyaudio.paContinue
 
     def _close_streams(self):
         with self._stream_lock:
@@ -949,7 +902,7 @@ class VoiceClient:
 
         查一次频道表只是本地字典查找，不走网络，没有省下来的必要。
         """
-        name = radiostack.channel_name(khz)
+        name = syncplan.channel_name(khz)
         channel = self._find_channel(name)
         recreated = False
 
@@ -985,9 +938,9 @@ class VoiceClient:
             if self._channel_ids.get(previous_khz) == channel_id:
                 self._channel_ids.pop(previous_khz, None)
             log.warning("channel id %s was reused: %s -> %s",
-                        channel_id, radiostack.channel_name(previous_khz), name)
+                        channel_id, syncplan.channel_name(previous_khz), name)
         log.debug("frequency %s maps to channel %s (id %s)",
-                  radiostack.format_frequency(khz), name, channel_id)
+                  syncplan.format_frequency(khz), name, channel_id)
         self._channel_ids[khz] = channel_id
         self._channel_to_khz[channel_id] = khz
         return channel_id, recreated
@@ -1104,7 +1057,7 @@ class VoiceClient:
                 joined_khz = khz
                 break
             log.warning("could not join the primary channel %s",
-                        radiostack.format_frequency(khz))
+                        syncplan.format_frequency(khz))
 
         # 没进去的频率一律挂频道监听——**试过没进去的那些也算在内**，别让管制员
         # 唯一在用的那个频率成了唯一听不到的
@@ -1126,10 +1079,10 @@ class VoiceClient:
         self._set_voice_target(self._tx_channels, force=force_target)
         self._program_cross_couple_targets()
         log.debug("syncing the radio stack: primary %s, RX %s, TX %s, XC %s",
-                  radiostack.format_frequency(joined_khz) if joined_khz else "none",
-                  [radiostack.format_frequency(k) for k in stack.rx_frequencies()],
-                  [radiostack.format_frequency(k) for k in stack.tx_frequencies()],
-                  [radiostack.format_frequency(k) for k in stack.xc_frequencies()])
+                  syncplan.format_frequency(joined_khz) if joined_khz else "none",
+                  [syncplan.format_frequency(k) for k in stack.rx_frequencies()],
+                  [syncplan.format_frequency(k) for k in stack.tx_frequencies()],
+                  [syncplan.format_frequency(k) for k in stack.xc_frequencies()])
 
     def _join_frequency(self, khz, channel_id):
         """进这个频率的频道，一次不成就按名字重新解析再试一次。
@@ -1150,7 +1103,7 @@ class VoiceClient:
         恰好在它唯一该生效的场景里把重试挡掉了——实测日志里 8 次进频道失败，
         "joining again" 一次都没出现过。
         """
-        name = radiostack.channel_name(khz)
+        name = syncplan.channel_name(khz)
         if self._join(channel_id, expected_name=name):
             return True
 
@@ -1163,7 +1116,7 @@ class VoiceClient:
             # 里面的，会把后面排队的 sync 一起拖住
             return False
         log.info("channel for %s resolved to id %s (recreated=%s), joining again",
-                 radiostack.format_frequency(khz), again, recreated)
+                 syncplan.format_frequency(khz), again, recreated)
         return self._join(again, expected_name=name)
 
     def _join(self, channel_id, expected_name=None):
@@ -1295,8 +1248,8 @@ class VoiceClient:
         # 的话音会点亮 A 的灯、按 A 的音量播、还转发到 A 的交叉耦合上。
         try:
             channel = self.mumble.channels[channel_id]
-            if channel.get("name") != radiostack.channel_name(khz):
-                self._forget_channel(khz, radiostack.channel_name(khz))
+            if channel.get("name") != syncplan.channel_name(khz):
+                self._forget_channel(khz, syncplan.channel_name(khz))
                 return
         except Exception:
             return
@@ -1344,13 +1297,9 @@ class VoiceClient:
                 if not self.running:
                     break
                 mixed = rxmix.take(self._rx_mix_frames)
-            # 以写入开始时间追赶节拍。阻塞 write 已经等待过一帧，不能在它
-            # 返回后重新起算 20 ms，否则 Windows 上偶发慢写会不断增加延迟。
-            next_frame = max(next_frame, time.monotonic())
 
-            # 声卡持续消费固定时间片，静音时也喂零，避免恢复话音时输出欠载。
             if mixed is None:
-                mixed = np.zeros(960, dtype=np.int16)
+                continue
             try:
                 mixed = rxmix.output_frame(mixed, self.CHUNK)
                 with self._output_stream_lock:
@@ -1358,6 +1307,9 @@ class VoiceClient:
                         self.output_stream.write(mixed.tobytes())
             except Exception as e:
                 log.warning(f"playing the mixed received audio raised: {e}")
+
+            if time.monotonic() > next_frame + frame_duration:
+                next_frame = time.monotonic()
 
     def _forward_cross_couple(self, khz, soundchunk):
         """交叉耦合：在一个 XC 频率上收到的话音，转发到其它 XC 频率。"""
@@ -1374,9 +1326,6 @@ class VoiceClient:
         with self._audio_lock:
             if self.transmitting:
                 return
-            if (self.mumble.sound_output.target == PTT_TARGET_ID
-                    and self.mumble.sound_output.get_buffer_size()):
-                return  # PTT 尾音尚未发完，不能被转发改目标。
             try:
                 self.mumble.sound_output.target = target_id
                 self.mumble.sound_output.add_sound(soundchunk.pcm)
@@ -1453,21 +1402,8 @@ class VoiceClient:
         reads = queued = audible = skipped = errors = 0
         peak = 0
         exit_reason = "PTT released"
-        backlog_resets = 0
-        max_pending = 0.0
-        # 麦克风在空闲期间一直开着，开始发话时丢掉设备内的旧录音。
-        try:
-            with self._input_stream_lock:
-                available = self.input_stream.get_read_available()
-                if isinstance(available, int) and available > 0:
-                    self.input_stream.read(available, exception_on_overflow=False)
-        except Exception as e:
-            log.debug("could not discard idle microphone samples: %s", e)
         try:
             with self._audio_lock:
-                output = self.mumble.sound_output
-                if output.get_buffer_size():
-                    output.clear_buffer()
                 self.mumble.sound_output.target = PTT_TARGET_ID
         except Exception as e:
             log.warning(f"switching the voice target failed: {e}")
@@ -1491,23 +1427,15 @@ class VoiceClient:
                         skipped += 1
                         continue
                     with self._audio_lock:
-                        output = self.mumble.sound_output
-                        pending = output.get_buffer_size()
-                        max_pending = max(max_pending, pending)
                         # 交叉耦合可能刚把 target 切走，每次都重新确认
                         self.mumble.sound_output.target = PTT_TARGET_ID
-                        dropped = txbuffer.enqueue(output, audio.tobytes())
-                        if dropped:
-                            backlog_resets += 1
-                            if backlog_resets == 1:
-                                log.warning("outgoing audio backlog reached %.3f s; "
-                                            "trimming oldest queued audio", pending)
+                        self.mumble.sound_output.add_sound(audio.tobytes())
                         queued += 1
             except Exception as e:
                 errors += 1
                 log.warning(f"recording raised: {e}")
                 time.sleep(0.1)
-            # read(CHUNK) 本身由声卡按 20 ms 节拍阻塞，不再额外休眠。
+            time.sleep(0.001)
 
         if not self.running:
             exit_reason = "voice stopped"
@@ -1521,9 +1449,7 @@ class VoiceClient:
             log.debug("could not inspect the outgoing audio queue: %s", e)
         try:
             with self._audio_lock:
-                # target 在真正发送时才被读取；队列还有尾音时不能提前改成 0。
-                if not self.mumble.sound_output.get_buffer_size():
-                    self.mumble.sound_output.target = 0
+                self.mumble.sound_output.target = 0
         except Exception:
             pass
         log.info("PTT ended (%s): %.1f s, mic reads %d, non-silent %d, peak %d/32768, "
@@ -1532,7 +1458,4 @@ class VoiceClient:
                  exit_reason, time.monotonic() - started, reads, audible, peak,
                  queued, skipped, errors,
                  f"{pending_seconds:.3f}" if pending_seconds is not None else "unavailable",
-                  encoder_ready, mumble_alive)
-        if backlog_resets:
-            log.info("outgoing audio backlog: peak %.3f s, discarded %d time(s)",
-                     max_pending, backlog_resets)
+                 encoder_ready, mumble_alive)

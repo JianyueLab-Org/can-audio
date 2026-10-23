@@ -1,11 +1,12 @@
-# airwaysn_audio
+# can-audio
 
-Cerulean Aviation Network（原 Cerulean Aviation Network）的**语音层**。基于 Mumble：飞行员的模拟器
+Cerulean Aviation Network（原 AirwaySN）的**语音层**。基于 Mumble：飞行员的模拟器
 COM1 频率决定他坐在哪个 Mumble 频道，管制员用一个电台栈同时守听/发话多个频率，
 情报通播由服务端的机器人把合成语音播到各自的频率上。
 
-只找使用说明的话看 [`发布说明.md`](发布说明.md)；给 AI 助手看的工程约定在
-[`CLAUDE.md`](CLAUDE.md)。这份 README 是给要跑源码、打包或部署服务端的人看的。
+管制客户端的使用说明在 [can-audio-client](https://github.com/JianyueLab-Org/can-audio-client)，
+通播客户端在 [can-atis](https://github.com/JianyueLab-Org/can-atis)；给 AI 助手看的工程约定在
+[`CLAUDE.md`](CLAUDE.md)。这份 README 是给要维护语音引擎、部署服务端的人看的。
 
 网络的另外两块在隔壁仓库：**can-fsd**（Go 写的 FSD 服务端 + 数据源）和
 **can-web**（网站、账号、雷达）。这个仓库只做语音，不参与飞行数据。
@@ -16,74 +17,65 @@ COM1 频率决定他坐在哪个 Mumble 频道，管制员用一个电台栈同�
 
 | 目录 | 入口 | 是什么 |
 |---|---|---|
-| `controller/` | `gui.py` | 管制客户端，一个电台栈，每个频率有 RX/TX/XC |
-| `atis/` | `gui.py` | 情报通播客户端，仿 vATIS：席位、预设、模板 |
-| `xpc/` | `gui.py` | **XPC for CAN** — X-Plane 客户端，语音 **+** FSD，能看到他机 |
-| `msfs/` | `gui.py` | **MSFS for CAN** — 同上，用于微软模拟器 |
+| `controller/` | `bridge.py` | 无界面语音引擎：Mumble 连接、音频收发、混音、降噪、增益。由 C# 管制客户端启动，经 stdin/stdout 的 JSON Lines 通信 |
+| `atis-worker/` | `can_mumble_worker.py` | 通播语音发送进程：由 C# 通播客户端 can-atis 启动，从 stdin 收 PCM，进频率频道循环播报，stdout 上报连接状态 |
 | `server/` | `login.py`、`ATIS/mumble.py` | 跑在 Mumble 主机上：Ice 认证器 + 服务端通播机队 |
+| `native/rnnoise/` | `build.ps1` | 可选的 RNNoise 降噪原生库构建 |
 
-`xpc/` 和 `msfs/` 是功能最全的两个：除了语音还会登录 FSD，所以飞机会出现在
-网络上、也能看到别人。
+这是 `new-client-sys` 分支：只放**客户端与 Python 开发共同维护的语音部分**和服务端。
+管制端的界面、设置、PTT 输入、电台栈规则都在 C# 客户端
+[can-audio-client](https://github.com/JianyueLab-Org/can-audio-client) 里；
+通播的界面、模板、METAR、FSD 和语音合成在 C# 客户端
+[can-atis](https://github.com/JianyueLab-Org/can-atis) 里；
+飞行员客户端由 C# 的 can-pilot-client 维护。旧的 Python 管制 GUI、Python 桌面通播客户端
+（`atis/`）和飞行员客户端仍在 `main` 分支的历史里。
 
-每个组件都是**从自己的目录独立运行**的——图标路径和配置文件都按当前目录解析。
-组件之间靠**复制**共享代码，不是 import（`mumblecompat.py`、`applog.py`、
-`voice.py` 等都有多份副本）。改公共逻辑要逐个核对副本，`xpc` 和 `msfs` 的
-`voice.py`、`traffic.py`、`chime.py`、`observer.py` 必须逐字节一致，有测试盯着。
+两边的协议、文件分工、测试和打包：管制端见 [`controller/README.md`](controller/README.md)，
+通播见 [`atis-worker/README.md`](atis-worker/README.md)。改协议要两个仓库一起改。
 
-`xpc/` 和 `msfs/` 还有一个**观察员模式**（连接栏上的勾），给双人机组的右座用：
-只连语音、不连 FSD，所以网络上不会多出一架飞机，也不会有重复呼号被踢。频率跟着
-自己的 COM1 走，没开模拟器就在无线电栏里手输一个。代价是收不到管制的文字消息
-——那是发给机长呼号的。两个人要用各自的账号。
-
-`controller/`、`atis/`、`xpc/` 和 `msfs/` 的设置中可选择服务器并刷新列表。
-`xpc/` 和 `msfs/` 的入口在「网络」页。语音和 FSD 分别选择，地址和端口会保存。
-选择「自定义」可手动填写地址和端口；列表获取失败时仍可使用已保存的地址。
-切换前需断开所有连接，ATIS 需停止所有播出。
+`mumblecompat.py` 在 `controller/`、`atis-worker/` 和 `server/ATIS/` 各有一份，必须逐字节相同，
+`server/ATIS/test_mumble.py` 会核对。
 
 ---
 
 ## 跑起来
 
-需要 **Python 3.12**（3.13+ 没有 PyAudio 的 wheel）。
+需要 **Python 3.12**（3.13+ 没有 PyAudio 的 wheel）。Windows 上 requirements 文件里有中文注释，
+pip 默认按 GBK 读会失败，先设 `PYTHONUTF8=1`：
 
 ```powershell
-pip install -r requirements-build.txt
+py -3.12 -m venv .venv
+$env:PYTHONUTF8 = 1
+.\.venv\Scripts\python.exe -m pip install -r requirements-voice.txt
 ```
 
-按需再装：`edge-tts requests pyttsx3 scipy`（服务端通播）、`zeroc-ice`（服务端认证器）。
 客户端使用仓库的 `pymumble_udp` 分支，而不是 PyPI 上只有 TCP tunnel 的旧版
 `pymumble`。它对外仍导入为 `pymumble_py3`，并会在 Mumble 1.5+ 服务端上使用
-加密 UDP 音频；UDP 不可用时自动回退到 TCP tunnel。
+加密 UDP 音频；UDP 不可用时自动回退到 TCP tunnel。两个包装进同一个
+`pymumble_py3` 目录，以前装过 PyPI 版的先 `pip uninstall pymumble`。
 
-pymumble 通过 ctypes 加载原生的 **opus** 库，找不到就 `Could not find Opus
-library`。仓库里各组件目录下有 `opus.dll`，把那个目录加进 `PATH` 即可。
+pymumble 通过 ctypes 加载原生的 **opus** 库；`controller/opus.dll` 已提交，
+`atis-worker/opus.dll` 是同一个文件；两个入口启动时都会把自己的目录加进 `PATH`。
+
+语音引擎本身没有界面，平时由 C# 客户端启动。手动调试可以直接跑，往 stdin 里一行一条命令：
 
 ```powershell
-cd controller;    python gui.py
-cd atis;          python gui.py
-cd xpc;           python gui.py
-cd msfs;          python gui.py
+.\.venv\Scripts\python.exe -u controller\bridge.py
+{"id": 1, "command": "devices"}
 ```
 
 ---
 
 ## 测试
 
-除 `server/login.py` 外每个组件都有测试，都在各自目录下运行，**不需要服务器、
-不需要音频设备、不需要网络**。跑之前把 `xpc` 加进 `PATH`（opus）。
+都**不需要服务器、不需要音频设备、不需要网络**：
 
 ```powershell
-cd controller;    python -m unittest test_radiostack test_applog test_mumblecompat test_voice -v
-                  python smoke_gui.py
-cd atis;          python -m unittest test_atis test_applog test_mumblecompat -v
-                  python smoke_gui.py
-cd xpc;           python -m unittest test_xpc -v;  python smoke_gui.py
-cd msfs;          python -m unittest test_msfs -v; python smoke_gui.py
-cd server;        python -m unittest test_login test_serverconf -v
-cd server\ATIS;   python -m unittest test_mumble -v
+.\.venv\Scripts\python.exe -m unittest discover -s controller -v
+.\.venv\Scripts\python.exe -m unittest discover -s atis-worker -v
+cd server;        python -m unittest test_login test_serverconf test_fix_acl -v
+cd server\ATIS;   python -m unittest test_mumble test_atisrouting -v
 ```
-
-`smoke_gui.py` 用离屏平台把所有窗口和对话框都建一遍，是唯一会碰 `gui.py` 的东西。
 
 **写测试请断言真实行为**——耗时、状态、真的收发了什么——而不是"有没有调用某个
 函数"。这条不是洁癖：仓库里已经有好几个 bug 是因为测试只对源码做字符串匹配而
@@ -93,24 +85,10 @@ cd server\ATIS;   python -m unittest test_mumble -v
 
 ## 打包
 
-在组件目录下：
-
-```powershell
-pyinstaller gui.spec
-```
-
-**能跑的是 `dist/` 里那份，不是 `build/` 里的。** PyInstaller 会在工作目录留一个
-同名 exe，但那只是引导程序，`python312.dll`、`opus.dll` 和 Qt 库都在
-`dist/<名字>/_internal/` 里；点 `build/` 那个会报「Failed to load Python DLL」，
-看着像构建坏了，其实只是点错了。
-
-打包前先关掉正在运行的同名程序，否则 `dist/` 被占用会产出残缺的包。
-
-两个必须随包带上、漏了会静默失效的原生库：**每个 spec 都要带 `opus.dll`**
-（ctypes 运行时加载，静态分析看不见）；**`msfs/gui.spec` 还要带
-`SimConnect.dll`**，而且必须落在 `_internal/SimConnect/` —— Python-SimConnect
-按模块自身位置推路径。漏了 SimConnect.dll 的话程序照样启动、涂装照样扫描，
-就是永远读不到模拟器，界面一直说"连不上 MSFS"。
+- 管制端语音引擎打成单文件 `can-voice.exe`，命令见 [`controller/README.md`](controller/README.md#开发与测试)。
+  C# 管制客户端的发行脚本会把它放进发行包的 `controller/` 目录。
+- 通播语音发送进程打成单文件 `can-voice-worker.exe`，命令见 [`atis-worker/README.md`](atis-worker/README.md#开发与测试)。
+  can-atis 的 `build-single-file.ps1` 会把它嵌进 `atis-for-can.exe`。
 
 ---
 
@@ -133,8 +111,7 @@ unless-stopped` 让外面重新拉起）。两个方向都会出事：`login.py`
 
 ### Docker
 
-镜像由 CI 构建并推到 GHCR（`.github/workflows/server-image.yml`，只在改
-`server/` 或 `Dockerfile` 时触发），服务器上用 compose 部署：
+这个分支暂时没有 GitHub CI，镜像需要手动构建并推到 GHCR，服务器上用 compose 部署：
 
 ```bash
 cp .env.example .env      # 改里面的密码；全都可以留空
@@ -160,9 +137,9 @@ docker run -d --name can-server --restart unless-stopped \
   can-audio-server
 ```
 
-**CI 里那步冒烟不是走过场**：这个镜像的失败模式全是"构建成功、运行时才发现"
+**构建完一定要冒烟**：这个镜像的失败模式全是"构建成功、运行时才发现"
 （漏了 `serverconf.py`、`start.sh` 没有执行位、ini 或 slice 路径探错），在
-`docker build` 的输出里一律是绿色的。所以构建完会真的把容器跑起来，等它自己的
+`docker build` 的输出里一律是绿色的。所以构建完要真的把容器跑起来，等它自己的
 HEALTHCHECK 变 healthy，再确认日志里出现了「认证器已设置」和「服务器回调已注册」。
 
 四条别绕过去的：
@@ -245,7 +222,7 @@ python3 server/fix_acl.py --apply    # 真的写进去
   `lock.acquire()` 没有任何超时（pymumble 源码里就写着 TODO）。命令没被处理就
   永久卡死，症状是日志的*缺失*——停在"建一个临时的"之后既没成功也没报错。
   **任何组件都不许调这两个包装**，自己发 `CreateChannel` / `MoveCmd`，再轮询确认
-  结果。`xpc/voice.py` 是参考实现。
+  结果。`controller/voice.py` 是参考实现。
 - **进没进频道是服务器说了算的，不能靠本地记账。** 连接都是 `reconnect=True`，
   重连之后服务器会把人放回根频道，而本地记的频率还是旧的。只比对本地值的话会
   以为"已经到位"而再也不切。另外根频道的 `channel_id` 就是 `0`，判断"有没有进

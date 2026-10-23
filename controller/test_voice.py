@@ -24,7 +24,7 @@ for _name in ("opuslib", "opuslib.api", "opuslib.api.decoder",
               "opuslib.api.encoder", "opuslib.api.info", "opuslib.exceptions"):
     sys.modules.setdefault(_name, mock.MagicMock())
 
-import radiostack
+from syncplan import SyncPlan
 import voice
 from voice import VoiceClient
 
@@ -67,88 +67,6 @@ def make_client():
 
 
 class VoiceTargetTest(unittest.TestCase):
-
-    def test_nonblocking_move_never_waits_on_ready_lock(self):
-        from pymumble_py3.commands import Commands
-        mumble = voice.RejectAwareMumble.__new__(voice.RejectAwareMumble)
-        mumble.connected = voice.PYMUMBLE_CONN_STATE_CONNECTED
-        mumble.is_alive = lambda: True
-        mumble.commands = Commands()
-        mumble.is_ready = mock.Mock(side_effect=AssertionError('must not wait'))
-        cmd = voice.messages.MoveCmd(42, 7)
-        mumble.execute_command(cmd, blocking=False)
-        self.assertIs(mumble.commands.pop_cmd(), cmd)
-        mumble.commands.answer(cmd)
-        mumble.is_ready.assert_not_called()
-
-    def test_disconnect_race_neither_waits_nor_writes_from_switch_thread(self):
-        mumble = voice.RejectAwareMumble.__new__(voice.RejectAwareMumble)
-        mumble.mumble_thread = object()
-        mumble.connected = voice.PYMUMBLE_CONN_STATE_FAILED
-        mumble.is_alive = lambda: True
-        mumble.commands = mock.Mock()
-        mumble.execute_command = mock.Mock()
-        state = voice.mumble_pb2.UserState()
-        with self.assertRaises(ConnectionError):
-            mumble.send_message(voice.PYMUMBLE_MSG_TYPES_USERSTATE, state)
-        mumble.commands.new_cmd.assert_not_called()
-        mumble.execute_command.assert_not_called()
-
-    def test_real_command_queue_keeps_rapid_switches_on_one_sender_thread(self):
-        from pymumble_py3.commands import Commands
-        import struct
-        import logging
-        mumble = voice.RejectAwareMumble.__new__(voice.RejectAwareMumble)
-        threading.Thread.__init__(mumble)
-        mumble._control_send_lock = threading.RLock()
-        mumble.connected = voice.PYMUMBLE_CONN_STATE_CONNECTED
-        mumble.commands = Commands()
-        mumble.Log = logging.getLogger('test-wire')
-        mumble.is_alive = lambda: True
-        wire = bytearray()
-        writers = set()
-
-        def send(data):
-            writers.add(threading.get_ident())
-            wire.extend(data[:3])  # 强制部分写，验证整条消息重试。
-            return min(3, len(data))
-
-        mumble.control_socket = types.SimpleNamespace(send=send)
-        ready = threading.Event()
-        queued = threading.Event()
-
-        def worker():
-            mumble.mumble_thread = threading.current_thread()
-            ready.set()
-            queued.wait(2)
-            while mumble.commands.is_cmd():
-                mumble.treat_command(mumble.commands.pop_cmd())
-
-        thread = threading.Thread(target=worker)
-        thread.start()
-        self.assertTrue(ready.wait(1))
-        for channel in range(1, 201):
-            move = voice.messages.MoveCmd(42, channel)
-            mumble.commands.new_cmd(move)
-            state = voice.mumble_pb2.UserState()
-            state.session = 42
-            state.listening_channel_add.append(channel + 1)
-            mumble.send_message(voice.PYMUMBLE_MSG_TYPES_USERSTATE, state)
-        self.assertFalse(wire)
-        queued.set()
-        thread.join(3)
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(writers, {thread.ident})
-        count = 0
-        while wire:
-            kind, size = struct.unpack('!HL', wire[:6])
-            self.assertEqual(kind, voice.PYMUMBLE_MSG_TYPES_USERSTATE)
-            state = voice.mumble_pb2.UserState()
-            state.ParseFromString(bytes(wire[6:6 + size]))
-            self.assertEqual(state.session, 42)
-            del wire[:6 + size]
-            count += 1
-        self.assertEqual(count, 400)
     """PTT 和交叉耦合必须用不同的 VoiceTarget 编号。"""
 
     def test_ptt_and_cross_couple_use_different_targets(self):
@@ -160,57 +78,7 @@ class VoiceTargetTest(unittest.TestCase):
                          "交叉耦合不能占用 PTT 的编号，否则转发时会把 PTT 的"
                          "目标一起改掉")
         self.assertEqual(len(set(client._xc_targets.values())), 3,
-                          "每个来源频率要有自己的编号")
-
-    def test_control_and_tunneled_audio_cannot_interleave(self):
-        mumble = voice.RejectAwareMumble.__new__(voice.RejectAwareMumble)
-        mumble.is_alive = lambda: False
-        mumble._control_send_lock = threading.RLock()
-        entered = threading.Event()
-        release = threading.Event()
-        audio_sent = threading.Event()
-
-        def control(*args):
-            entered.set()
-            release.wait(timeout=1)
-
-        with mock.patch.object(voice.pymumble.Mumble, 'send_message', control), \
-                mock.patch.object(voice.pymumble.Mumble, 'send_audio_packet',
-                                  lambda *args: audio_sent.set()):
-            first = threading.Thread(target=mumble.send_message, args=(1, None))
-            second = threading.Thread(target=mumble.send_audio_packet, args=(b'audio',))
-            first.start()
-            self.assertTrue(entered.wait(1))
-            second.start()
-            try:
-                self.assertFalse(audio_sent.wait(0.05))
-            finally:
-                release.set()
-                first.join(1)
-                second.join(1)
-            self.assertTrue(audio_sent.is_set())
-
-    def test_frequency_control_is_queued_for_the_mumble_thread(self):
-        mumble = voice.RejectAwareMumble.__new__(voice.RejectAwareMumble)
-        mumble.is_alive = lambda: True
-        mumble.mumble_thread = object()
-        mumble.connected = voice.PYMUMBLE_CONN_STATE_CONNECTED
-        mumble.execute_command = mock.Mock()
-        mumble._control_send_lock = threading.RLock()
-        mumble.commands = mock.Mock()
-        message = voice.mumble_pb2.UserState()
-        message.session = 42
-        message.listening_channel_add.append(7)
-        with mock.patch.object(voice.pymumble.Mumble, 'send_message') as send:
-            mumble.send_message(voice.PYMUMBLE_MSG_TYPES_USERSTATE, message)
-            send.assert_not_called()
-            mumble.execute_command.assert_not_called()
-            cmd = mumble.commands.new_cmd.call_args.args[0]
-            expected = message.SerializeToString()
-            message.Clear()
-            mumble.treat_command(cmd)
-            self.assertEqual(send.call_args.args[1].SerializeToString(), expected)
-            mumble.commands.answer.assert_called_once_with(cmd)
+                         "每个来源频率要有自己的编号")
 
     def test_cross_couple_excludes_its_own_source(self):
         client = make_client()
@@ -250,51 +118,6 @@ class CrossCoupleDuringPttTest(unittest.TestCase):
         self.assertEqual(len(self.client.mumble.sound_output.sent), 1)
         target, _ = self.client.mumble.sound_output.sent[0]
         self.assertEqual(target, self.client._xc_targets[11])
-
-    def test_ptt_tail_keeps_its_target_until_queue_is_empty(self):
-        client = self.client
-        client.transmitting = True
-        client.input_stream = mock.Mock()
-        client.input_stream.get_read_available.return_value = 0
-        output = client.mumble.sound_output
-        output.get_buffer_size = lambda: 0.1
-        output.clear_buffer = mock.Mock()
-
-        def read(*args, **kwargs):
-            client.transmitting = False
-            return np.zeros(960, np.int16).tobytes()
-
-        client.input_stream.read.side_effect = read
-        client._transmit_loop()
-        self.assertEqual(output.target, voice.PTT_TARGET_ID)
-        before = len(output.sent)
-        client._forward_cross_couple(118000, self.chunk())
-        self.assertEqual(len(output.sent), before)
-
-    def test_long_transmission_drops_stale_send_backlog(self):
-        client = self.client
-        client.transmitting = True
-        client.input_stream = mock.Mock()
-        client.input_stream.get_read_available.return_value = 0
-        output = client.mumble.sound_output
-        output.encoder_framesize = 0.02
-        output.channels = 1
-        output.pcm = []
-        output.get_buffer_size = lambda: sum(map(len, output.pcm)) / 96000
-        output.clear_buffer = mock.Mock(side_effect=output.pcm.clear)
-        reads = [0]
-
-        def read(*args, **kwargs):
-            reads[0] += 1
-            if reads[0] == 100:
-                client.transmitting = False
-            return bytes(1920)
-
-        client.input_stream.read.side_effect = read
-        client._transmit_loop()
-        self.assertEqual(output.clear_buffer.call_count, 0)
-        self.assertLessEqual(output.get_buffer_size(), 0.240)
-        self.assertEqual(len(output.pcm), 12)
 
     def test_does_not_forward_while_transmitting(self):
         self.client.transmitting = True
@@ -444,71 +267,6 @@ class MicProcessingTest(unittest.TestCase):
 
 class RxIndicatorTest(unittest.TestCase):
 
-    def test_slow_windows_write_does_not_add_another_timer_wait(self):
-        client = make_client()
-        clock = types.SimpleNamespace(now=0.0)
-
-        class Wakeup:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                pass
-
-            def wait(self, timeout):
-                clock.now += max(0, timeout)
-
-        writes = []
-
-        def write(pcm):
-            writes.append(clock.now)
-            clock.now += 0.030  # 模拟 Windows 慢写，已阻塞超过一帧。
-            if len(writes) == 100:
-                client.running = False
-
-        client._rx_mix_wakeup = Wakeup()
-        client.output_stream = types.SimpleNamespace(write=write)
-        with mock.patch.object(voice.time, 'monotonic', side_effect=lambda: clock.now):
-            client._rx_mix_loop()
-        self.assertAlmostEqual(writes[-1] - writes[0], 99 * 0.030, places=6)
-
-    def test_recent_control_reply_prevents_false_ping_disconnect(self):
-        client = make_client()
-        client._last_connected = True
-        client._last_ping_rcv = time.time() - 30
-        client.mumble.connected = voice.PYMUMBLE_CONN_STATE_CONNECTED
-        client.mumble.ping_stats = {}
-        client.mumble._last_control_received = time.monotonic()
-        changes = []
-        client.on_connection_change = changes.append
-
-        def finish(_):
-            client.running = False
-
-        with mock.patch.object(voice.time, 'sleep', side_effect=finish):
-            client._connection_monitor()
-        self.assertTrue(client.connected)
-        self.assertEqual(changes, [])
-
-    def test_output_stays_fed_while_frequency_is_silent(self):
-        client = make_client()
-        written = []
-
-        def write(pcm):
-            written.append(pcm)
-            if len(written) == 4:
-                client.running = False
-
-        client.output_stream = types.SimpleNamespace(write=write)
-        worker = threading.Thread(target=client._rx_mix_loop, daemon=True)
-        worker.start()
-        worker.join(timeout=1)
-        client.running = False
-        with client._rx_mix_wakeup:
-            client._rx_mix_wakeup.notify_all()
-        worker.join(timeout=1)
-        self.assertEqual(written, [bytes(1920)] * 4)
-
     def test_received_frames_are_mixed_and_limited(self):
         frames = [
             np.array([20000, -20000, 100], dtype=np.int16),
@@ -539,10 +297,8 @@ class RxIndicatorTest(unittest.TestCase):
             client._rx_mix_wakeup.notify_all()
         client._rx_mix_thread.join(timeout=2)
 
-        audible = [call.args[0] for call in client.output_stream.write.call_args_list
-                   if any(call.args[0])]
-        self.assertEqual(len(audible), 1)
-        self.assertEqual(audible[0],
+        self.assertEqual(client.output_stream.write.call_count, 1)
+        self.assertEqual(client.output_stream.write.call_args.args[0],
                          np.full(960, 400, dtype=np.int16).tobytes())
 
     def test_two_callbacks_before_the_next_tick_are_mixed(self):
@@ -570,10 +326,8 @@ class RxIndicatorTest(unittest.TestCase):
             with client._rx_mix_wakeup:
                 client._rx_mix_wakeup.notify_all()
             client._rx_mix_thread.join(timeout=2)
-        audible = [call.args[0] for call in client.output_stream.write.call_args_list
-                   if any(call.args[0])]
-        self.assertEqual(len(audible), 1)
-        self.assertEqual(audible[0],
+        self.assertEqual(client.output_stream.write.call_count, 1)
+        self.assertEqual(client.output_stream.write.call_args.args[0],
                          np.full(960, 400, dtype=np.int16).tobytes())
 
     def test_atis_is_played_but_never_cross_coupled(self):
@@ -934,21 +688,13 @@ class ChannelSwitchTest(unittest.TestCase):
         """sync() 是整条链的入口，卡在这里等于电台栈永远同步不上去。"""
         voice.CHANNEL_TIMEOUT = 0.3
         self.server.answers = False
-        stack = radiostack.RadioStack()
-        for freq in ("118.000", "121.700"):
-            stack.add(freq)
-            stack.get(radiostack.parse_frequency(freq)).rx = True
-        stack.selected_khz = 118000
+        stack = SyncPlan(rx=[118000, 121700], selected=118000)
         _, elapsed = self.call(lambda: self.client.sync(stack), budget=6.0)
         self.assertLess(elapsed, 5.0, "两个频率各等一个超时，也该结束了")
         self.assertEqual(self.server.blocking_calls, [])
 
     def test_sync_joins_the_selected_frequency(self):
-        stack = radiostack.RadioStack()
-        for freq in ("118.000", "121.700"):
-            stack.add(freq)
-            stack.get(radiostack.parse_frequency(freq)).rx = True
-        stack.selected_khz = 121700
+        stack = SyncPlan(rx=[118000, 121700], selected=121700)
         self.call(lambda: self.client.sync(stack), budget=8.0)
         joined = self.client._channel_ids[121700]
         self.assertEqual(self.server.my_channel, joined,
@@ -984,13 +730,8 @@ class TemporaryChannelRemovedTest(unittest.TestCase):
         self.client.connected = True
         self.client.running = True
 
-        self.stack = radiostack.RadioStack()
-        for khz in (118000, 121700):
-            self.stack.add(khz)
-            radio = self.stack.get(khz)
-            radio.rx = True
-            radio.tx = True
-        self.stack.select(118000)
+        self.stack = SyncPlan(rx=[118000, 121700], tx=[118000, 121700],
+                              selected=118000)
 
     def tearDown(self):
         voice.CHANNEL_TIMEOUT = self._timeout
@@ -1008,7 +749,7 @@ class TemporaryChannelRemovedTest(unittest.TestCase):
         old = self.client._channel_ids[118000]
         self.assertEqual(self.server.my_channel, old, "前提：先进了 118.000")
 
-        self.stack.select(121700)
+        self.stack.selected_khz = 121700
         self.sync_and_wait()
         self.assertNotEqual(self.server.my_channel, old, "前提：已经换到 121.700")
 
@@ -1018,7 +759,7 @@ class TemporaryChannelRemovedTest(unittest.TestCase):
     def test_a_removed_channel_is_not_joined_by_its_old_id(self):
         self.switch_away_and_let_the_old_channel_die()
 
-        self.stack.select(118000)
+        self.stack.selected_khz = 118000
         self.sync_and_wait()
 
         rebuilt = self.server.by_name.get("FREQ_118000")
@@ -1036,7 +777,7 @@ class TemporaryChannelRemovedTest(unittest.TestCase):
     def test_a_removed_channel_never_ends_up_in_the_voice_target(self):
         self.switch_away_and_let_the_old_channel_die()
 
-        self.stack.select(118000)
+        self.stack.selected_khz = 118000
         self.sync_and_wait()
 
         programmed = None
@@ -1067,13 +808,8 @@ class ReconnectTest(unittest.TestCase):
         self.client.connected = True
         self.client.running = True
 
-        self.stack = radiostack.RadioStack()
-        self.stack.add(118000)
-        self.stack.add(121700)
-        for radio in self.stack:
-            radio.rx = True
-            radio.tx = True
-        self.stack.select(118000)
+        self.stack = SyncPlan(rx=[118000, 121700], tx=[118000, 121700],
+                              selected=118000)
 
     def sync_and_wait(self):
         thread = threading.Thread(target=self.client.sync, args=(self.stack,),
@@ -1163,15 +899,11 @@ class SyncStormTest(unittest.TestCase):
         voice.CHANNEL_TIMEOUT = self._timeout
 
     def stack_with(self, *frequencies, tx=(), xc=()):
-        stack = radiostack.RadioStack()
-        for khz in frequencies:
-            stack.add(khz)
-        for radio in stack:
-            radio.rx = True
-            radio.tx = radio.frequency_khz in tx or radio.frequency_khz in xc
-            radio.xc = radio.frequency_khz in xc
-        stack.select(frequencies[0])
-        return stack
+        frequencies = sorted(frequencies)
+        return SyncPlan(rx=frequencies,
+                        tx=[khz for khz in frequencies if khz in tx or khz in xc],
+                        xc=[khz for khz in frequencies if khz in xc],
+                        selected=frequencies[0])
 
     def fire(self, calls):
         """同时打进来一批 sync，等它们全部返回。"""
@@ -1490,14 +1222,10 @@ class PrimaryChannelSelectionTest(unittest.TestCase):
         self.client.connected = True
         self.client.running = True
 
-        self.stack = radiostack.RadioStack()
-        for khz in (118000, 121700, 126750):
-            self.stack.add(khz)
-            radio = self.stack.get(khz)
-            radio.rx = True
-            radio.tx = True
-        self.stack.select(126750)       # 手动选中的不是本人席位
-        self.stack.set_locked({118000, 121700})
+        # 手动选中的 126.750 不是本人席位；本人值守 118.000 / 121.700
+        self.stack = SyncPlan(rx=[118000, 121700, 126750],
+                              tx=[118000, 121700, 126750],
+                              selected=126750, locked={118000, 121700})
 
     def tearDown(self):
         voice.CHANNEL_TIMEOUT = self._timeout
@@ -1536,14 +1264,9 @@ class PrimaryChannelFallbackTest(unittest.TestCase):
         self.client.connected = True
         self.client.running = True
 
-        self.stack = radiostack.RadioStack()
-        for khz in (118000, 118350):
-            self.stack.add(khz)
-            radio = self.stack.get(khz)
-            radio.rx = True
-            radio.tx = True
-        self.stack.select(118000)          # 手动加的那个当上了主频率
-        self.stack.set_locked({118350})  # 数据源上正在值守的是 118.350
+        # 手动加的 118.000 当上了主频率，数据源上正在值守的是 118.350
+        self.stack = SyncPlan(rx=[118000, 118350], tx=[118000, 118350],
+                              selected=118000, locked={118350})
 
     def tearDown(self):
         voice.CHANNEL_TIMEOUT = self._timeout
