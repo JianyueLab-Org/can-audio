@@ -57,6 +57,33 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual({r.frequency_khz: r.effective_volume() for r in plan},
                          {118000: 80, 121700: 100})
 
+    def test_calibrate_does_not_need_a_connection(self):
+        # 有没有麦克风都行：没有时是 error 事件，有时先来 quiet；命令本身都立即回 null
+        process = subprocess.Popen([sys.executable, '-u', str(Path(__file__).with_name('bridge.py'))],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding='utf-8')
+        try:
+            process.stdin.write(json.dumps({'id': 1, 'command': 'calibrate',
+                                            'data': {'input': None, 'denoise': False}}) + '\n')
+            process.stdin.flush()
+            time.sleep(1.5)
+            output, error = process.communicate('\n'.join(json.dumps(item) for item in [
+                {'id': 2, 'command': 'calibrate_cancel'},
+                {'id': 3, 'command': 'quit'},
+            ]) + '\n', timeout=10)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+        self.assertEqual(process.returncode, 0, error)
+        messages = [json.loads(line) for line in output.splitlines()]
+        replies = {msg['id']: msg for msg in messages if 'id' in msg}
+        self.assertIsNone(replies[1]['result'])
+        self.assertIsNone(replies[2]['result'])
+        stages = [msg['stage'] for msg in messages if msg.get('event') == 'calibration']
+        self.assertTrue(stages, output)
+        self.assertIn(stages[0], ('quiet', 'error'))
+
     def test_range_audio_command_requires_connection(self):
         process = subprocess.Popen([sys.executable, '-u', str(Path(__file__).with_name('bridge.py'))],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
