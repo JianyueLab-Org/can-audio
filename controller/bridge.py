@@ -30,6 +30,7 @@ def emit(**data):
 
 def main():
     import pyaudio
+    from audiodevices import list_devices
     from syncplan import SyncPlan
     from voice import VoiceClient
     client = None
@@ -56,10 +57,7 @@ def main():
                 if command == 'devices':
                     audio = pyaudio.PyAudio()
                     try:
-                        result = [dict(index=i, name=audio.get_device_info_by_index(i)['name'],
-                                       input=bool(audio.get_device_info_by_index(i)['maxInputChannels']),
-                                       output=bool(audio.get_device_info_by_index(i)['maxOutputChannels']))
-                                  for i in range(audio.get_device_count())]
+                        result = list_devices(audio)
                     finally:
                         audio.terminate()
                 elif command == 'connect':
