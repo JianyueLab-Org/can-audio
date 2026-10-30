@@ -121,5 +121,43 @@ bridge.emit(id=999, result=client._range_audio_policy)
                 self.assertEqual(replies[999]['result'], {})
 
 
+class FakeAudio:
+    """Windows 上的样子：同一个耳机按 MME、DirectSound、WASAPI、WDM-KS 各出现一次。"""
+    HOSTS = ['MME', 'Windows DirectSound', 'Windows WASAPI', 'Windows WDM-KS']
+    DEVICES = [
+        (0, '麦克风 (Arctis 7 Chat)', 1, 0),
+        (0, '耳机 (Arctis 7 Chat)', 0, 2),
+        (1, '麦克风 (Arctis 7 Chat)', 1, 0),
+        (2, '麦克风 (Arctis 7 Chat)', 1, 0),
+        (2, '耳机 (Arctis 7 Chat)', 0, 2),
+        (3, '麦克风 (Arctis 7 Chat)', 1, 0),
+    ]
+
+    def get_default_host_api_info(self):
+        return {'index': 0, 'name': self.HOSTS[0]}
+
+    def get_device_count(self):
+        return len(self.DEVICES)
+
+    def get_device_info_by_index(self, index):
+        host, name, inputs, outputs = self.DEVICES[index]
+        return {'hostApi': host, 'name': name,
+                'maxInputChannels': inputs, 'maxOutputChannels': outputs}
+
+
+class DeviceListTest(unittest.TestCase):
+    def test_only_the_default_host_api_is_listed(self):
+        from audiodevices import list_devices
+        self.assertEqual(list_devices(FakeAudio()), [
+            {'index': 0, 'name': '麦克风 (Arctis 7 Chat)', 'host_api': 'MME', 'input': True, 'output': False},
+            {'index': 1, 'name': '耳机 (Arctis 7 Chat)', 'host_api': 'MME', 'input': False, 'output': True},
+        ])
+
+    def test_names_are_unique_so_a_name_lookup_cannot_land_on_wdm_ks(self):
+        from audiodevices import list_devices
+        names = [(d['name'], d['input']) for d in list_devices(FakeAudio())]
+        self.assertEqual(len(names), len(set(names)))
+
+
 if __name__ == '__main__':
     unittest.main()
