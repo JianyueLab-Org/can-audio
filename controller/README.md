@@ -15,6 +15,7 @@ C# 客户端（[can-audio-client](https://github.com/JianyueLab-Org/can-audio-cl
 | `syncplan.py` | C# 推来的同步计划（`SyncPlan`）和频道命名约定 `FREQ_118000` |
 | `connectionstatus.py` | 每秒上报的连接快照（传输方式、Ping RTT） |
 | `rxmix.py` / `denoise.py` / `micgain.py` | 多路接收混音、RNNoise 降噪、增益与限幅 |
+| `calibration.py` | 麦克风音量自动校准（静音 1 秒测底噪 + 朗读 8 秒） |
 | `mumblecompat.py` | pymumble 兼容补丁（TLS、证书钉扎、发送重试） |
 | `i18n.py` | `voice.*` / `reject.*` / `denied.*` 状态文字（中 / 英） |
 
@@ -31,7 +32,9 @@ C# 对每条命令等 90 秒。
 | --- | --- | --- | --- |
 | `devices` | 无 | `[{"index", "name", "input", "output"}]` | PortAudio 设备表；C# 用 `index` 回传设备 |
 | `connect` | `host`, `port`, `cid`, `password`, `input`, `output`（设备 index 或 null） | `true` / `false` | 阻塞到连上或失败；失败原因走 `state` 事件 |
-| `audio` | `mic`, `speaker`（0–200 %），`denoise`（bool），`input`, `output` | `null` | 未连接时报错 |
+| `audio` | `mic`, `speaker`（0–200 %），`denoise`（bool），`input`, `output`，可选 `baseline`（校准基准 dB，-12 ~ +20） | `null` | 未连接时报错 |
+| `calibrate` | `input`（设备 index 或 null），`denoise`（bool） | `null` | 立即返回，开始一次麦克风校准，不需要连着；再发一次会取消上一次。进度和结果走 `calibration` 事件 |
+| `calibrate_cancel` | 无 | `null` | 取消正在进行的校准 |
 | `sync` | 见下 | `null` | 立即返回，频道同步在后台线程做 |
 | `range_audio` | `{ "CID": true/false }` | `{"entries": n}` | 替换范围通话策略；未出现的 CID 默认允许 |
 | `ptt` | `active`（bool） | `null` | 开始 / 停止发话；未连接时忽略。C# 已经过滤掉"未上席位"和"设置窗口打开"的情况 |
@@ -66,6 +69,17 @@ Mumble 用户名（当前即 CID）查询该快照，明确为 `false` 的来源
 | `rx` | `khz`, `active`, `callsign`（CAN ID） | 某频率开始 / 停止收到话音 |
 | `tx` | `active` | 真正开始 / 停止发话 |
 | `fatal` | `message` | 引擎崩溃 |
+| `calibration` | `stage` 及其字段，见下 | 麦克风校准进度和结果 |
+
+`calibration` 事件按 `stage` 区分：
+
+- `quiet` / `read`：`progress`（0–1），`level`（这一帧的 RMS，dBFS）。约每 60 ms 一条；进入朗读阶段时必有一条 `read`。
+- `done`：`gain_db`（基准增益 dB，失败时为 null），`reason`（`clipping` / `too_short` / `too_noisy`，成功时为 null），
+  `speech_dbfs`, `noise_dbfs`, `speech_seconds`, `clip_ratio`, `denoise`（实际是否用了降噪）。
+- `error`：`message`（打不开麦克风等）；`cancelled`：被取消。
+
+C# 把 `gain_db` 按设备名和降噪状态存下来，之后在 `audio` 命令里作为 `baseline` 发送；发送链路为
+降噪 → × 10^(baseline/20) × mic% → 限幅。
 
 改协议时要同时改 can-audio-client 里的 `Services/VoiceBridge.cs` 与 `ViewModels/MainWindowViewModel.Backend.cs`。
 
