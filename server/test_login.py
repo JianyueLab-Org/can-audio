@@ -502,6 +502,13 @@ class WatchConnectionTest(unittest.TestCase):
         self.assertFalse(alive)
         self.assertLess(time.time() - started, 2.0)
 
+    def test_a_stopped_virtual_server_is_not_a_healthy_connection(self):
+        class Stopped:
+            def isRunning(self, context):
+                return False
+
+        self.assertFalse(login_module.watch_connection(Stopped(), {}, interval=0.01))
+
     def test_a_healthy_link_keeps_watching(self):
         class Alive:
             def __init__(self):
@@ -637,6 +644,61 @@ class KickTest(unittest.TestCase):
         output = self.capture(
             lambda: self.make(server).kick_previous_session("1000"))
         self.assertEqual(output, "")
+
+
+class ExistingSessionTest(unittest.TestCase):
+    def test_only_anonymous_sessions_are_removed_after_registration(self):
+        class Server:
+            def __init__(self):
+                self.users = {
+                    1: types.SimpleNamespace(name="visitor", session=1, userid=-1),
+                    2: types.SimpleNamespace(name="1000", session=2, userid=1000),
+                    3: types.SimpleNamespace(name="1000_atis118000", session=3, userid=118000),
+                    4: types.SimpleNamespace(name="SuperUser", session=4, userid=0),
+                }
+
+            def getUsers(self, context):
+                return dict(self.users)
+
+            def kickUser(self, session, reason, context):
+                del self.users[session]
+
+        server = Server()
+        auth = login_module.AuthenticatorI(server, None, {"secret": "s"})
+        login_module.reconcile_existing_sessions(auth)
+        self.assertEqual(set(server.users), {2, 3, 4})
+        self.assertEqual(auth.online_users, {
+            "1000": 2, "1000_atis118000": 3, "SuperUser": 4,
+        })
+
+    def test_failure_to_remove_anonymous_session_aborts_registration(self):
+        class Server:
+            def getUsers(self, context):
+                return {1: types.SimpleNamespace(name="visitor", session=1, userid=-1)}
+
+            def kickUser(self, *args):
+                raise RuntimeError("cannot remove session")
+
+        auth = login_module.AuthenticatorI(Server(), None)
+        with self.assertRaises(RuntimeError):
+            login_module.reconcile_existing_sessions(auth)
+        self.assertEqual(auth.online_users, {})
+
+    def test_an_insecure_murmur_configuration_cannot_register_as_ready(self):
+        class Server:
+            def getConf(self, key, context):
+                return "false"
+
+        with self.assertRaises(RuntimeError):
+            login_module.require_external_auth(Server(), {}, {"forceExternalAuth": "true"})
+
+    def test_missing_boot_default_cannot_claim_restart_safety(self):
+        class Server:
+            def getConf(self, key, context):
+                return "true"
+
+        with self.assertRaises(RuntimeError):
+            login_module.require_external_auth(Server(), {}, {})
 
 
 # **必须放在文件末尾。** 原来它在 KickTest 之前，于是 `python test_login.py`

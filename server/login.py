@@ -408,6 +408,25 @@ def signal_handler(signum, frame):
 _communicator = None
 
 
+def require_external_auth(server, context, defaults):
+    """--login 也必须检查启动默认值和虚拟服务器覆盖，不能把不安全的宿主标成就绪。"""
+    default = defaults.get("forceExternalAuth", "")
+    override = server.getConf("forceExternalAuth", context)
+    if str(default).lower() not in ("true", "1") or (
+            override and str(override).lower() not in ("true", "1")):
+        raise RuntimeError("Murmur must start with forceExternalAuth=true; restart it using start.sh")
+
+
+def reconcile_existing_sessions(auth):
+    """只清理未认证访客；保留已认证的 CAN 用户、通播和本地管理员。"""
+    for user in auth.server.getUsers(auth.context).values():
+        if user.userid < 0:
+            auth.server.kickUser(user.session, "请使用 CAN 账号重新登录", auth.context)
+            log.warning("Removed pre-authentication anonymous session: session=%s", user.session)
+        else:
+            auth.online_users[user.name] = user.session
+
+
 def watch_connection(server, context, interval=None):
     """守着和 Murmur 的链路，断了就返回 False 让进程退出。
 
@@ -423,7 +442,8 @@ def watch_connection(server, context, interval=None):
         interval = HEALTH_INTERVAL
     while not _shutting_down:
         try:
-            server.isRunning(context)
+            if not server.isRunning(context):
+                return False
         except Exception as e:
             print(f"和 Murmur 的链路断了，退出让外面重新拉起: {e}")
             return False
@@ -486,6 +506,7 @@ def main():
 
         # 尽早给服务器代理设超时，避免关闭时卡住
         server = MumbleIce.ServerPrx.checkedCast(server.ice_timeout(3000))
+        require_external_auth(server, context, meta.getDefaultConf(context))
 
         # 创建Ice适配器
         adapter = communicator.createObjectAdapterWithEndpoints(
@@ -508,13 +529,9 @@ def main():
             server.addCallback(callback_prx, context)
             print("服务器回调已注册")
 
-            # 补上注册回调之前就已经在线的用户
-            try:
-                for user in server.getUsers(context).values():
-                    auth.online_users[user.name] = user.session
-                print(f"当前在线 {len(auth.online_users)} 人")
-            except Exception as e:
-                print(f"获取在线用户失败: {e}")
+            # 匿名访客不能因为注册认证器就获得永久的免验证会话。
+            reconcile_existing_sessions(auth)
+            log.info("Existing authenticated sessions retained: count=%s", len(auth.online_users))
 
             # 守着这条链路，别只是干等
             alive = watch_connection(server, context)

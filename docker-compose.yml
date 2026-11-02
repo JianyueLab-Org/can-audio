@@ -5,10 +5,9 @@
 #   docker compose logs -f
 #   docker compose exec mumble python3 fix_acl.py --apply    # 头一次要跑
 #
-# 升级：docker compose pull && docker compose up -d
-# 镜像由 .github/workflows/server-image.yml 推到 GHCR。包是私有的话，服务器上
-# 先 docker login ghcr.io（用户名是 GitHub 账号，密码用一个有 read:packages
-# 的 PAT）；或者把这个包在 GitHub 上改成 public。
+# 升级：从已验收的 main 提交手动构建，用 SERVER_IMAGE 固定已验证标签。
+# 当前分支没有服务端镜像 CI。私有 GHCR 包拉取前先 docker login ghcr.io，
+# 使用带 read:packages 的 PAT；推送需要 write:packages。
 #
 # 本地改了代码想直接试：docker compose up -d --build
 
