@@ -99,32 +99,64 @@ cd server\ATIS;   python -m unittest test_mumble test_atisrouting -v
 ```bash
 cd server
 ./start.sh            # 起 mumble-server + login.py
-./start.sh --login    # 只起 login.py
+./start.sh --login    # 仅连接已按下面的强制认证要求配置并重启的 Murmur
 cd ATIS && python3 mumble.py          # 通播机队，需要 PATH 里有 ffmpeg
 ```
 
-`start.sh` 里**任何一个进程退出，整个退出**（容器上配 `--restart
-unless-stopped` 让外面重新拉起）。两个方向都会出事：`login.py` 不在，Murmur
-回落到自己的空账号库，所有人登录被拒而客户端显示"密码错误"；`mumble-server`
-重启之后认证器不会被自动重新注册，`login.py` 的 `watch_connection()` 察觉链路
-断了会主动退出——"退出比假装还活着好"。
+`start.sh` 在 Murmur 绑定语音端口前写入顶层 `forceExternalAuth=true`。
+认证器延迟注册、注册失败、退出、被杀，或 Murmur 重启时，Murmur 原生拒绝新准入，
+不回落到访客或本地账号库。认证器就绪后，会员和通播仍使用 CAN 账号密码登录。
+`SuperUser` 仅在认证器正常时交回本地密码验证。根 ACL 的 `all` 组权限不变。
+
+启动检查要求 **Murmur >= 1.5.735、SQLite，以及顶层明确的 `database=` 路径**。
+数据库路径可以相对传入的 ini 路径；ini 是符号链接时也沿用该路径所在目录，不改用链接目标目录。路径不支持 QSettings 转义、内联注释或逗号。
+Docker 构建会将发行版的空 `database=` 明确设为
+`/var/lib/mumble-server/mumble-server.sqlite`，保留非空的自定义路径。
+`[General]` 中的键须先移到无节的顶层；不支持百分号转义的顶层键。
+数据库不可读，或任意虚拟服务器的持久化 `forceExternalAuth` 覆盖不是 `true` / `1`，
+启动会在监听前失败，不修改账号或 ACL。升级前如已有该覆盖，在旧服务的本机 Ice
+接口将其设为 `true`，再停止旧服务；不要在运行中的新服务上关闭该标志。
+`--login` 只注册认证器，不修复宿主启动配置；它要求 Murmur 的启动默认值和虚拟服务器
+配置均强制外部认证。注册时只踢出遗留匿名会话，保留已认证会员、通播和管理员。
+
+任一进程退出仍会整组退出；容器用 `--restart unless-stopped` 重启。
+这项监督负责恢复服务，不是准入安全边界。HEALTHCHECK 也不是准入安全边界。
+
+隔离的真实准入回归需要上述 Murmur、`python3-zeroc-ice`、`python3-requests`、
+`zeroc-ice-compilers` 和安装版本的 `MumbleServer.ice`，不需要音频设备或真实会员：
+
+```bash
+export CAN_AUDIO_TEST_WORKDIR=/path/to/CeruleanAviationNetwork/.temp/voice-admission
+cd server
+python3 -m unittest test_admission test_login test_serverconf test_fix_acl -v
+python3 smoke_admission.py --workdir "$CAN_AUDIO_TEST_WORKDIR"
+```
+
+冒烟会在隔离 Linux 环境的回环启动真实 Murmur、Ice 认证器和本地凭据 fixture：
+先证明未防护配置允许访客，再检查延迟注册、注册失败、有效会员与通播、错误凭据、
+认证器正常退出与强杀、Murmur 进程/虚拟服务器重启，以及遗留匿名会话清理。
+所有数据库、日志和随机测试凭据随临时子目录删除。不要在生产主机运行此回归。
 
 ### Docker
 
-这个分支暂时没有 GitHub CI，镜像需要手动构建并推到 GHCR，服务器上用 compose 部署：
+这个分支没有 GitHub CI。服务端从通过准入验收的 `main` 提交手动构建，保留原 Compose project 和数据库卷：
 
 ```bash
-cp .env.example .env      # 改里面的密码；全都可以留空
-docker compose up -d
+test -f .env || cp .env.example .env  # 升级保留已有配置
+# 在 .env 中固定 SERVER_IMAGE=can-audio-server:sha-<已验收 main 提交的前 12 位>
+# 可用 git rev-parse --short=12 HEAD 查看；保留已有口令和卷。
+unset SERVER_IMAGE                  # 使用 .env，不沿用当前 shell 的覆盖值
+docker compose build mumble
+docker compose up -d --pull never mumble
 docker compose logs -f
 docker compose exec mumble python3 fix_acl.py --apply   # 头一次要跑，见下面"权限"
 
-docker compose pull && docker compose up -d             # 升级
+# 升级时在已验收的新提交上重复构建和启动；不要更换数据库卷。
 ```
 
-包是私有的话，服务器上先 `docker login ghcr.io`（密码用一个带 `read:packages`
-的 PAT），或者把这个包在 GitHub 上改成 public。想回滚就在 `.env` 里把
-`SERVER_IMAGE` 指到某个 `sha-xxxxxxx` 标签——每次构建都会推一个。
+跨主机部署时，手动推送已验证的 `ghcr.io/jianyuelab-org/can-audio-server:sha-<commit>`，
+并在服务器 `.env` 中固定 `SERVER_IMAGE`。私有包拉取需要 `read:packages`，
+推送需要 `write:packages`。镜像和提交标签不会自动发布。
 
 本地不用 compose 也行：
 
@@ -153,8 +185,7 @@ HEALTHCHECK 变 healthy，再确认日志里出现了「认证器已设置」和
 - **`/var/lib/mumble-server` 必须挂卷**：SuperUser 密码、注册用户和 `fix_acl.py`
   授的权限都在那个 sqlite 里。不挂的话每换一次容器就得重授一次，而症状是管制端
   除了主频道以外全是静音，看不出和换容器有关。
-- **基础镜像钉死版本**，因为 Listen 权限是 Mumble 1.4 才有的，构建时会校验
-  `mumble-server >= 1.4` 并当场失败。
+- **基础镜像钉死版本**，构建和启动均要求 `mumble-server >= 1.5.735`。
 
 通播机队默认不装依赖（numpy + ffmpeg 太大，而且不在 `CMD` 里），GHCR 上那个
 镜像也不带。要跑它用 compose 的 `atis` profile，那是本地构建的：
@@ -166,9 +197,9 @@ docker compose --profile atis up -d --build
 `.env` 里要有 `ATIS_PASSWORD`。注意 `login.py` 里的保留账号旁路已经去掉了，
 那个 cid（默认 900）得在 can-web 那边真实存在。
 
-`login.py` 是 Ice 认证器：网络没有本地账号，登录一律转给 can-web 的
-`/api/v1/public/auth` 校验。它没跑起来的话，谁都连不上语音。Ice 绑定要在主机上
-自己生成（已 gitignore）：
+`login.py` 是 Ice 认证器，会员凭据交给 `/api/v1/public/auth` 校验。
+认证器缺席时，强制外部认证的 Murmur 拒绝新准入。Ice 绑定要用主机安装版本生成
+（已 gitignore）：
 
 ```bash
 slice2py /usr/share/mumble-server/MumbleServer.ice
