@@ -1,5 +1,6 @@
 """在 Murmur 监听公网端口之前启用原生的外部认证强制模式。"""
 from contextlib import closing
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -32,11 +33,12 @@ def root_settings(text):
 
 def prepare(ini_path):
     """拒绝不能检查的数据库和关闭强制认证的持久化覆盖，不改账号或 ACL。"""
-    ini_path = Path(ini_path).resolve()
+    # Murmur 相对传入 ini 的目录打开数据库；解析 ini 符号链接会检查到另一份库。
+    ini_path = Path(os.path.abspath(ini_path))
     text = ini_path.read_text(encoding="utf-8")
     settings = root_settings(text)
     # QSettings 的 [General] 也是根键，不能把它误当普通节而漏查覆盖。
-    if any(line.strip().lower() == "[general]" for line in text.splitlines()):
+    if any(re.match(r"\[\s*general\s*\]", line.strip(), re.IGNORECASE) for line in text.splitlines()):
         raise UnsafeAdmission("Move [General] settings to the unsectioned top level before startup")
     if any("%" in key for key in settings):
         raise UnsafeAdmission("Percent-escaped top-level QSettings keys are not supported by admission preflight")

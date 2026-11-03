@@ -109,7 +109,7 @@ cd ATIS && python3 mumble.py          # 通播机队，需要 PATH 里有 ffmpeg
 `SuperUser` 仅在认证器正常时交回本地密码验证。根 ACL 的 `all` 组权限不变。
 
 启动检查要求 **Murmur >= 1.5.735、SQLite，以及顶层明确的 `database=` 路径**。
-数据库路径可以相对 ini 文件；路径不支持 QSettings 转义、内联注释或逗号。
+数据库路径可以相对传入的 ini 路径；ini 是符号链接时也沿用该路径所在目录，不改用链接目标目录。路径不支持 QSettings 转义、内联注释或逗号。
 Docker 构建会将发行版的空 `database=` 明确设为
 `/var/lib/mumble-server/mumble-server.sqlite`，保留非空的自定义路径。
 `[General]` 中的键须先移到无节的顶层；不支持百分号转义的顶层键。
@@ -142,8 +142,10 @@ python3 smoke_admission.py --workdir "$CAN_AUDIO_TEST_WORKDIR"
 这个分支没有 GitHub CI。服务端从通过准入验收的 `main` 提交手动构建，保留原 Compose project 和数据库卷：
 
 ```bash
-cp .env.example .env      # 改里面的密码；全都可以留空
-export SERVER_IMAGE=can-audio-server:sha-$(git rev-parse --short=12 HEAD)
+test -f .env || cp .env.example .env  # 升级保留已有配置
+# 在 .env 中固定 SERVER_IMAGE=can-audio-server:sha-<已验收 main 提交的前 12 位>
+# 可用 git rev-parse --short=12 HEAD 查看；保留已有口令和卷。
+unset SERVER_IMAGE                  # 使用 .env，不沿用当前 shell 的覆盖值
 docker compose build mumble
 docker compose up -d --pull never mumble
 docker compose logs -f

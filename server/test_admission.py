@@ -58,6 +58,48 @@ class AdmissionConfigTest(unittest.TestCase):
         admission.prepare(self.ini)
         self.assertEqual(admission.root_settings(self.ini.read_text())["forceExternalAuth"], "true")
 
+    def test_symlinked_ini_checks_the_database_in_the_supplied_directory(self):
+        physical = self.root / "physical"
+        physical.mkdir()
+        logical = self.root / "logical"
+        logical.mkdir()
+        self.ini = physical / "mumble.ini"
+        self.db = logical / "mumble.sqlite"
+        self.configure(database="mumble.sqlite")
+        self.stored_override("false")
+        selected = logical / "mumble.ini"
+        selected.symlink_to(self.ini)
+        before = self.ini.read_bytes()
+        with self.assertRaises(admission.UnsafeAdmission):
+            admission.prepare(selected)
+        self.assertEqual(self.ini.read_bytes(), before)
+
+    def test_symlinked_ini_retains_a_safe_relative_database(self):
+        physical = self.root / "physical"
+        physical.mkdir()
+        logical = self.root / "logical"
+        logical.mkdir()
+        self.ini = physical / "mumble.ini"
+        self.db = logical / "mumble.sqlite"
+        self.configure(database="mumble.sqlite")
+        self.stored_override("true")
+        selected = logical / "mumble.ini"
+        selected.symlink_to(self.ini)
+        before = self.db.read_bytes()
+        admission.prepare(selected)
+        self.assertEqual(self.db.read_bytes(), before)
+        self.assertEqual(admission.root_settings(self.ini.read_text())["forceExternalAuth"], "true")
+
+    def test_decorated_general_aliases_cannot_disable_native_authentication(self):
+        for header in ("[General] ; comment", "[General] # comment",
+                       "[General]trailing-text", "[ General ]"):
+            with self.subTest(header=header):
+                self.configure(header + "\nforceExternalAuth=false\n")
+                before = self.ini.read_bytes()
+                with self.assertRaises(admission.UnsafeAdmission):
+                    admission.prepare(self.ini)
+                self.assertEqual(self.ini.read_bytes(), before)
+
     def test_unknown_or_old_murmur_cannot_start_with_an_unverified_control(self):
         for version in ("", "1.4.287", "1.5.0", "unknown"):
             with self.subTest(version=version):
