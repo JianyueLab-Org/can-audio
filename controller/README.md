@@ -30,7 +30,7 @@ C# 对每条命令等 90 秒。
 
 | 命令 | data | result | 说明 |
 | --- | --- | --- | --- |
-| `devices` | 无 | `[{"index", "name", "input", "output"}]` | PortAudio 设备表；C# 用 `index` 回传设备 |
+| `devices` | 无 | `[{"index", "name", "host_api", "input", "output"}]` | PortAudio 设备表，只含默认 host API（Windows 上是 MME）的设备，所以同一个设备不会以 WASAPI / WDM-KS 等身份重复出现；C# 用 `index` 回传设备。MME 的设备名最长 31 个字符 |
 | `connect` | `host`, `port`, `cid`, `password`, `input`, `output`（设备 index 或 null） | `true` / `false` | 阻塞到连上或失败；失败原因走 `state` 事件 |
 | `audio` | `mic`, `speaker`（0–200 %），`denoise`（bool），`input`, `output`，可选 `baseline`（校准基准 dB，-12 ~ +20） | `null` | 未连接时报错 |
 | `calibrate` | `input`（设备 index 或 null），`denoise`（bool） | `null` | 立即返回，开始一次麦克风校准，不需要连着；再发一次会取消上一次。进度和结果走 `calibration` 事件 |
