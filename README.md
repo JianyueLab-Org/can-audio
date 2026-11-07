@@ -22,13 +22,13 @@ COM1 频率决定他坐在哪个 Mumble 频道，管制员用一个电台栈同�
 | `server/` | `login.py`、`ATIS/mumble.py` | 跑在 Mumble 主机上：Ice 认证器 + 服务端通播机队 |
 | `native/rnnoise/` | `build.ps1` | 可选的 RNNoise 降噪原生库构建 |
 
-这是 `new-client-sys` 分支：只放**客户端与 Python 开发共同维护的语音部分**和服务端。
+本仓库（`main` 分支）只放**客户端与 Python 开发共同维护的语音部分**和服务端。
 管制端的界面、设置、PTT 输入、电台栈规则都在 C# 客户端
 [can-audio-client](https://github.com/JianyueLab-Org/can-audio-client) 里；
 通播的界面、模板、METAR、FSD 和语音合成在 C# 客户端
 [can-atis](https://github.com/JianyueLab-Org/can-atis) 里；
 飞行员客户端由 C# 的 can-pilot-client 维护。旧的 Python 管制 GUI、Python 桌面通播客户端
-（`atis/`）和飞行员客户端仍在 `main` 分支的历史里。
+（`atis/`）和飞行员客户端仍在本仓库的 git 历史里。
 
 两边的协议、文件分工、测试和打包：管制端见 [`controller/README.md`](controller/README.md)，
 通播见 [`atis-worker/README.md`](atis-worker/README.md)。改协议要两个仓库一起改。
@@ -139,7 +139,7 @@ python3 smoke_admission.py --workdir "$CAN_AUDIO_TEST_WORKDIR"
 
 ### Docker
 
-这个分支没有 GitHub CI。服务端从通过准入验收的 `main` 提交手动构建，保留原 Compose project 和数据库卷：
+本仓库没有 GitHub CI。服务端从通过准入验收的提交手动构建，保留原 Compose project 和数据库卷：
 
 ```bash
 test -f .env || cp .env.example .env  # 升级保留已有配置
