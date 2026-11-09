@@ -4,7 +4,7 @@ name: AI Code Review
 # posts/updates a single PR comment. Runs on open + every new push to the PR.
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 # The reusable workflow posts a comment, so the caller must grant write here.
 permissions:
@@ -13,6 +13,6 @@ permissions:
 
 jobs:
   review:
-    uses: JianyueLab-Org/actions/.github/workflows/ai-code-review.yml@main
+    uses: JianyueLab-Org/actions/.github/workflows/ai-code-review.yml@v27.1.0
     # Same org as the reusable workflow: AI_API_KEY and AI_BASE_URL are inherited.
     secrets: inherit
