@@ -139,24 +139,45 @@ python3 smoke_admission.py --workdir "$CAN_AUDIO_TEST_WORKDIR"
 
 ### Docker
 
-本仓库没有 GitHub CI。服务端从通过准入验收的提交手动构建，保留原 Compose project 和数据库卷：
+服务端镜像由 CI 构建并推到 GHCR，工作流是
+[`.github/workflows/server-image.yml`](.github/workflows/server-image.yml)：
+
+- **何时触发**：只有 `server/**`、`Dockerfile`、`.dockerignore` 或这个工作流本身变了才跑，
+  改客户端不会触发；也可以在 Actions 页面手动运行。
+- **做什么**：先跑 `server/` 和 `server/ATIS/` 的单元测试，再构建 linux/amd64 镜像并冒烟
+  （见下面"构建完一定要冒烟"）。
+- **推什么**：PR 上只验证不推送。合进 `main` 后，`publish` job 把**冒烟测过的那一份**
+  镜像推为 `latest` 和 `sha-<7 位 commit>`，推了哪些标签写在那次运行的摘要页里。
+  只有这个 job 有 `packages: write`，它只在 `main` 上运行，也不执行仓库里的代码。
+  如果推送报 `denied`，到 GHCR 包设置的 Manage Actions access 里给本仓库 Write 权限。
+
+服务器上部署和升级（保留原 Compose project 和数据库卷）：
 
 ```bash
 test -f .env || cp .env.example .env  # 升级保留已有配置
-# 在 .env 中固定 SERVER_IMAGE=can-audio-server:sha-<已验收 main 提交的前 12 位>
-# 可用 git rev-parse --short=12 HEAD 查看；保留已有口令和卷。
+docker login ghcr.io                  # 私有包：用带 read:packages 的 PAT
+docker compose pull mumble
+docker compose up -d mumble
+docker compose logs -f
+docker compose exec mumble python3 fix_acl.py --apply   # 头一次要跑，见下面"权限"
+```
+
+compose 给 `mumble` 设了 `pull_policy: always`。同时写了 `image:` 和 `build:` 的服务，
+本地没有镜像时会悄悄自己构建，那样部署的就不是 CI 验过的镜像。
+
+**回滚**：在 `.env` 里写 `SERVER_IMAGE=ghcr.io/jianyuelab-org/can-audio-server:sha-<commit>`，
+再 `docker compose up -d mumble`。不要更换数据库卷。
+
+不经 CI、直接从源码构建（需要完整仓库）：
+
+```bash
 unset SERVER_IMAGE                  # 使用 .env，不沿用当前 shell 的覆盖值
 docker compose build mumble
 docker compose up -d --pull never mumble
-docker compose logs -f
-docker compose exec mumble python3 fix_acl.py --apply   # 头一次要跑，见下面"权限"
-
-# 升级时在已验收的新提交上重复构建和启动；不要更换数据库卷。
 ```
 
-跨主机部署时，手动推送已验证的 `ghcr.io/jianyuelab-org/can-audio-server:sha-<commit>`，
-并在服务器 `.env` 中固定 `SERVER_IMAGE`。私有包拉取需要 `read:packages`，
-推送需要 `write:packages`。镜像和提交标签不会自动发布。
+本地构建的镜像沿用 `SERVER_IMAGE` 的名字（默认就是 GHCR 的 `latest`），下一次
+`docker compose pull` 会用 CI 的镜像把它覆盖掉。
 
 本地不用 compose 也行：
 
@@ -173,6 +194,7 @@ docker run -d --name can-server --restart unless-stopped \
 （漏了 `serverconf.py`、`start.sh` 没有执行位、ini 或 slice 路径探错），在
 `docker build` 的输出里一律是绿色的。所以构建完要真的把容器跑起来，等它自己的
 HEALTHCHECK 变 healthy，再确认日志里出现了「认证器已设置」和「服务器回调已注册」。
+CI 每次都会自动做这一步，冒烟不过就不推送；本地手动构建时得自己做。
 
 四条别绕过去的：
 
