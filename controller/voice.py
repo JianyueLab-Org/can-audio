@@ -149,6 +149,7 @@ class RejectAwareMumble(pymumble.Mumble):
 
 
 SUPPORTED_SAMPLE_RATES = [48000, 44100, 32000, 24000, 16000]
+MUMBLE_RATE = 48000            # pymumble 收发的 PCM 一律是 48 kHz
 
 # VoiceTarget 的编号（协议允许 1-30）。PTT 和交叉耦合各用各的：
 # 共用一个编号的话，转发时重编目标会把 PTT 的目标一起改掉，管制员的话音就
@@ -314,7 +315,8 @@ class VoiceClient:
         self.output_stream = None
         self.FORMAT = pyaudio.paInt16
         self.CHANNELS = 1
-        self.RATE = 48000
+        self.RATE = 48000              # 麦克风流的采样率
+        self.OUTPUT_RATE = 48000       # 扬声器流的采样率，可以和麦克风不同
         self.CHUNK = 960
         self._input_device = None
         self._output_device = None
@@ -482,8 +484,6 @@ class VoiceClient:
         self._state('connecting', t("voice.connecting", cid=self.cid, server=self.server))
         try:
             self.audio = pyaudio.PyAudio()
-            self.RATE = self._find_best_sample_rate()
-            self.CHUNK = int(self.RATE * 0.02)
 
             # reconnect=True 仍然要，掉线自己连回来是对的；上限由
             # BoundedReconnect 管，用尽了就整个下线。
@@ -777,28 +777,62 @@ class VoiceClient:
         self._state(state, message if message is not None else t("voice.stopped"))
 
     # ---------- 音频设备 ----------
-    def _find_best_sample_rate(self):
-        def works(rate):
-            try:
-                probe = self.audio.open(
-                    format=self.FORMAT, channels=self.CHANNELS, rate=rate,
-                    input=True, frames_per_buffer=960, start=False,
-                    input_device_index=self._input_device)
-                probe.close()
-                return True
-            except Exception:
-                return False
+    def _candidate_rates(self, device, input):
+        """先试常用采样率，再试设备自己报的默认采样率（比如只开 96 kHz 的声卡）。"""
+        rates = list(SUPPORTED_SAMPLE_RATES)
+        try:
+            if device is None:
+                info = (self.audio.get_default_input_device_info() if input
+                        else self.audio.get_default_output_device_info())
+            else:
+                info = self.audio.get_device_info_by_index(device)
+            native = int(round(float(info['defaultSampleRate'])))
+            if native > 0 and native not in rates:
+                rates.append(native)
+        except Exception as e:
+            log.debug("could not read the default sample rate of %s device %s: %s",
+                      "input" if input else "output", device, e)
+        return rates
 
-        for rate in SUPPORTED_SAMPLE_RATES:
-            if works(rate):
-                if rate != 48000:
-                    log.warning(f"the device does not support 48 kHz, falling back to "
-                                f"{rate} Hz (audio will be pitch-shifted)")
-                return rate
-        return 48000
+    def _find_rate(self, device, input):
+        """返回这个设备能打开的采样率，48 kHz 优先；一个都不行时返回 None。
+
+        输入和输出分别探测：只探麦克风再拿同一个采样率去开扬声器，扬声器
+        不支持时就是 [Errno -9997] Invalid sample rate。
+        """
+        direction = "input" if input else "output"
+        for rate in self._candidate_rates(device, input):
+            kwargs = dict(format=self.FORMAT, channels=self.CHANNELS, rate=rate,
+                          frames_per_buffer=int(rate * 0.02), start=False)
+            if input:
+                kwargs.update(input=True, input_device_index=device)
+            else:
+                kwargs.update(output=True, output_device_index=device)
+            try:
+                probe = self.audio.open(**kwargs)
+            except Exception as e:
+                log.debug("%s device %s refused %d Hz: %s", direction, device, rate, e)
+                continue
+            try:
+                probe.close()
+            except Exception:
+                pass
+            if rate != MUMBLE_RATE:
+                log.info("%s device %s does not open at 48 kHz, using %d Hz "
+                         "(resampled to 48 kHz)", direction, device, rate)
+            return rate
+        log.warning("%s device %s opened at none of the sample rates tried", direction, device)
+        return None
+
+    def _find_best_sample_rate(self):
+        """麦克风的采样率（保留旧名字，测试和外部调用沿用）。"""
+        return self._find_rate(self._input_device, True) or MUMBLE_RATE
 
     def setup_audio(self, input_device=None, output_device=None):
-        """打开输入输出流。不传设备时沿用上次选定的。"""
+        """打开输入输出流。不传设备时沿用上次选定的。
+
+        每次都重新探测采样率：换了设备，上一个设备能用的采样率不一定还能用。
+        """
         if input_device is not None:
             self._input_device = input_device
         if output_device is not None:
@@ -806,20 +840,28 @@ class VoiceClient:
 
         with self._stream_lock:
             self._close_streams_locked()
+            input_rate = self._find_rate(self._input_device, True) or MUMBLE_RATE
+            output_rate = self._find_rate(self._output_device, False) or MUMBLE_RATE
+            with self._input_stream_lock:
+                self.RATE = input_rate
+                self.CHUNK = int(input_rate * 0.02)
+            self.OUTPUT_RATE = output_rate
+            log.info("audio devices: input %s at %d Hz, output %s at %d Hz",
+                     self._input_device, input_rate, self._output_device, output_rate)
             self.input_stream = self.audio.open(
                 format=self.FORMAT, channels=self.CHANNELS, rate=self.RATE,
                 input=True, frames_per_buffer=self.CHUNK,
                 input_device_index=self._input_device)
             self.output_stream = self.audio.open(
-                format=self.FORMAT, channels=self.CHANNELS, rate=self.RATE,
-                output=True, frames_per_buffer=self.CHUNK,
+                format=self.FORMAT, channels=self.CHANNELS, rate=self.OUTPUT_RATE,
+                output=True, frames_per_buffer=int(self.OUTPUT_RATE * 0.02),
                 output_device_index=self._output_device,
                 stream_callback=self._playback_callback)
 
     def _playback_callback(self, in_data, frame_count, time_info, status):
         """声卡需要多少采样就混多少；不在实时回调里等待、写声卡或记日志。"""
         try:
-            size = max(1, int(round(frame_count * 48000 / self.RATE)))
+            size = max(1, int(round(frame_count * MUMBLE_RATE / self.OUTPUT_RATE)))
             with self._rx_mix_wakeup:
                 mixed = rxmix.take(self._rx_mix_frames, size)
             if mixed is None:
@@ -1568,14 +1610,19 @@ class VoiceClient:
     def _process_mic(self, data):
         """一帧麦克风 PCM → 要发出去的 int16。"""
         samples = np.frombuffer(data, dtype=np.int16)
+        # pymumble 只认 48 kHz；麦克风开在别的采样率上时先重采样，否则对方
+        # 听到的是变调的声音，RNNoise 也只在 48 kHz 下工作。
+        if self.RATE != MUMBLE_RATE and samples.size:
+            target = max(1, int(round(samples.size * MUMBLE_RATE / self.RATE)))
+            samples = rxmix.output_frame(samples, target)
         if self.mic_denoise:
-            if self._denoiser is None or self._denoiser.rate != self.RATE:
+            if self._denoiser is None or self._denoiser.rate != MUMBLE_RATE:
                 if self._denoiser is not None:
                     self._denoiser.close()
-                self._denoiser = self._denoiser_factory(self.RATE)
+                self._denoiser = self._denoiser_factory(MUMBLE_RATE)
             samples = self._denoiser.process(samples)
-        if self._mic_limiter is None or self._mic_limiter.rate != self.RATE:
-            self._mic_limiter = micgain.Limiter(self.RATE)
+        if self._mic_limiter is None or self._mic_limiter.rate != MUMBLE_RATE:
+            self._mic_limiter = micgain.Limiter(MUMBLE_RATE)
         return micgain.apply_gain(samples, self.mic_baseline_db, self.mic_volume,
                                   self._mic_limiter)
 
