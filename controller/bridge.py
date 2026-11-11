@@ -30,9 +30,12 @@ def emit(**data):
 
 def main():
     import pyaudio
+    from audiodevices import list_devices
     from syncplan import SyncPlan
     from voice import VoiceClient
+    from calibration import Calibration
     client = None
+    calibration = None
     stop_status = threading.Event()
 
     def publish_status():
@@ -56,10 +59,7 @@ def main():
                 if command == 'devices':
                     audio = pyaudio.PyAudio()
                     try:
-                        result = [dict(index=i, name=audio.get_device_info_by_index(i)['name'],
-                                       input=bool(audio.get_device_info_by_index(i)['maxInputChannels']),
-                                       output=bool(audio.get_device_info_by_index(i)['maxOutputChannels']))
-                                  for i in range(audio.get_device_count())]
+                        result = list_devices(audio)
                     finally:
                         audio.terminate()
                 elif command == 'connect':
@@ -79,9 +79,22 @@ def main():
                     # 频道同步会等待网络往返，不能挡住 PTT 松开指令。
                     threading.Thread(target=client.sync, args=(plan,), daemon=True).start()
                 elif command == 'range_audio' and client:
-                    result = {'entries': client.set_range_audio_policy(data)}
+                    result = {'entries': client.set_range_audio_policy(request.get('data'))}
+                elif command == 'calibrate':
+                    # 不需要连着；立即返回，进度和结果走 calibration 事件
+                    if calibration:
+                        calibration.cancel()
+                    calibration = Calibration(data.get('input'), data.get('denoise', True),
+                                              lambda event: emit(event='calibration', **event))
+                    calibration.start()
+                elif command == 'calibrate_cancel':
+                    if calibration:
+                        calibration.cancel()
+                        calibration = None
                 elif command == 'audio' and client:
                     client.set_mic_volume(data['mic'])
+                    if data.get('baseline') is not None:
+                        client.set_mic_baseline(data['baseline'])
                     client.set_speaker_volume(data['speaker'])
                     client.set_mic_denoise(data['denoise'])
                     client.setup_audio(data.get('input'), data.get('output'))
@@ -103,6 +116,8 @@ def main():
     finally:
         stop_status.set()
         status_thread.join(timeout=2)
+        if calibration:
+            calibration.cancel()
         if client:
             client.disconnect()
 

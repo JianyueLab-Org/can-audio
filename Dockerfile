@@ -24,15 +24,13 @@
 #    Listen / MakeTempChannel 权限，全在 /var/lib/mumble-server 的 sqlite 里。
 #    不挂卷的话每换一次容器就得重授一次权限，而症状是管制端除了主频道以外全
 #    是静音 —— 完全看不出和换容器有关。
-# 4. **serverconf.py 必须一起复制进来。** login.py 的第一件事就是
-#    `import serverconf`，缺了它容器起来就退出；而 login.py 不在的时候
-#    Murmur 会回落到自己的空账号库，所有人登录被拒、客户端显示的是"密码错误"。
+# 4. **serverconf.py / admission.py 必须一起复制进来。** 启动前检查数据库覆盖，
+#    写入 forceExternalAuth=true；认证器不在时 Murmur 拒绝准入。
 #
-# 基础镜像刻意钉死版本而不是用 latest：整份文件依赖 mumble-server ≥ 1.5
-# （频道监听的 Listen 权限是 1.4 才有的，1.3 上管制端听不到非主频道；客户端
-# 用的 pymumble-udp 只发 1.5 的 protobuf 音频格式，1.4 收到也不认，所有人
-# 互相听不见），而 latest 会漂。换别的基础镜像只有这一条要求，下面的 RUN 会
-# 当场校验。
+# 基础镜像钉死版本而不是用 latest；Murmur 至少 1.5.735，
+# forceExternalAuth 才能在认证器缺席时原生拒绝准入。
+# 客户端的 protobuf 音频还要求 1.5，频道监听的 Listen 权限要求 1.4。
+# 构建和每次启动都校验已安装的软件包版本。
 FROM ubuntu:26.04
 
 # 避免交互式提示
@@ -85,16 +83,9 @@ RUN if [ "$WITH_ATIS" = "1" ]; then \
 RUN set -eu; \
     mkdir -p /etc/can /app/server; \
     ver="$(dpkg-query -W -f '${Version}' mumble-server 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)"; \
-    if [ -z "$ver" ]; then \
-        echo "读不出 mumble-server 的版本号（不是 dpkg 装的？），跳过版本校验" >&2; \
-    else \
-        major="${ver%%.*}"; rest="${ver#*.}"; minor="${rest%%.*}"; \
-        if [ "$major" -lt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -lt 5 ]; }; then \
-            echo "mumble-server $ver 太老。客户端只发 1.5 的 protobuf 音频格式，" >&2; \
-            echo "更老的服务器收到也不认，所有人互相听不见，而且客户端毫无提示。" >&2; \
-            echo "换一个带 mumble-server >= 1.5 的基础镜像。" >&2; \
-            exit 1; \
-        fi; \
+    if [ -z "$ver" ] || ! dpkg --compare-versions "$ver" ge 1.5.735; then \
+        echo "mumble-server >= 1.5.735 is required for forceExternalAuth and protobuf audio." >&2; \
+        exit 1; \
     fi; \
     ini=""; \
     for p in /etc/mumble/mumble-server.ini /etc/mumble-server.ini; do \
@@ -110,7 +101,7 @@ RUN set -eu; \
     [ -n "$slice" ] || { echo "找不到 Mumble 的 Ice slice 文件" >&2; exit 1; }; \
     inc=""; [ -d /usr/share/ice/slice ] && inc="-I/usr/share/ice/slice"; \
     slice2py $inc --output-dir /app/server "$slice"; \
-    printf 'MUMBLE_INI=%s\nMUMBLE_VERSION=%s\n' "$ini" "$ver" > /etc/can/paths.env; \
+    printf 'MUMBLE_INI=%s\n' "$ini" > /etc/can/paths.env; \
     echo "ini=$ini slice=$slice version=$ver"
 
 # 改 ini：Ice 只听回环，日志走 stdout（logfile 留空 Murmur 就往控制台打，否则
@@ -125,9 +116,10 @@ RUN set -eu; \
 # 症状是 start.sh 等 30 秒超时、login.py 根本没起来、健康检查永远 unhealthy。
 # 先把所有 ice= 行删干净（重复的 key QSettings 取最后一个），再插到第 1 行，
 # 那里一定在任何节之前。
+# 发行版的空 database= 显式使用数据目录；保留已配置的非空路径。
 RUN set -eu; \
     . /etc/can/paths.env; \
-    sed -i '/^#\?ice=/d; /^#\?logfile=/d' "$MUMBLE_INI"; \
+    sed -i '/^#\?ice=/d; /^#\?logfile=/d; s|^database=[[:space:]]*$|database=/var/lib/mumble-server/mumble-server.sqlite|' "$MUMBLE_INI"; \
     awk 'BEGIN { print "ice=\"tcp -h 127.0.0.1 -p 6502\""; print "logfile=" } { print }' \
         "$MUMBLE_INI" > "$MUMBLE_INI.new"; \
     cat "$MUMBLE_INI.new" > "$MUMBLE_INI"; \
@@ -139,7 +131,7 @@ RUN set -eu; \
 #   serverconf.py —— login.py 直接 import，漏了容器起不来
 #   fix_acl.py    —— 授 Listen / MakeTempChannel，Ice 只听回环所以只能在容器里跑
 #   whereami.py   —— 查"谁在哪个频道"，排障用
-COPY server/serverconf.py server/login.py server/fix_acl.py server/whereami.py /app/server/
+COPY server/serverconf.py server/admission.py server/login.py server/fix_acl.py server/whereami.py /app/server/
 COPY server/start.sh /app/server/
 COPY server/ATIS/ /app/server/ATIS/
 

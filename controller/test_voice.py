@@ -413,6 +413,56 @@ class RxIndicatorTest(unittest.TestCase):
         client._on_sound({"name": "1001", "channel_id": 7}, types.SimpleNamespace(pcm=pcm))
         self.assertEqual(len(client.mumble.sound_output.sent), 1)
 
+    def heard_on(self, context, sender_channel, my_channel=1, listening=()):
+        """1005 在 my_channel 里、监听着 listening，收到一段 context 送来的话音。
+
+        频道 1 = 125.900，2 = 118.500，3 = 122.800。
+        """
+        client = make_client()
+
+        class Users(dict):
+            myself = {"name": "1005", "channel_id": my_channel}
+        client.mumble.users = Users()
+        client.mumble.channels = {1: {"name": "FREQ_125900"},
+                                  2: {"name": "FREQ_118500"},
+                                  3: {"name": "FREQ_122800"}}
+        client._channel_to_khz = {1: 125900, 2: 118500, 3: 122800}
+        client._channel_ids = {125900: 1, 118500: 2, 122800: 3}
+        client._listening = set(listening)
+        events = []
+        client.on_rx = lambda khz, active, name: events.append(khz)
+        pcm = np.array([10, 20], dtype=np.int16).tobytes()
+        client._on_sound({"name": "10006", "channel_id": sender_channel},
+                         types.SimpleNamespace(pcm=pcm, target=context))
+        return events
+
+    def test_a_voice_target_into_our_channel_is_shown_on_our_frequency(self):
+        """实测：塔台 10006 待在 FREQ_118500，PTT 发 125.900；1005 在 125.900。
+
+        听得见，界面却亮 118.500——原来按说话人所在的频道算频率。
+        """
+        events = self.heard_on(voice.AUDIO_CONTEXT_SHOUT, sender_channel=2,
+                               listening={2})
+        self.assertEqual(events, [125900])
+
+    def test_normal_speech_is_on_our_channel(self):
+        self.assertEqual(self.heard_on(voice.AUDIO_CONTEXT_NORMAL, 1), [125900])
+
+    def test_listened_audio_uses_the_sender_channel_when_we_listen_to_it(self):
+        events = self.heard_on(voice.AUDIO_CONTEXT_LISTEN, sender_channel=3,
+                               listening={2, 3})
+        self.assertEqual(events, [122800])
+
+    def test_listened_audio_from_elsewhere_goes_to_the_only_listened_channel(self):
+        events = self.heard_on(voice.AUDIO_CONTEXT_LISTEN, sender_channel=2,
+                               listening={3})
+        self.assertEqual(events, [122800])
+
+    def test_a_direct_whisper_keeps_the_sender_channel(self):
+        """ATIS 地理分发是直接发给本人的 whisper，频率只能看说话人所在频道。"""
+        events = self.heard_on(voice.AUDIO_CONTEXT_WHISPER, sender_channel=2)
+        self.assertEqual(events, [118500])
+
     def test_continuous_audio_never_reports_rx_end(self):
         """有人一直在讲话时，监控线程不该报 RX 结束——那会让指示灯闪。"""
         client = make_client()
@@ -527,6 +577,9 @@ class FakeServer:
         # 频率上自始至终只有自己一个人"：临时频道一空就死，于是每一轮都是刚
         # 建好就没了，MoveCmd 永远落空。
         self.reap_on_move = set()
+        # True = 和真 Murmur 一样，建临时频道的人被当场挪进去。默认关着，多数
+        # 用例只关心建没建、进没进，不想让"建"顺带完成"进"。
+        self.move_creator = False
         self.by_name = {}
         self.my_channel = my_channel
         self.commands = []
@@ -553,12 +606,15 @@ class FakeServer:
         params = cmd.parameters
         with self.lock:
             if "name" in params:                    # CreateChannel
+                channel_id = self._free_id()
                 self.by_name[params["name"]] = {
-                    "channel_id": self._free_id(),
+                    "channel_id": channel_id,
                     "name": params["name"],
                     "parent": params["parent"],
                     "temporary": params["temporary"],
                 }
+                if self.move_creator and params["temporary"]:
+                    self.my_channel = channel_id
             elif "session" in params:               # MoveCmd
                 target = params["channel_id"]
                 # 命令到达的这一刻频道才空掉被销毁——解析出号和 MoveCmd 被处理
@@ -588,6 +644,14 @@ class FakeServer:
         while candidate in used:
             candidate += 1
         return candidate
+
+    def open_channel(self, name):
+        """别人（机组、另一位管制员）开了这个频道并待在里面。"""
+        with self.lock:
+            channel = {"channel_id": self._free_id(), "name": name,
+                       "parent": 0, "temporary": True}
+            self.by_name[name] = channel
+            return channel
 
     def remove_channel(self, name):
         """服务器销毁一个空掉的临时频道。
@@ -1070,7 +1134,8 @@ class SyncStormTest(unittest.TestCase):
         self.fire([stack])
 
         created = [name for _, name, _ in self.server.created_names()]
-        self.assertEqual(sorted(created), ["FREQ_118000", "FREQ_121700"],
+        # 只有主频道会建；121.700 只监听，没人开就不建
+        self.assertEqual(sorted(created), ["FREQ_118000"],
                          f"同一轮里重复建了频道：{created}")
 
     # ---------- 被拒就别等 ----------
@@ -1299,13 +1364,115 @@ class PrimaryChannelSelectionTest(unittest.TestCase):
     def test_non_staffed_selection_is_not_joined_as_primary(self):
         self.client.sync(self.stack)
         primary = self.server.my_channel
-        allowed = {
-            self.server.by_name["FREQ_118000"]["channel_id"],
-            self.server.by_name["FREQ_121700"]["channel_id"],
-        }
-        self.assertIn(primary, allowed)
-        self.assertNotEqual(primary,
-                            self.server.by_name["FREQ_126750"]["channel_id"])
+        self.assertEqual(primary,
+                         self.server.by_name["FREQ_118000"]["channel_id"])
+        self.assertNotIn("FREQ_126750", self.server.by_name,
+                         "非值守的选中频率既不该进，也不该为它建频道")
+
+
+class ListenOnlyChannelTest(unittest.TestCase):
+    """只监听的频率不能自己建频道。
+
+    实测日志（2026-10-23，cid 1005）：主频率 125.900 有人，122.800 只开了 RX、
+    上面没人。每 15 秒一轮 sync 都是：
+
+        Added channel FREQ_122800 under Root
+        Moved 1005 to FREQ_125900
+
+    Murmur 把建临时频道的人当场挪进去，回主频道后它一空就被销毁，监听落了
+    空，下一轮再建——整晚没监听上。
+    """
+
+    def setUp(self):
+        self._timeout = voice.CHANNEL_TIMEOUT
+        voice.CHANNEL_TIMEOUT = 0.3
+        self.client = VoiceClient("host", "1005", "pw")
+        self.server = FakeServer(latency=0.02)
+        self.server.strict_moves = True
+        self.server.move_creator = True
+        self.primary = self.server.open_channel("FREQ_125900")
+        self.server.my_channel = self.primary["channel_id"]
+        self.client.mumble = self.server
+        self.client.connected = True
+        self.client.running = True
+
+        self.stack = SyncPlan(rx=[125900, 122800], tx=[125900],
+                              selected=125900, locked={125900})
+
+    def tearDown(self):
+        voice.CHANNEL_TIMEOUT = self._timeout
+
+    def sync_and_wait(self):
+        thread = threading.Thread(target=self.client.sync, args=(self.stack,),
+                                  daemon=True)
+        thread.start()
+        thread.join(voice.CHANNEL_TIMEOUT * 8 + 5)
+        self.assertFalse(thread.is_alive(), "sync 没有在预算内返回")
+
+    def wait_for(self, condition, budget=5.0):
+        deadline = time.time() + budget
+        while time.time() < deadline and not condition():
+            time.sleep(0.02)
+        return condition()
+
+    def test_an_empty_listen_only_frequency_is_not_created(self):
+        for _ in range(3):              # 界面每 15 秒推一次
+            self.sync_and_wait()
+
+        self.assertEqual(self.server.created_names(), [],
+                         "只监听的频率被建了出来，回主频道后它当场就会被销毁")
+        self.assertEqual(self.server.moves(), [], "人本来就在主频道里，不该来回挪")
+        self.assertEqual(self.server.my_channel, self.primary["channel_id"])
+
+    def test_a_channel_opened_later_is_listened_to_right_away(self):
+        self.sync_and_wait()
+        self.assertEqual(self.client._listening, set())
+
+        opened = self.server.open_channel("FREQ_122800")
+        self.client._on_channel_created(opened)
+
+        self.assertTrue(
+            self.wait_for(lambda: self.client._listening == {opened["channel_id"]}),
+            f"别人开了 122.800，监听没挂上：{self.client._listening}")
+        self.assertEqual(self.server.created_names(), [])
+
+    def test_a_recreated_channel_with_the_same_id_is_listened_to_again(self):
+        """Murmur 发最小空闲号，频道死了再开多半还是同一个号。"""
+        first = self.server.open_channel("FREQ_122800")
+        self.sync_and_wait()
+        self.assertEqual(self.client._listening, {first["channel_id"]})
+
+        self.client._on_channel_removed(self.server.remove_channel("FREQ_122800"))
+        self.assertEqual(self.client._listening, set())
+
+        before = len(self.server.messages)
+        again = self.server.open_channel("FREQ_122800")
+        self.assertEqual(again["channel_id"], first["channel_id"], "前提：号被复用")
+        self.client._on_channel_created(again)
+
+        def listened_again():
+            return any(again["channel_id"] in getattr(m, "listening_channel_add", ())
+                       for _, m in self.server.messages[before:])
+        self.assertTrue(self.wait_for(listened_again),
+                        "同号重建的频道没有重新发监听——diff 以为早就监听上了")
+
+    def test_an_unrelated_channel_does_not_trigger_a_sync(self):
+        calls = []
+        self.client.sync = lambda stack: calls.append(stack)
+        self.client._stack = self.stack
+        self.client._on_channel_created(self.server.open_channel("FREQ_118000"))
+        time.sleep(0.1)
+        self.assertEqual(calls, [])
+
+    def test_the_primary_is_still_created_when_nobody_is_on_it(self):
+        self.server.remove_channel("FREQ_125900")
+        self.server.my_channel = 0
+        self.sync_and_wait()
+
+        self.assertEqual([n for _, n, _ in self.server.created_names()],
+                         ["FREQ_125900"])
+        self.assertEqual(self.server.my_channel,
+                         self.server.by_name["FREQ_125900"]["channel_id"])
 
 
 class PrimaryChannelFallbackTest(unittest.TestCase):
@@ -1353,10 +1520,14 @@ class PrimaryChannelFallbackTest(unittest.TestCase):
         self.assertEqual(self.server.my_channel, staffed["channel_id"],
                          "没有退到席位频率——管制员正在值守的频率发不出话")
 
-    def test_the_frequency_that_could_not_be_joined_still_gets_a_listener(self):
+    def test_the_frequency_that_is_not_primary_still_gets_a_listener(self):
+        # 118.000 上有别人，频道一直在
+        self.server.reap_on_move.clear()
+        opened = self.server.open_channel("FREQ_118000")
         self.sync_and_wait()
 
-        self.assertTrue(self.client._listening, "进不去的那个频率连监听都没挂上")
+        self.assertEqual(self.client._listening, {opened["channel_id"]},
+                         "没当上主频率的那个频率连监听都没挂上")
         self.assertNotIn(self.server.my_channel, self.client._listening,
                          "已经进去的频道不该再挂一份监听")
 

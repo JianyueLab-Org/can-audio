@@ -4,16 +4,9 @@
 #   ./start.sh            两个都起
 #   ./start.sh --login    只起 login.py（服务端已经在别处跑着）
 #
-# **任何一个退出，整个退出。** 两个方向都会出事，而且都很难从外面看出来：
-#
-#   - login.py 不在，Murmur 就回落到自己的账号库（里面一个账号都没有），
-#     所有人登录被拒，客户端上显示的却是"密码错误"——语音端口照常应答，
-#     容器看起来一切正常。
-#   - mumble-server 重启之后认证器不会被自动重新注册，login.py 的
-#     watch_connection() 察觉链路断了会主动退出（见 login.py 里那段注释：
-#     "退出比假装还活着好"），这时候必须有人把它拉起来。
-#
-# 所以跑容器时配上 --restart unless-stopped，让 docker 当这个"有人"。
+# 任一进程退出就整组退出；Docker 用 --restart unless-stopped 重启。
+# 公网准入不依赖监督器响应速度：Murmur 启动前强制 forceExternalAuth=true，
+# 认证器尚未注册、注册失败或连接丢失时，Murmur 原生拒绝认证，不回落访客。
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -133,6 +126,9 @@ wait_for_ice() {
 }
 
 if [ "$only_login" -eq 0 ]; then
+    # 必须先于 -supw 和 -fg：-fg 一绑定语音端口就能处理客户端。
+    version="$(dpkg-query -W -f '${Version}' mumble-server)"
+    python3 admission.py "$MUMBLE_INI" "$version"
     ensure_ice_secret
     set_superuser_password
     echo "启动 mumble-server（${MUMBLE_INI}）"
@@ -160,7 +156,7 @@ if [ "$stopping" -eq 1 ]; then
 elif [ -n "$mumble_pid" ] && ! kill -0 "$mumble_pid" 2>/dev/null; then
     echo "mumble-server 退出了（${code}），整个停下来" >&2
 else
-    echo "login.py 退出了（${code}）——认证器不在的话谁都登录不上，整个停下来" >&2
+    echo "login.py exited (${code}); stopping Murmur" >&2
 fi
 
 exit "$code"
