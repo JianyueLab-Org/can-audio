@@ -288,7 +288,7 @@ class ServerCallbackI(MumbleIce.ServerCallback):
         pass
 
 
-url = "https://ceruleanavi.net/api/v1/public/auth"
+url = "https://api.ceruleanavi.net/api/v1/public/auth"
 USER_AGENT = "Mozilla/5.0 (compatible; CanATIS/1.0)"
 
 # 上游接口的三种结果。"验证不了"必须和"密码不对"分开：前者再试一次就好，
