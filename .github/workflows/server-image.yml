@@ -92,6 +92,8 @@ jobs:
   image:
     needs: test
     runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -99,12 +101,32 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      - name: 镜像名转小写
+        # 镜像引用只收小写，而 github.repository 是 JianyueLab-Org/…，直接用
+        # 会在 docker 那里报 "repository name must be lowercase"
+        run: |
+          echo "IMAGE=$(echo "ghcr.io/${{ github.repository }}-server" \
+                        | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - id: meta
+        # 只是算标签和 OCI label，不需要任何权限。在这里算是为了让 label 在
+        # 构建时就打进镜像——publish 推的是这一份，不会再 build。
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          # latest 只跟 main；每次构建都另有一个按 commit 定位的标签，
+          # 部署出问题时能精确回滚到上一个 sha
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-
+
       - name: 构建（先装进本地 daemon，冒烟过了再推）
         uses: docker/build-push-action@v6
         with:
           context: .
           load: true
           tags: ${{ env.CI_TAG }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -171,40 +193,39 @@ jobs:
         if: always()
         run: docker rm -f smoke 2>/dev/null || true
 
+      - name: 把冒烟过的这份镜像交给 publish
+        # 推的必须是刚才真跑起来过的那一份，而不是重新 build 的——缓存只要
+        # 有一层没命中（apt 源更新了、缓存被清了），重建出来的就是一个没冒烟
+        # 过的镜像。只在会发布的时候存，PR 上不浪费这几百 MB。
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: docker save ${{ env.CI_TAG }} | gzip -1 > server-image.tar.gz
+
+      - if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-image
+          path: server-image.tar.gz
+          retention-days: 1
+          compression-level: 0     # 已经 gzip 过了
+
   publish:
-    # 只有这个 job 能写 GHCR，而且 PR 上根本不跑：到这里的代码已经在 main
-    # 上了（或者是有写权限的人手动触发的），并且上面的测试和冒烟都过了。
-    # 不是把 image job 的产物传过来，而是用同一份 gha 缓存再 build 一次——
-    # 每一层都命中缓存，实际只是打标签和上传。
+    # 只有这个 job 能写 GHCR。PR 上不跑，别的分支（包括手动触发时选了别的
+    # 分支）也不跑——不然任何能推分支的人都能发一个 sha- 标签出去。
+    # 它不 checkout、不 build，只加载 image job 冒烟过的那一份镜像，
+    # 打上标签推上去：这个 job 里不执行仓库里的任何代码。
     needs: image
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write        # 推 GHCR 要写权限
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
-          persist-credentials: false
+          name: server-image
 
-      - uses: docker/setup-buildx-action@v3
-
-      - name: 镜像名转小写
-        # 镜像引用只收小写，而 github.repository 是 JianyueLab-Org/…，直接用
-        # 会在 docker 那里报 "repository name must be lowercase"
-        run: |
-          echo "IMAGE=$(echo "ghcr.io/${{ github.repository }}-server" \
-                        | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
-
-      - id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE }}
-          # latest 只跟 main；每次构建都另有一个按 commit 定位的标签，
-          # 部署出问题时能精确回滚到上一个 sha
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=sha-
+      - name: 加载镜像
+        run: gunzip -c server-image.tar.gz | docker load
 
       - name: 登录 GHCR
         uses: docker/login-action@v3
@@ -214,23 +235,26 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 推镜像
-        uses: docker/build-push-action@v6
-        # 上一次构建的每一层都在 gha 缓存里，这一步只是打标签和上传
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        env:
+          TAGS: ${{ needs.image.outputs.tags }}
+        run: |
+          set -euo pipefail
+          [ -n "$TAGS" ] || { echo "image job 没给出任何标签" >&2; exit 1; }
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            docker tag "$CI_TAG" "$tag"
+            docker push "$tag"
+          done <<< "$TAGS"
 
       - name: 说一下推了什么
+        env:
+          TAGS: ${{ needs.image.outputs.tags }}
         run: |
           {
             echo "### 服务端镜像"
             echo
             echo '```'
-            echo "${{ steps.meta.outputs.tags }}"
+            echo "$TAGS"
             echo '```'
             echo
             echo "服务器上升级：\`docker compose pull && docker compose up -d\`"
