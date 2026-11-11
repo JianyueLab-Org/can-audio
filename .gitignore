@@ -20,3 +20,5 @@ rnnoise.dll
 librnnoise.dylib
 native/rnnoise/work/
 native/rnnoise/out/
+
+pymumble_udp/
