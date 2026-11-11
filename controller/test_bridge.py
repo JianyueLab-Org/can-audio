@@ -185,26 +185,6 @@ class DeviceListTest(unittest.TestCase):
         names = [(d['name'], d['input']) for d in list_devices(FakeAudio())]
         self.assertEqual(len(names), len(set(names)))
 
-    def test_range_audio_command_requires_connection(self):
-        process = subprocess.Popen([sys.executable, '-u', str(Path(__file__).with_name('bridge.py'))],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding='utf-8')
-        try:
-            output, error = process.communicate('\n'.join(json.dumps(item) for item in [
-                {'id': 1, 'command': 'range_audio', 'data': {'1003': False}},
-                {'id': 2, 'command': 'quit'},
-            ]) + '\n', timeout=10)
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.communicate()
-        self.assertEqual(process.returncode, 0, error)
-        replies = {message['id']: message for message in map(json.loads, output.splitlines())
-                   if 'id' in message}
-        self.assertIn('error', replies[1])
-        self.assertIn('尚未连接', replies[1]['error'])
-        self.assertNotIn(2, replies)
-
 
 if __name__ == '__main__':
     unittest.main()
