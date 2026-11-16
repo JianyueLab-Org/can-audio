@@ -163,7 +163,9 @@ AUDIO_CONTEXT_NORMAL = 0       # 当前频道里的正常说话
 AUDIO_CONTEXT_SHOUT = 1        # 发到我们当前频道的 VoiceTarget
 AUDIO_CONTEXT_WHISPER = 2      # 直接发给本人
 AUDIO_CONTEXT_LISTEN = 3       # 经由监听的频道
-CONNECT_TIMEOUT = 15.0
+# 一个地址族连不上时要再试另一个（mumblecompat.connect_with_fallback），而
+# pymumble 每次建连的 socket 超时是 10 秒，所以要给两次尝试都留够时间
+CONNECT_TIMEOUT = 25.0
 # 建完临时频道到它出现在频道表里、以及进频道到服务器确认，都要等一次网络往返。
 # 固定 sleep 赌不起——远程服务器上 0.2 秒经常不够，表现出来就是频道"建不出来"。
 CHANNEL_TIMEOUT = 5.0
@@ -287,9 +289,12 @@ class VoiceClient:
     """
 
     def __init__(self, server, cid, password, on_state=None, on_rx=None, on_tx=None,
-                 on_connection_change=None, reconnect_limit=RECONNECT_LIMIT, port=64738):
+                 on_connection_change=None, reconnect_limit=RECONNECT_LIMIT, port=64738,
+                 ip_family=mumblecompat.IP_FAMILY_AUTO):
         self.server = server
         self.port = port
+        # "auto" / "ipv4" / "ipv6"：优先用哪个地址族，另一个作回退（can-issues#26）
+        self.ip_family = mumblecompat.normalise_ip_family(ip_family)
         self.cid = str(cid).strip()
         self.password = password
         self.on_state = on_state
@@ -432,6 +437,15 @@ class VoiceClient:
         stats = getattr(mumble, "ping_stats", {})
         return "TCP", stats.get("avg")
 
+    def address_status(self):
+        """这条连接走的地址族（"IPv4" / "IPv6" / None）和回退情况（见
+        mumblecompat.connect_with_fallback，没回退为 None）。"""
+        mumble = self.mumble
+        if mumble is None:
+            return None, None
+        family = mumblecompat.family_name(getattr(mumble, "address_family", None)) or None
+        return family, getattr(mumble, "address_fallback", None)
+
     # ---------- 被踢 ----------
     def _on_user_removed(self, user, event=None):
         """有人离开了。只关心一种：**我们自己被踢了**。
@@ -496,6 +510,7 @@ class VoiceClient:
             # 环境从源码跑的人语音会直接 TypeError，界面上只看到"连接失败"。
             self.mumble.reconnect_limit = self.reconnect_limit
             self.mumble.on_reconnect = self._on_reconnect_attempt
+            self.mumble.ip_family = self.ip_family
             self.mumble.set_receive_sound(True)
             self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_CONNECTED, self._on_connected)
             # 被踢和普通掉线要分开，否则谁也说不清该不该连回去 —— 见

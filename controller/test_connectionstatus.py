@@ -21,5 +21,20 @@ class ConnectionStatusTest(unittest.TestCase):
     def test_disconnected_has_no_stale_transport(self):
         client = self.client(True)
         client.connected = False
-        self.assertEqual(snapshot(client), dict(connected=False, running=True, transport=None, latency_ms=None))
-        self.assertEqual(snapshot(None), dict(connected=False, running=False, transport=None, latency_ms=None))
+        self.assertEqual(snapshot(client), dict(connected=False, running=True, transport=None, latency_ms=None,
+                                                   ip_family=None, ip_fallback=None))
+        self.assertEqual(snapshot(None), dict(connected=False, running=False, transport=None, latency_ms=None,
+                                                   ip_family=None, ip_fallback=None))
+
+    def test_address_family_and_fallback_are_reported(self):
+        client = self.client(True)
+        fallback = {'reason': 'missing', 'wanted': 'IPv6', 'used': 'IPv4'}
+        client.address_status = lambda: ('IPv4', fallback)
+        status = snapshot(client)
+        self.assertEqual(status['ip_family'], 'IPv4')
+        self.assertEqual(status['ip_fallback'], fallback)
+
+    def test_a_client_without_address_status_still_works(self):
+        status = snapshot(self.client())
+        self.assertIsNone(status['ip_family'])
+        self.assertIsNone(status['ip_fallback'])

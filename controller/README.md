@@ -31,7 +31,7 @@ C# 对每条命令等 90 秒。
 | 命令 | data | result | 说明 |
 | --- | --- | --- | --- |
 | `devices` | 无 | `[{"index", "name", "host_api", "input", "output"}]` | PortAudio 设备表，只含默认 host API（Windows 上是 MME）的设备，所以同一个设备不会以 WASAPI / WDM-KS 等身份重复出现；C# 用 `index` 回传设备。MME 的设备名最长 31 个字符 |
-| `connect` | `host`, `port`, `cid`, `password`, `input`, `output`（设备 index 或 null） | `true` / `false` | 阻塞到连上或失败；失败原因走 `state` 事件 |
+| `connect` | `host`, `port`, `cid`, `password`, `input`, `output`（设备 index 或 null），可选 `ip_family`（`auto` / `ipv4` / `ipv6`，缺省 `auto`） | `true` / `false` | 阻塞到连上或失败；失败原因走 `state` 事件。`ip_family` 指定优先用的地址族，连不上或没有该族的解析记录时自动改用另一个，见下 |
 | `audio` | `mic`, `speaker`（0–200 %），`denoise`（bool），`input`, `output`，可选 `baseline`（校准基准 dB，-12 ~ +20） | `null` | 未连接时报错 |
 | `calibrate` | `input`（设备 index 或 null），`denoise`（bool） | `null` | 立即返回，开始一次麦克风校准，不需要连着；再发一次会取消上一次。进度和结果走 `calibration` 事件 |
 | `calibrate_cancel` | 无 | `null` | 取消正在进行的校准 |
@@ -65,11 +65,15 @@ Mumble 用户名（当前即 CID）查询该快照，明确为 `false` 的来源
 | --- | --- | --- |
 | `ready` | | 进程启动完成 |
 | `state` | `state`, `message` | `connecting` / `online` / `reconnecting` / `offline` / `denied` / `error` / `stopped`；`error`、`stopped` 会让界面回到未连接 |
-| `connection` | `connected`, `running`, `transport`（`UDP`/`TCP`/null）, `latency_ms`（无 Ping 样本为 null） | 每秒一次 |
+| `connection` | `connected`, `running`, `transport`（`UDP`/`TCP`/null）, `latency_ms`（无 Ping 样本为 null）, `ip_family`（`IPv4`/`IPv6`/null）, `ip_fallback`（没回退为 null） | 每秒一次 |
 | `rx` | `khz`, `active`, `callsign`（CAN ID） | 某频率开始 / 停止收到话音 |
 | `tx` | `active` | 真正开始 / 停止发话 |
 | `fatal` | `message` | 引擎崩溃 |
 | `calibration` | `stage` 及其字段，见下 | 麦克风校准进度和结果 |
+
+`ip_fallback` 是 `{"reason", "wanted", "used"}`：`reason` 为 `missing`（服务器没有 `wanted` 那个族的解析记录）
+或 `unreachable`（`wanted` 那个族连不上），`wanted` / `used` 为 `IPv4` / `IPv6`。`auto` 时 `wanted` 是系统排在前面的那个族。
+指纹校验不随地址族变化：引擎始终按主机名连接，只限定地址族（can-issues#26）。
 
 `calibration` 事件按 `stage` 区分：
 

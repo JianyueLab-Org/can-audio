@@ -12,6 +12,7 @@ import socket
 import ssl
 import threading
 import unittest
+import unittest.mock
 
 import mumblecompat
 
@@ -533,6 +534,149 @@ class SendBufferTest(unittest.TestCase):
         self.assertIs(client.control_socket._sock, plain)
         self.assertFalse(mumblecompat.guard_control_socket(client),
                          "已经包过就不该再套一层")
+
+
+class AddressFamilyTest(unittest.TestCase):
+    """can-issues#26：IPv4/IPv6 可以选，一个族连不上要换另一个。
+
+    pymumble 只拿 getaddrinfo 的第一条结果建 socket，双栈服务器上 IPv6 一不通
+    就直接报连接失败，IPv4 连试都不试。
+    """
+
+    V4 = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 64738))
+    V6 = (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", 64738, 0, 0))
+
+    def resolver(self, *records):
+        calls = []
+
+        def resolve(host, port, family=0, type=0, proto=0, flags=0):
+            calls.append(family)
+            found = [r for r in records if family in (0, r[0])]
+            if not found:
+                raise socket.gaierror(socket.EAI_NONAME, "no address")
+            return found
+        return resolve, calls
+
+    def test_auto_keeps_the_system_order(self):
+        resolve, _ = self.resolver(self.V6, self.V4)
+        self.assertEqual(mumblecompat.plan_address_families("h", 1, "auto", resolve),
+                         ([socket.AF_INET6, socket.AF_INET], False))
+
+    def test_a_preference_goes_first_and_keeps_the_other_as_fallback(self):
+        resolve, _ = self.resolver(self.V6, self.V4)
+        self.assertEqual(mumblecompat.plan_address_families("h", 1, "ipv4", resolve),
+                         ([socket.AF_INET, socket.AF_INET6], False))
+
+    def test_a_missing_preference_falls_back_and_says_so(self):
+        resolve, _ = self.resolver(self.V4)
+        self.assertEqual(mumblecompat.plan_address_families("h", 1, "ipv6", resolve),
+                         ([socket.AF_INET], True))
+
+    def test_unknown_values_mean_auto(self):
+        for value in (None, "", "IPV9", 6):
+            self.assertEqual(mumblecompat.normalise_ip_family(value), "auto")
+        self.assertEqual(mumblecompat.normalise_ip_family(" IPv6 "), "ipv6")
+
+    def fake_module(self):
+        class Mumble:
+            def __init__(self, reachable, error=None):
+                self.host, self.port = "audio.example", 64738
+                self.reachable = reachable
+                self.error = error
+                self.tried = []
+                self.control_socket = self.media_socket = None
+
+            def connect(self):
+                # pymumble 的写法：用模块里的 socket.getaddrinfo 取第一条
+                family = module.socket.getaddrinfo(self.host, self.port, type=socket.SOCK_STREAM)[0][0]
+                self.tried.append(family)
+                if self.error:
+                    raise self.error
+                if family in self.reachable:
+                    return 1
+                self.control_socket = unittest.mock.MagicMock()
+                return 3
+
+        import types
+        module = types.SimpleNamespace(Mumble=Mumble, socket=socket,
+                                       PYMUMBLE_CONN_STATE_FAILED=3)
+        self.assertTrue(mumblecompat.patch_address_family(module))
+        return module
+
+    def connect(self, records, reachable, preference="auto", error=None):
+        import unittest.mock
+        resolve, calls = self.resolver(*records)
+        module = self.fake_module()
+        client = module.Mumble(reachable, error)
+        client.ip_family = preference
+        with unittest.mock.patch.object(socket, "getaddrinfo", resolve):
+            state = module.Mumble.connect(client)
+        return client, state
+
+    def test_ipv6_failing_falls_back_to_ipv4(self):
+        client, state = self.connect([self.V6, self.V4], {socket.AF_INET})
+        self.assertEqual(state, 1)
+        self.assertEqual(client.tried, [socket.AF_INET6, socket.AF_INET],
+                         "IPv6 连不上要接着试 IPv4")
+        self.assertEqual(client.address_family, socket.AF_INET)
+        self.assertEqual(client.address_fallback,
+                         {"reason": "unreachable", "wanted": "IPv6", "used": "IPv4"})
+
+    def test_the_preferred_family_is_tried_first(self):
+        client, state = self.connect([self.V6, self.V4], {socket.AF_INET, socket.AF_INET6}, "ipv4")
+        self.assertEqual(client.tried, [socket.AF_INET])
+        self.assertIsNone(client.address_fallback, "直接连上了就不算回退")
+
+    def test_a_missing_family_is_reported_as_a_fallback(self):
+        client, state = self.connect([self.V4], {socket.AF_INET}, "ipv6")
+        self.assertEqual(state, 1)
+        self.assertEqual(client.tried, [socket.AF_INET])
+        self.assertEqual(client.address_fallback,
+                         {"reason": "missing", "wanted": "IPv6", "used": "IPv4"})
+
+    def test_both_failing_is_still_a_failure(self):
+        client, state = self.connect([self.V6, self.V4], set())
+        self.assertEqual(state, 3)
+        self.assertEqual(len(client.tried), 2)
+        self.assertIsNone(client.address_family)
+
+    def test_a_pin_failure_is_not_retried_on_the_other_family(self):
+        """证书不对是中间人，不是网络问题，换个族再把密码送一次是错的。"""
+        with self.assertRaises(mumblecompat.CertificatePinError):
+            self.connect([self.V6, self.V4], set(),
+                         error=mumblecompat.CertificatePinError("bad"))
+
+    def test_the_host_name_is_never_replaced_by_an_address(self):
+        """指纹校验按主机名认官方服务器，换成 IP 就等于关掉钉扎。"""
+        client, _ = self.connect([self.V6, self.V4], {socket.AF_INET})
+        self.assertEqual(client.host, "audio.example")
+
+    def test_patching_twice_does_not_stack(self):
+        module = self.fake_module()
+        self.assertFalse(mumblecompat.patch_address_family(module))
+        self.assertIsInstance(module.socket, mumblecompat._FamilySocketModule)
+        self.assertNotIsInstance(module.socket._real, mumblecompat._FamilySocketModule)
+
+    def test_the_send_guard_marker_survives(self):
+        """patch_send() 靠 _can_guarded 判断包没包过，外面再套一层也要认得出。"""
+        import types
+        class Mumble:
+            def connect(self):
+                return 1
+        Mumble.connect._can_guarded = True
+        module = types.SimpleNamespace(Mumble=Mumble, socket=socket)
+        mumblecompat.patch_address_family(module)
+        self.assertTrue(Mumble.connect._can_guarded)
+
+    def test_other_threads_are_not_affected(self):
+        """限定地址族只在连接那一刻、只在那个线程里生效。"""
+        proxy = mumblecompat._FamilySocketModule(socket)
+        seen = []
+        import unittest.mock
+        with unittest.mock.patch.object(socket, "getaddrinfo",
+                                        lambda h, p, f=0, *a: seen.append(f) or []):
+            proxy.getaddrinfo("h", 1)
+        self.assertEqual(seen, [0])
 
 
 if __name__ == "__main__":
