@@ -66,6 +66,7 @@ def main():
                     if client:
                         client.disconnect()
                     client = VoiceClient(data['host'], data['cid'], data['password'], port=data['port'],
+                        ip_family=data.get('ip_family', 'auto'),
                         on_state=lambda state, message: emit(event='state', state=state, message=message),
                         on_rx=lambda khz, active, callsign: emit(event='rx', khz=khz, active=active, callsign=callsign),
                         on_tx=lambda active: emit(event='tx', active=active))

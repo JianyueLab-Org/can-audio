@@ -6,5 +6,10 @@ def snapshot(client):
         stats = getattr(client.mumble, 'udp_ping_stats' if transport == 'UDP' else 'ping_stats', {})
         if not stats.get('nb', 0):
             latency = None
+    # 走的是 IPv4 还是 IPv6、有没有从用户选的那个族回退（can-issues#26）
+    family, fallback = (None, None)
+    if connected and hasattr(client, 'address_status'):
+        family, fallback = client.address_status()
     return dict(connected=connected, running=bool(client and client.running),
-                transport=transport, latency_ms=latency)
+                transport=transport, latency_ms=latency,
+                ip_family=family, ip_fallback=fallback)

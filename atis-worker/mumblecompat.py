@@ -51,7 +51,9 @@ import hashlib
 import logging
 import os
 import select
+import socket
 import ssl
+import threading
 import time
 
 log = logging.getLogger("mumblecompat")
@@ -384,6 +386,8 @@ def install():
         log.warning("the voice server certificate is NOT pinned on this "
                     "pymumble/Python combination; use Python 3.12 or newer")
     patch_send()
+    # 套在发送补丁外面：换一个地址族重连时，新的那条连接同样要被包住
+    patch_address_family()
     return patched_ssl
 
 
@@ -466,4 +470,177 @@ def _install_wrap_socket():
     log.info("reinstated ssl.wrap_socket for pymumble (removed from Python "
              "3.12 onwards); the voice server certificate is pinned by "
              "SHA-256 fingerprint")
+    return True
+
+
+# ---- IPv4 / IPv6 ----
+#
+# can-issues#26。服务器同时有 A 和 AAAA 记录时，pymumble 的 `connect()` 只拿
+# `getaddrinfo()` 的**第一条**结果建 socket（Windows 默认把 IPv6 排前面），
+# 连不上就算失败——IPv4 连试都不试。国内有的运营商 IPv6 不通或绕远，于是有
+# IPv4 能用的人也连不上，或者走了延迟翻倍的那条。
+#
+# 这里做两件事：
+#   1. 用户可以指定优先用 IPv4 还是 IPv6（`Mumble.ip_family`，"auto" /
+#      "ipv4" / "ipv6"）；
+#   2. 不管指没指定，一个地址族连不上就换另一个再连一次；指定的那个族根本没有
+#      解析记录时直接用另一个。两种回退都记日志，并留在 `address_fallback` 里
+#      交给界面显式提示。
+#
+# **主机名一直是主机名。** 不能把解析出来的 IP 直接当 host 传下去：指纹校验
+# （`_PinnedSSLSocket`）按 `connect()` 的地址判断是不是官方服务器，传 IP 就
+# 等于把钉扎关掉。所以只限定地址族——pymumble 的 `getaddrinfo` 换成只返回
+# 那个族的版本，它建出来的就是那个族的 socket，`connect((host, port))` 也只
+# 会解析那个族的地址。
+#
+# 证书对不上（`CertificatePinError`）不是网络问题，不换族重试，原样往外抛。
+
+IP_FAMILY_AUTO = "auto"
+IP_FAMILY_IPV4 = "ipv4"
+IP_FAMILY_IPV6 = "ipv6"
+IP_FAMILIES = {IP_FAMILY_IPV4: socket.AF_INET, IP_FAMILY_IPV6: socket.AF_INET6}
+_FAMILY_NAMES = {socket.AF_INET: "IPv4", socket.AF_INET6: "IPv6"}
+
+# 只在 pymumble 那个连接线程、只在 connect() 期间生效
+_forced_family = threading.local()
+
+
+def normalise_ip_family(value):
+    """设置里的值 → "auto" / "ipv4" / "ipv6"，认不出来的一律当 auto。"""
+    name = str(value or "").strip().lower()
+    return name if name in IP_FAMILIES else IP_FAMILY_AUTO
+
+
+def family_name(family):
+    """socket.AF_INET → "IPv4"，不认识的返回空串。"""
+    return _FAMILY_NAMES.get(family, "")
+
+
+def plan_address_families(host, port, preference=IP_FAMILY_AUTO, resolve=None):
+    """按什么顺序试哪些地址族。返回 (顺序, 偏好的族没有解析记录)。
+
+    auto 照系统给的顺序；指定了就把它排第一，另一个留作回退。指定的族一条
+    记录都没有时第二项为 True，顺序里只剩实际有的那些。解析失败照常抛
+    `OSError`（`socket.gaierror`），交给调用方。`resolve` 只给测试用。
+    """
+    resolve = resolve or socket.getaddrinfo
+    found = []
+    for info in resolve(host, port, 0, socket.SOCK_STREAM):
+        if info[0] in _FAMILY_NAMES and info[0] not in found:
+            found.append(info[0])
+    wanted = IP_FAMILIES.get(normalise_ip_family(preference))
+    if wanted is None:
+        return found, False
+    if wanted in found:
+        return [wanted] + [f for f in found if f != wanted], False
+    return found, True
+
+
+class _FamilySocketModule:
+    """pymumble 模块里 `socket` 的替身：只改 getaddrinfo，其余原样转发。
+
+    pymumble 写的是 `socket.getaddrinfo(...)` / `socket.socket(...)` /
+    `except socket.error`，所以换掉它模块里的 `socket` 这个名字就够了，不用
+    动进程里其它任何人的 socket。
+    """
+
+    def __init__(self, real):
+        self._real = real
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def getaddrinfo(self, host, port, family=0, type=0, proto=0, flags=0):
+        forced = getattr(_forced_family, "value", None)
+        if forced is not None:
+            family = forced
+        return self._real.getaddrinfo(host, port, family, type, proto, flags)
+
+
+def _close_attempt(mumble):
+    """上一个地址族那次失败的尝试留下的 socket 关掉，再换下一个族。"""
+    for name in ("media_socket", "control_socket"):
+        sock = getattr(mumble, name, None)
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            setattr(mumble, name, None)
+
+
+def connect_with_fallback(mumble, original, failed_state):
+    """按地址族的顺序调 `original(mumble)`，一个连不上就换下一个。
+
+    结果留在 `mumble.address_family`（这次连上用的 socket 族，没连上为
+    None）和 `mumble.address_fallback`（没回退为 None，回退了是
+    {"reason": "missing"|"unreachable", "wanted": "IPv6", "used": "IPv4"}）。
+    """
+    preference = normalise_ip_family(getattr(mumble, "ip_family", IP_FAMILY_AUTO))
+    host, port = mumble.host, mumble.port
+    mumble.address_family = None
+    mumble.address_fallback = None
+    try:
+        order, missing = plan_address_families(host, port, preference)
+    except OSError as e:
+        # 解析都失败了，让 pymumble 自己按原来的路子报"连接失败"
+        log.warning("could not resolve %s: %s", host, e)
+        return original(mumble)
+    if not order:
+        return original(mumble)
+
+    wanted = family_name(IP_FAMILIES.get(preference)) or family_name(order[0])
+    if missing:
+        log.warning("%s has no %s address, using %s instead",
+                    host, wanted, family_name(order[0]))
+
+    state = failed_state
+    for index, family in enumerate(order):
+        if index:
+            _close_attempt(mumble)
+            log.warning("could not reach %s over %s, trying %s",
+                        host, family_name(order[index - 1]), family_name(family))
+        _forced_family.value = family
+        try:
+            state = original(mumble)
+        finally:
+            _forced_family.value = None
+        if state < failed_state:
+            mumble.address_family = family
+            if missing:
+                mumble.address_fallback = {"reason": "missing", "wanted": wanted,
+                                           "used": family_name(family)}
+            elif index:
+                mumble.address_fallback = {"reason": "unreachable", "wanted": wanted,
+                                           "used": family_name(family)}
+            log.info("connected to %s over %s", host, family_name(family))
+            return state
+    return state
+
+
+def patch_address_family(module=None):
+    """让 `Mumble.connect()` 认 `ip_family` 并在地址族之间回退。返回是否打了补丁。
+
+    `module` 只给测试用。
+    """
+    module = module or _pymumble_module()
+    mumble_class = getattr(module, "Mumble", None)
+    if mumble_class is None:
+        return False
+    if not isinstance(module.socket, _FamilySocketModule):
+        module.socket = _FamilySocketModule(module.socket)
+    original = mumble_class.connect
+    if getattr(original, "_can_family", False):
+        return False
+    failed_state = getattr(module, "PYMUMBLE_CONN_STATE_FAILED", 3)
+
+    def connect(self):
+        return connect_with_fallback(self, original, failed_state)
+
+    connect._can_family = True
+    # 让 patch_send() 再调一次时认得出已经包过，不在外面再套一层
+    connect._can_guarded = getattr(original, "_can_guarded", False)
+    mumble_class.connect = connect
+    log.info("patched pymumble to honour the IPv4/IPv6 preference and fall "
+             "back to the other address family")
     return True
